@@ -1,0 +1,29 @@
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+t_desktop.ini
+
+# Compiled Binaries / Go Executables
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Local Database Files
+data/*.db
+data/*.db-journal
+data/*.db-wal
+
+# Sensitive Telemetry and Raw Music Platform Data Exports
+data/Apple Music Activity/
+data/*.csv
+data/*.txt
+data/*.json
+
+# Development Environment Overrides (If you add any local environment vars later)
+.env
+.env.local
