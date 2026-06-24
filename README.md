@@ -2,7 +2,7 @@
 
 A local-first, personal music intelligence platform built in Go. This project ingests historical listening data and music exports from various platforms, normalizes and enriches the metadata using open API registries, and exposes your entire musical profile over the Model Context Protocol (MCP). 
 
-Ultimately, this serves as a high-fidelity context engine powering localized music recommendation pipelines via LLMs (like DeepSeek-R1 via Ollama).
+Ultimately, this serves as a high-fidelity context engine powering localized music recommendation pipelines via LLMs (like Qwen MoE models via Ollama).
 
 ## Data Gathering & Ingestion Ecosystem
 
@@ -38,8 +38,16 @@ Once raw data is ingested, the library state is extended via asynchronous metada
 * **Community Tag Aggregation:** If a `LASTFM_API_KEY` is present, it pulls community top-tags and passes them through a strict, internal whitelist to filter out low-value noise (e.g., filtering out tags like "seen live" or "awesome" while keeping strict subgenres).
 * **Idempotency:** Empty arrays are explicitly committed for missing or unresolvable artists, ensuring the engine doesn't waste network resources or rate-limits retrying dead endpoints.
 
+### Proactive Discovery & LLM Anti-Hallucination
+
+Rather than relying on LLMs to blind-guess music recommendations and validating them reactively, the platform implements a proactive filtering design over the Model Context Protocol:
+* **Pre-Exclusion Filtering:** The server builds an in-memory database exclusion map of your entire track, album, and artist history using Unicode string normalization rules.
+* **MusicBrainz Integration:** External discovery requests leverage live MusicBrainz metadata queries wrapped in a padded fetch buffer (`limit * 4`) to prevent result starvation during data stripping.
+* **Monotony & Anti-Anchoring Guardrails:** The protocol layer enforces a strict limit of 2 tracks per artist to ensure discovery variety, while forcing the LLM to prioritize your active "target vibe" over past library anchors.
+
 ## Technical Stack & Layout
 
 * **Language:** Go 1.25.5
 * **Database:** Embedded SQLite (`data/music_vault.db`) via `mattn/go-sqlite3` with strict Unicode normalization for clean search indexing.
-* **Protocol Interface:** `mark3labs/mcp-go` exposing stdio capabilities (with network transport planned).
+* **Protocol Interface:** `mark3labs/mcp-go` exposing local context tools via `stdin`/`stdout`. This includes semantic discovery routing (`get_verified_discovery_candidates`), structural taste mapping (`get_taste_adjacencies`), and instantaneous local metadata logging (`log_album_rating`).
+* **Local Inference Engine:** Ollama running Qwen Mixture of Experts (MoE) models to execute high-fidelity context reasoning and routing.
