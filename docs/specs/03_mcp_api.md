@@ -39,11 +39,14 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `seed_artists` (array of strings, optional): Artist names to build outward from. If omitted, defaults to the user's top high-affinity artists.
   - `target_vibe` (string, optional): A sonic, technical, or mood descriptor to guide discovery.
 
-### Tool: `check_album_history`
-- **Description:** Check whether an album already exists in the local albums table using Specification 07 clean key normalization.
+### Tool: `get_verified_discovery_candidates`
+- **Description:** Search live MusicBrainz metadata using canonical genre tags and exclude candidates already represented in the local library. Abstract vibes must be translated to semantic fallback tags before the external request.
 - **Input Arguments:**
-  - `artist` (string, required): The album artist name.
-  - `album` (string, required): The album title.
+  - `target_vibe` (string, optional): A raw vibe, canonical MusicBrainz genre tag, or comma-separated canonical tag list.
+  - `fallback_tags` (array of strings, optional): Canonical MusicBrainz genre tags derived from an abstract phrase. For example, `"erratic rhythm section"` becomes `["math rock", "idm", "breakcore"]`.
+  - `limit` (integer, optional): Maximum candidates to return (Default: 5; maximum: 50).
+- **Validation:** At least one of `target_vibe` or `fallback_tags` is required. When both are supplied, `fallback_tags` takes precedence.
+- **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world track metadata).
 
 ### Tool: `log_album_rating`
 - **Description:** Persist a local album rating to `albums.user_rating` using Specification 07 clean key normalization; insert a UUID-backed album row if absent.

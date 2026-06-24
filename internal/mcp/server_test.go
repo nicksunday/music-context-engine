@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -15,6 +16,16 @@ import (
 	mcpsrv "github.com/mark3labs/mcp-go/server"
 	"github.com/nicksunday/music-context-platform/internal/database"
 )
+
+type discoverySourceFunc func(context.Context, []string, int) ([]DiscoveryCandidate, error)
+
+func (fn discoverySourceFunc) Search(
+	ctx context.Context,
+	searchTags []string,
+	limit int,
+) ([]DiscoveryCandidate, error) {
+	return fn(ctx, searchTags, limit)
+}
 
 func TestSearchLibraryTracksNormalizesQuery(t *testing.T) {
 	db := openTestDB(t)
@@ -325,7 +336,21 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 		t.Fatalf("failed to insert MCP fixtures: %v", err)
 	}
 
-	mcpServer := NewServer(db.Ctx)
+	mcpServer := newServer(db.Ctx, discoverySourceFunc(func(
+		context.Context,
+		[]string,
+		int,
+	) ([]DiscoveryCandidate, error) {
+		return []DiscoveryCandidate{
+			{
+				TrackName:   "CAFO",
+				Artist:      "Animals as Leaders",
+				Album:       "Animals as Leaders",
+				Runtime:     "6:41",
+				ReleaseYear: 2009,
+			},
+		}, nil
+	}))
 	tools := mcpServer.ListTools()
 	wantToolNames := []string{
 		getLibraryTracksToolName,
@@ -334,11 +359,19 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 		getGenreDistributionToolName,
 		getAlbumTracksToolName,
 		getTasteAdjacenciesToolName,
-		checkAlbumHistoryToolName,
+		getVerifiedCandidatesToolName,
 		logAlbumRatingToolName,
 	}
 	if len(tools) != len(wantToolNames) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(wantToolNames))
+	}
+	if _, ok := tools["check_album_history"]; ok {
+		t.Fatal("deprecated check_album_history tool is still registered")
+	}
+	if description := tools[getVerifiedCandidatesToolName].Tool.Description; !strings.Contains(description, "STRICT TWO-SENTENCE LIMIT") ||
+		!strings.Contains(description, "ANTI-GASLIGHTING RULE") ||
+		!strings.Contains(description, "KNOWLEDGE FALLBACK") {
+		t.Fatalf("%s description does not include critical recommendation instructions: %q", getVerifiedCandidatesToolName, description)
 	}
 
 	registeredTools := make([]mcpsrv.ServerTool, 0, len(wantToolNames))
@@ -376,7 +409,7 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 	assertToolResponseContains(getGenreDistributionToolName, nil, "| Subgenre | Total Occurrences |")
 	assertToolResponseContains(getAlbumTracksToolName, map[string]any{"artist": "Mastodon", "album": "Crack the Skye"}, "Oblivion")
 	assertToolResponseContains(getTasteAdjacenciesToolName, map[string]any{"seed_artists": []any{"Mastodon"}, "target_vibe": "erratic rhythm section"}, "Direct Adjacencies")
-	assertToolResponseContains(checkAlbumHistoryToolName, map[string]any{"artist": "Mastodon", "album": "Crack the Skye"}, "4.8/5")
+	assertToolResponseContains(getVerifiedCandidatesToolName, map[string]any{"target_vibe": "erratic rhythm section", "limit": 1}, `"track_name":"CAFO"`)
 	assertToolResponseContains(logAlbumRatingToolName, map[string]any{"artist": "Beyoncé", "album": "I Am... Sasha Fierce", "rating": 4.2}, "Updated")
 }
 
@@ -391,7 +424,7 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 		*tools[getTopRatedAlbumsToolName],
 		*tools[getAlbumTracksToolName],
 		*tools[getTasteAdjacenciesToolName],
-		*tools[checkAlbumHistoryToolName],
+		*tools[getVerifiedCandidatesToolName],
 		*tools[logAlbumRatingToolName],
 	)
 	if err != nil {
@@ -437,10 +470,22 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 			wantMessage: "seed_artists argument must be an array of strings",
 		},
 		{
-			name:        "history album must be string",
-			toolName:    checkAlbumHistoryToolName,
-			args:        map[string]any{"artist": "Mastodon", "album": 12},
-			wantMessage: "album argument must be a string",
+			name:        "discovery target vibe must be string",
+			toolName:    getVerifiedCandidatesToolName,
+			args:        map[string]any{"target_vibe": 12},
+			wantMessage: "target_vibe argument must be a string",
+		},
+		{
+			name:        "discovery fallback tags must be strings",
+			toolName:    getVerifiedCandidatesToolName,
+			args:        map[string]any{"fallback_tags": []any{"math rock", 12}},
+			wantMessage: "fallback_tags argument must be an array of strings",
+		},
+		{
+			name:        "discovery requires vibe or fallback tags",
+			toolName:    getVerifiedCandidatesToolName,
+			args:        map[string]any{},
+			wantMessage: "provide a non-empty target_vibe or fallback_tags",
 		},
 		{
 			name:        "log rating must be number",
@@ -460,6 +505,229 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 				t.Fatalf("toolResultText() = %q, want to contain %q", got, tt.wantMessage)
 			}
 		})
+	}
+}
+
+func TestGetVerifiedDiscoveryCandidatesNormalizesExclusions(t *testing.T) {
+	candidates, err := getVerifiedDiscoveryCandidates(
+		context.Background(),
+		discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
+			return []DiscoveryCandidate{
+				{TrackName: "Gantz Graf", Artist: "Autechre", Album: "Gantz Graf", Runtime: "3:58", ReleaseYear: 2002},
+				{TrackName: "T69 Collapse", Artist: "Aphex Twin", Album: "Collapse EP", Runtime: "5:22", ReleaseYear: 2018},
+				{TrackName: "Story 2", Artist: "clipping.", Album: "CLPPNG", Runtime: "2:11", ReleaseYear: 2014},
+			}, nil
+		}),
+		[]string{"experimental electronic"},
+		10,
+		map[string]bool{
+			"AUTECHRE!!!": true,
+			"collapse ep": true,
+			"STORY 2!!!":  true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
+	}
+
+	for _, candidate := range candidates {
+		if candidate.Artist == "Autechre" {
+			t.Fatalf("excluded artist leaked into candidates: %#v", candidate)
+		}
+		if candidate.Album == "Collapse EP" {
+			t.Fatalf("excluded album leaked into candidates: %#v", candidate)
+		}
+		if candidate.TrackName == "Story 2" {
+			t.Fatalf("excluded track leaked into candidates: %#v", candidate)
+		}
+	}
+}
+
+func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *testing.T) {
+	db := openTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist)
+		VALUES ('album-autechre', 'Gantz Graf', 'Autechre', 'gantz graf', 'autechre')`)
+	if err != nil {
+		t.Fatalf("failed to insert exclusion fixture: %v", err)
+	}
+
+	discovery := discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
+		return []DiscoveryCandidate{
+			{TrackName: "Gantz Graf", Artist: "Autechre", Album: "Gantz Graf", Runtime: "3:58", ReleaseYear: 2002},
+			{TrackName: "T69 Collapse", Artist: "Aphex Twin", Album: "Collapse EP", Runtime: "5:22", ReleaseYear: 2018},
+		}, nil
+	})
+	tool, ok := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	if !ok {
+		t.Fatalf("registered tool %q not found", getVerifiedCandidatesToolName)
+	}
+	testServer, err := mcptest.NewServer(t, *tool)
+	if err != nil {
+		t.Fatalf("failed to start MCP test server: %v", err)
+	}
+	defer testServer.Close()
+
+	result := callTool(
+		t,
+		context.Background(),
+		testServer,
+		getVerifiedCandidatesToolName,
+		map[string]any{"target_vibe": "experimental electronic", "limit": 10},
+	)
+	if result.IsError {
+		t.Fatalf("%s returned error: %s", getVerifiedCandidatesToolName, toolResultText(t, result))
+	}
+
+	var response verifiedDiscoveryCandidatesToolResult
+	if err := json.Unmarshal([]byte(toolResultText(t, result)), &response); err != nil {
+		t.Fatalf("failed to decode discovery candidate JSON: %v", err)
+	}
+	if response.EffectiveLimit != 10 {
+		t.Fatalf("effective limit = %d, want 10", response.EffectiveLimit)
+	}
+	if !strings.Contains(response.Instructions, "STRICT TWO-SENTENCE LIMIT") ||
+		!strings.Contains(response.Instructions, "ANTI-GASLIGHTING RULE") ||
+		!strings.Contains(response.Instructions, "KNOWLEDGE FALLBACK") {
+		t.Fatalf("instructions missing critical output contract: %q", response.Instructions)
+	}
+
+	foundUnexcludedCandidate := false
+	for _, candidate := range response.Candidates {
+		if candidate.Artist == "Autechre" {
+			t.Fatalf("excluded artist leaked into JSON response: %#v", candidate)
+		}
+		if candidate.Artist == "Aphex Twin" {
+			foundUnexcludedCandidate = true
+		}
+	}
+	if !foundUnexcludedCandidate {
+		t.Fatalf("JSON response omitted valid unexcluded candidate: %#v", response.Candidates)
+	}
+}
+
+func TestVerifiedDiscoveryCandidatesHandlerRoutesFallbackTagsToDiscoverySource(t *testing.T) {
+	db := openTestDB(t)
+
+	var gotTags []string
+	var gotLimit int
+	discovery := discoverySourceFunc(func(
+		_ context.Context,
+		searchTags []string,
+		limit int,
+	) ([]DiscoveryCandidate, error) {
+		gotTags = append([]string(nil), searchTags...)
+		gotLimit = limit
+		return []DiscoveryCandidate{{
+			TrackName:   "CAFO",
+			Artist:      "Animals as Leaders",
+			Album:       "Animals as Leaders",
+			Runtime:     "6:41",
+			ReleaseYear: 2009,
+		}}, nil
+	})
+	tool := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	testServer, err := mcptest.NewServer(t, *tool)
+	if err != nil {
+		t.Fatalf("failed to start MCP test server: %v", err)
+	}
+	defer testServer.Close()
+
+	result := callTool(
+		t,
+		context.Background(),
+		testServer,
+		getVerifiedCandidatesToolName,
+		map[string]any{
+			"target_vibe":   "erratic rhythm section",
+			"fallback_tags": []any{" Math Rock ", "idm", "breakcore"},
+			"limit":         2,
+		},
+	)
+	if result.IsError {
+		t.Fatalf("%s returned error: %s", getVerifiedCandidatesToolName, toolResultText(t, result))
+	}
+
+	if got := strings.Join(gotTags, ","); got != "math rock,idm,breakcore" {
+		t.Fatalf("discovery search tags = %q, want canonical fallback tags", got)
+	}
+	if gotLimit != 20 {
+		t.Fatalf("discovery search limit = %d, want 20 candidates for exclusion filtering", gotLimit)
+	}
+}
+
+func TestVerifiedDiscoveryCandidatesHandlerClampsLimitAndIncludesInstructions(t *testing.T) {
+	db := openTestDB(t)
+
+	var gotLimit int
+	discovery := discoverySourceFunc(func(
+		_ context.Context,
+		_ []string,
+		limit int,
+	) ([]DiscoveryCandidate, error) {
+		gotLimit = limit
+		return []DiscoveryCandidate{{
+			TrackName:   "Obscure Groove",
+			Artist:      "Scene Project",
+			Album:       "Deep Cut",
+			Runtime:     "4:12",
+			ReleaseYear: 1987,
+		}}, nil
+	})
+	tool := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	testServer, err := mcptest.NewServer(t, *tool)
+	if err != nil {
+		t.Fatalf("failed to start MCP test server: %v", err)
+	}
+	defer testServer.Close()
+
+	result := callTool(
+		t,
+		context.Background(),
+		testServer,
+		getVerifiedCandidatesToolName,
+		map[string]any{"target_vibe": "funk metal", "limit": maxDiscoveryCandidateLimit + 500},
+	)
+	if result.IsError {
+		t.Fatalf("%s returned error: %s", getVerifiedCandidatesToolName, toolResultText(t, result))
+	}
+
+	var response verifiedDiscoveryCandidatesToolResult
+	if err := json.Unmarshal([]byte(toolResultText(t, result)), &response); err != nil {
+		t.Fatalf("failed to decode discovery candidate JSON: %v", err)
+	}
+	if response.EffectiveLimit != maxDiscoveryCandidateLimit {
+		t.Fatalf("effective limit = %d, want %d", response.EffectiveLimit, maxDiscoveryCandidateLimit)
+	}
+	if gotLimit != maxMusicBrainzSearchLimit {
+		t.Fatalf("discovery search limit = %d, want capped external search limit %d", gotLimit, maxMusicBrainzSearchLimit)
+	}
+	if !strings.Contains(response.Instructions, "STRICT TWO-SENTENCE LIMIT") ||
+		!strings.Contains(response.Instructions, "ANTI-GASLIGHTING RULE") ||
+		!strings.Contains(response.Instructions, "KNOWLEDGE FALLBACK") {
+		t.Fatalf("instructions missing critical output contract: %q", response.Instructions)
+	}
+	if len(response.Candidates) != 1 || response.Candidates[0].TrackName != "Obscure Groove" {
+		t.Fatalf("candidates = %#v, want wrapped discovery candidate", response.Candidates)
+	}
+}
+
+func TestGetVerifiedDiscoveryCandidatesReturnsOnlyStrictVibeMatches(t *testing.T) {
+	candidates, err := getVerifiedDiscoveryCandidates(
+		context.Background(),
+		discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
+			return nil, nil
+		}),
+		[]string{"not a registered sonic topology"},
+		5,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want no unverified fallback candidates", candidates)
 	}
 }
 

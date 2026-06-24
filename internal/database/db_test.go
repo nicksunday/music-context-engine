@@ -468,6 +468,51 @@ func TestArtistAffinityViewScoresAndOrdersExplicitSignals(t *testing.T) {
 	}
 }
 
+func TestGetExclusionListIncludesAllTracksAndAlbums(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "exclusions.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	_, err = db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist)
+		VALUES
+			('album-1', 'Gantz Graf!!!', 'AUTÉCHRE', 'gantz graf', 'autechre'),
+			('album-2', 'Polygondwanaland', 'King Gizzard & The Lizard Wizard', 'polygondwanaland', 'king gizzard and the lizard wizard');
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, is_favorite)
+		VALUES
+			('track-1', NULL, 'Jóga', 'Homogenic!!!', 'BJÖRK', 'joga', 'bjork', 1),
+			('track-2', NULL, 'Ignored', 'Ignored Album', 'Ignored Artist', 'ignored', 'ignored artist', 0);`)
+	if err != nil {
+		t.Fatalf("failed to insert exclusion fixtures: %v", err)
+	}
+
+	exclusions, err := db.GetExclusionList()
+	if err != nil {
+		t.Fatalf("GetExclusionList() error = %v", err)
+	}
+
+	for _, want := range []string{
+		"bjork",
+		"homogenic",
+		"joga",
+		"autechre",
+		"gantz graf",
+		"king gizzard and the lizard wizard",
+		"polygondwanaland",
+		"ignored",
+		"ignored artist",
+		"ignored album",
+	} {
+		if !exclusions[want] {
+			t.Errorf("GetExclusionList()[%q] = false, want true", want)
+		}
+	}
+}
+
 func TestArtistAffinityViewClampsOutliersAndPenalizesDislikes(t *testing.T) {
 	unsetMusicVaultDBPathEnv(t)
 

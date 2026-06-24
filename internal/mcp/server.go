@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/nicksunday/music-context-platform/internal/database"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -26,29 +27,38 @@ const (
 	libraryTrackCap           = 100
 	defaultFavoriteTrackLimit = 50
 
-	getLibraryTracksToolName     = "get_library_tracks"
-	getFavoriteTracksToolName    = "get_favorite_tracks"
-	getTopRatedAlbumsToolName    = "get_top_rated_albums"
-	getGenreDistributionToolName = "get_genre_distribution"
-	getAlbumTracksToolName       = "get_album_tracks"
-	getTasteAdjacenciesToolName  = "get_taste_adjacencies"
-	checkAlbumHistoryToolName    = "check_album_history"
-	logAlbumRatingToolName       = "log_album_rating"
+	getLibraryTracksToolName      = "get_library_tracks"
+	getFavoriteTracksToolName     = "get_favorite_tracks"
+	getTopRatedAlbumsToolName     = "get_top_rated_albums"
+	getGenreDistributionToolName  = "get_genre_distribution"
+	getAlbumTracksToolName        = "get_album_tracks"
+	getTasteAdjacenciesToolName   = "get_taste_adjacencies"
+	getVerifiedCandidatesToolName = "get_verified_discovery_candidates"
+	logAlbumRatingToolName        = "log_album_rating"
 
 	defaultTasteArtistLimit = 12
 	defaultTasteGenreLimit  = 20
 
-	recommendationToolInstructions = "Use the local affinity/topography data as grounding. Enforce the sourcing hierarchy when researching: Metal Depth -> Encyclopaedia Metallum (metal-archives.com) and Shreddit Release Tracker; Progressive/Rock/Fusion -> ProgArchives (progarchives.com) and Fecking Bahamas (feckingbahamas.com); Roots/Virtuosic Acoustic -> Bluegrass Today (bluegrasstoday.com) and No Depression (nodepression.com); Hip Hop/Rap/Production -> HipHopDX (hiphopdx.com), Passion of the Weiss (passionweiss.com), and Dead End Hip Hop (deadendhiphop.com); Experimental/Electronic/Avant-Garde -> The Quietus (thequietus.com) and Resident Advisor (residentadvisor.net); Historical Canon -> 1001 Albums You Must Hear Before You Die and community-curated variations. Cross-reference musician pedigree and prefer sonic topology overlap over broad commercial genres. Final recommendation output must be grouped under Direct Adjacencies and Cross-Genre Wildcards."
+	recommendationToolInstructions = `Use the local affinity/topography data as grounding. Enforce the sourcing hierarchy when researching: Metal Depth -> Encyclopaedia Metallum (metal-archives.com) and Shreddit Release Tracker; Progressive/Rock/Fusion -> ProgArchives (progarchives.com) and Fecking Bahamas (feckingbahamas.com); Roots/Virtuosic Acoustic -> Bluegrass Today (bluegrasstoday.com) and No Depression (nodepression.com); Hip Hop/Rap/Production -> HipHopDX (hiphopdx.com), Passion of the Weiss (passionweiss.com), and Dead End Hip Hop (deadendhiphop.com); Experimental/Electronic/Avant-Garde -> The Quietus (thequietus.com) and Resident Advisor (residentadvisor.net); Historical Canon -> 1001 Albums You Must Hear Before You Die and community-curated variations. Cross-reference musician pedigree and prefer sonic topology overlap over broad commercial genres. Final recommendation output must be grouped under Direct Adjacencies and Cross-Genre Wildcards.
+
+CRITICAL OUTPUT CONTRACT:
+1. STRICT TWO-SENTENCE LIMIT: The structural breakdown for each track MUST be exactly two sentences long. No run-on sentences, semicolons, or excessive comma splices to bypass this limit.
+2. ANTI-GASLIGHTING RULE: If your pre-training data lacks deep, explicit knowledge of a track's actual sonic arrangements, you are FORBIDDEN from inventing descriptions (e.g., fabricating guitar style, production credits, or vocal style).
+3. KNOWLEDGE FALLBACK: For obscure tracks, pivot the two sentences strictly to verifiable historical context, such as: "Returned via canonical tags [X]. While exact tracking arrangements are outside local parameters, [Artist] emerged from the [Year] [Scene/Subgenre] movement, mirroring the structural timeline of your request."`
 )
 
 func NewServer(db *sql.DB) *server.MCPServer {
+	return newServer(db, defaultDiscoverySource())
+}
+
+func newServer(db *sql.DB, discovery discoverySource) *server.MCPServer {
 	s := server.NewMCPServer(
 		serverName,
 		serverVersion,
 		server.WithToolCapabilities(false),
 	)
 
-	registerTools(s, db)
+	registerTools(s, db, discovery)
 
 	return s
 }
@@ -57,7 +67,7 @@ func ServeStdio(db *sql.DB) error {
 	return server.ServeStdio(NewServer(db))
 }
 
-func registerTools(s *server.MCPServer, db *sql.DB) {
+func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource) {
 	s.AddTool(
 		mcpsdk.NewTool(getLibraryTracksToolName,
 			mcpsdk.WithDescription("Search local library tracks by artist or title."),
@@ -132,18 +142,22 @@ func registerTools(s *server.MCPServer, db *sql.DB) {
 	)
 
 	s.AddTool(
-		mcpsdk.NewTool(checkAlbumHistoryToolName,
-			mcpsdk.WithDescription("Check whether an album already exists in the local albums table using Specification 07 clean key normalization. "+recommendationToolInstructions),
-			mcpsdk.WithString("artist",
-				mcpsdk.Required(),
-				mcpsdk.Description("The album artist name. The server normalizes by lowercasing, converting & to and, and stripping punctuation."),
+		mcpsdk.NewTool(getVerifiedCandidatesToolName,
+			mcpsdk.WithDescription("Search live MusicBrainz recording metadata by a raw canonical vibe or semantic fallback tags, then exclude artists, albums, and tracks already present in the local library. For abstract, non-canonical phrases, translate the phrase into canonical MusicBrainz genre tags before calling this tool; for example, map \"erratic rhythm section\" to fallback_tags [\"math rock\", \"idm\", \"breakcore\"]. Provide target_vibe or fallback_tags. "+recommendationToolInstructions),
+			mcpsdk.WithString("target_vibe",
+				mcpsdk.Description("Optional raw vibe or canonical MusicBrainz genre tag. A comma-separated canonical tag list is also accepted. Use fallback_tags instead when the original phrase is abstract or unlikely to be a MusicBrainz tag."),
 			),
-			mcpsdk.WithString("album",
-				mcpsdk.Required(),
-				mcpsdk.Description("The album title. The server normalizes by lowercasing, converting & to and, and stripping punctuation."),
+			mcpsdk.WithArray("fallback_tags",
+				mcpsdk.Description("Optional semantic fallback as canonical MusicBrainz genre tags. When provided, these tags take precedence over target_vibe and are queried together. Example: [\"math rock\", \"idm\", \"breakcore\"]."),
+				mcpsdk.MinItems(1),
+				mcpsdk.UniqueItems(true),
+				mcpsdk.WithStringItems(mcpsdk.MinLength(1)),
+			),
+			mcpsdk.WithInteger("limit",
+				mcpsdk.Description("Maximum candidates to return. Defaults to 5 and is capped at 50."),
 			),
 		),
-		checkAlbumHistoryHandler(db),
+		getVerifiedDiscoveryCandidatesHandler(db, discovery),
 	)
 
 	s.AddTool(
@@ -339,6 +353,63 @@ func getTasteAdjacenciesHandler(db *sql.DB) server.ToolHandlerFunc {
 	}
 }
 
+func getVerifiedDiscoveryCandidatesHandler(db *sql.DB, discovery discoverySource) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		targetVibe, validationErr := optionalStringArgument(request, "target_vibe")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		fallbackTags, validationErr := optionalStringSliceArgument(request, "fallback_tags")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		limit, validationErr := optionalIntegerArgument(request, "limit", defaultDiscoveryCandidateLimit)
+		if validationErr != nil {
+			return validationErr, nil
+		}
+
+		fallbackTags = compactStrings(fallbackTags)
+		searchTags := fallbackTags
+		if len(searchTags) == 0 && strings.TrimSpace(targetVibe) != "" {
+			searchTags = []string{targetVibe}
+		}
+		if len(searchTags) == 0 {
+			return mcpsdk.NewToolResultError("Please provide a non-empty target_vibe or fallback_tags argument."), nil
+		}
+		if limit <= 0 {
+			return mcpsdk.NewToolResultError("The limit argument must be a positive integer."), nil
+		}
+		limit = clampDiscoveryCandidateLimit(limit)
+
+		exclusions, err := (&database.DB{Ctx: db}).GetExclusionListContext(ctx)
+		if err != nil {
+			log.Printf("failed to build discovery exclusion list: %v", err)
+			return mcpsdk.NewToolResultError("Unable to build the discovery exclusion list right now."), nil
+		}
+
+		candidates, err := getVerifiedDiscoveryCandidates(ctx, discovery, searchTags, limit, exclusions)
+		if err != nil {
+			log.Printf("failed to get verified discovery candidates: %v", err)
+			return mcpsdk.NewToolResultError("Unable to retrieve verified discovery candidates right now."), nil
+		}
+
+		payload, err := json.Marshal(verifiedDiscoveryCandidatesToolResult{
+			Instructions:   recommendationToolInstructions,
+			EffectiveLimit: limit,
+			Candidates:     candidates,
+		})
+		if err != nil {
+			log.Printf("failed to encode verified discovery candidates: %v", err)
+			return mcpsdk.NewToolResultError("Unable to encode verified discovery candidates right now."), nil
+		}
+
+		return mcpsdk.NewToolResultText(string(payload)), nil
+	}
+}
+
+// Deprecated: check_album_history is no longer registered as an MCP endpoint.
+// Discovery callers must use get_verified_discovery_candidates so metadata and
+// history exclusion are enforced before candidates enter the LLM context.
 func checkAlbumHistoryHandler(db *sql.DB) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		artist, validationErr := requireStringArgument(request, "artist")
@@ -487,6 +558,12 @@ type albumRatingLog struct {
 	rating      float64
 	inserted    bool
 	rowsUpdated int64
+}
+
+type verifiedDiscoveryCandidatesToolResult struct {
+	Instructions   string               `json:"instructions"`
+	EffectiveLimit int                  `json:"effective_limit"`
+	Candidates     []DiscoveryCandidate `json:"candidates"`
 }
 
 func searchLibraryTracks(ctx context.Context, db *sql.DB, query string) ([]libraryTrack, error) {
@@ -1281,6 +1358,13 @@ func compactStrings(values []string) []string {
 		compacted = append(compacted, value)
 	}
 	return compacted
+}
+
+func clampDiscoveryCandidateLimit(limit int) int {
+	if limit > maxDiscoveryCandidateLimit {
+		return maxDiscoveryCandidateLimit
+	}
+	return limit
 }
 
 func escapeLikePattern(value string) string {

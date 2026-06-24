@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
 type ArtistAffinity struct {
@@ -21,6 +23,68 @@ type GenreTopography struct {
 	FavoriteTracksCount int
 	DislikedTracksCount int
 	AvgAlbumRating      sql.NullFloat64
+}
+
+// GetExclusionList returns normalized artist, album, and track names from the
+// user's library.
+func (db *DB) GetExclusionList() (map[string]bool, error) {
+	return db.GetExclusionListContext(context.Background())
+}
+
+// GetExclusionListContext is the cancellable form used by request handlers.
+func (db *DB) GetExclusionListContext(ctx context.Context) (map[string]bool, error) {
+	if db == nil || db.Ctx == nil {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+
+	return getExclusionList(ctx, db.Ctx)
+}
+
+func getExclusionList(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	exclusions := make(map[string]bool)
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT artist, album, title
+		FROM tracks
+		UNION ALL
+		SELECT artist, title, NULL
+		FROM albums`)
+	if err != nil {
+		return nil, fmt.Errorf("query exclusion names: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var artist, album, track sql.NullString
+		if err := rows.Scan(&artist, &album, &track); err != nil {
+			return nil, fmt.Errorf("scan exclusion names: %w", err)
+		}
+		for _, value := range []sql.NullString{artist, album, track} {
+			if err := addNormalizedExclusion(exclusions, value); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate exclusion names: %w", err)
+	}
+
+	return exclusions, nil
+}
+
+func addNormalizedExclusion(exclusions map[string]bool, value sql.NullString) error {
+	if !value.Valid {
+		return nil
+	}
+
+	normalized, err := utils.NormalizeSearchText(value.String)
+	if err != nil {
+		return fmt.Errorf("normalize exclusion name %q: %w", value.String, err)
+	}
+	if normalized != "" {
+		exclusions[normalized] = true
+	}
+	return nil
 }
 
 func dropAnalyticalViews(db *sql.DB) error {

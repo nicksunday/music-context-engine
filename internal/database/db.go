@@ -16,9 +16,11 @@ const (
 	defaultDatabasePath = "data/music_vault.db"
 )
 
-type DBClient struct {
+type DB struct {
 	Ctx *sql.DB
 }
+
+type DBClient = DB
 
 func InitDB(defaultPath string) (*DBClient, error) {
 	dbPath, err := ResolveDatabasePath(defaultPath)
