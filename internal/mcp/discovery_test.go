@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -172,6 +174,49 @@ func TestGetVerifiedDiscoveryCandidatesCapsResultsPerArtist(t *testing.T) {
 	}
 	if !reflect.DeepEqual(candidates, want) {
 		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want %#v", candidates, want)
+	}
+}
+
+func TestGetVerifiedDiscoveryCandidatesCapsResultsPerNormalizedArtist(t *testing.T) {
+	candidates, err := getVerifiedDiscoveryCandidates(
+		context.Background(),
+		discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
+			return []DiscoveryCandidate{
+				{TrackName: "Svefn-g-englar", Artist: "Sigur Rós", Album: "Ágætis byrjun", Runtime: "10:04", ReleaseYear: 1999},
+				{TrackName: "Starálfur", Artist: "Sigur Ros", Album: "Agaetis byrjun", Runtime: "6:47", ReleaseYear: 1999},
+				{TrackName: "Glósóli", Artist: "Sigur Rós", Album: "Takk...", Runtime: "6:15", ReleaseYear: 2005},
+				{TrackName: "Hyperballad", Artist: "Björk", Album: "Post", Runtime: "5:21", ReleaseYear: 1995},
+			}, nil
+		}),
+		[]string{"post rock"},
+		4,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
+	}
+
+	normalizedArtist := "sigur ros"
+	normalizedArtistCount := 0
+	controlIncluded := false
+	for _, candidate := range candidates {
+		cleanArtist, err := utils.NormalizeSearchText(candidate.Artist)
+		if err != nil {
+			t.Fatalf("NormalizeSearchText(%q) error = %v", candidate.Artist, err)
+		}
+		if cleanArtist == normalizedArtist {
+			normalizedArtistCount++
+		}
+		if candidate.Artist == "Björk" && candidate.TrackName == "Hyperballad" {
+			controlIncluded = true
+		}
+	}
+
+	if normalizedArtistCount > 2 {
+		t.Fatalf("normalized artist count = %d, want at most 2; candidates = %#v", normalizedArtistCount, candidates)
+	}
+	if !controlIncluded {
+		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want control candidate included", candidates)
 	}
 }
 

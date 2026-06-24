@@ -227,13 +227,12 @@ func getVerifiedDiscoveryCandidates(
 		}
 		seen[candidateKey] = true
 
-		cleanArtistKey := strings.ToLower(strings.TrimSpace(candidate.Artist))
-		if artistCount[cleanArtistKey] >= 2 {
+		if artistCount[cleanArtist] >= 2 {
 			continue
 		}
 
 		candidates = append(candidates, candidate)
-		artistCount[cleanArtistKey]++
+		artistCount[cleanArtist]++
 		if len(candidates) == limit {
 			break
 		}
