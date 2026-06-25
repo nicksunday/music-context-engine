@@ -23,11 +23,26 @@ This platform treats your listening history as entirely private, local-first sta
 * **What it provides:** Track-level library state from your cloud streaming ecosystem.
 * **Ingestion Mechanics:** Extracts track and streaming metadata from your official Google Takeout uploads CSV (`data/music uploads metadata.csv`). If a track is missing explicit artist metadata during ingestion, the pipeline safely falls back to a standardized `Unknown Artist` tag to maintain relational database integrity.
 
-### 4. Apple Music (Upcoming Pipeline Hook)
-* **Extraction Method Options:** 1. **Native Desktop Export:** Launch the Apple Music app on Mac/PC and execute `File > Library > Export Playlist` (selecting `Text files` or `XML`) to pull raw track metadata strings.
-  2. **Apple Privacy Dump:** Request a formal historical archive from Apple's Data and Privacy portal to fetch JSON listening logs.
-* **What it will provide:** Primary local-library sync and active track playlists.
-* **Ingestion Strategy:** Future CLI updates will introduce `music-vault ingest *.txt` or `music-vault ingest *.xml` to map native Apple schema fields (Track Name, Artist, Album, Play Count) directly into the core `tracks` and `albums` relations.
+### 4. Apple Music
+* **Extraction Sources:** Native Apple Music playlist/library CSV-style exports and Apple Data & Privacy archive files.
+* **What it provides:** Local-library sync, explicit likes/dislikes, album track counts, and playback telemetry for skip/history analysis.
+* **Ingestion Mechanics:** The `music-vault ingest` command content-sniffs headers and JSON keys, so Apple Music files can be passed directly alongside other exports:
+  ```sh
+  music-vault ingest \
+    "data/Apple Music Library Tracks.json" \
+    "data/Apple Music Library Activity.json" \
+    "data/Apple Music - Favorites.csv" \
+    "data/Apple Music Play Activity.csv" \
+    "data/Apple Music - Track Play History.csv"
+  ```
+  Supported Apple Music contracts are:
+  * **Native likes/library CSV:** Files whose first columns are `Name,Artist,Composer,Album` are treated as positive library intent. Existing tracks are marked `is_favorite = 1` and `is_disliked = 0`; missing tracks self-heal into `tracks` and `albums`, falling back to `Unknown Artist` or `Unknown Album` when needed.
+  * **Favorites CSV:** Apple Data & Privacy files with `Favorite Type`, `Item Description`, and `Preference` parse song rows such as `Artist - Title`. `LIKE`/`liked` values set `is_favorite = 1`; `DISLIKE`/`disliked` values set `is_disliked = 1` and clear favorite status.
+  * **Library Tracks JSON:** `Apple Music Library Tracks.json` arrays create or update track and album rows from `Title`, `Artist`/`Album Artist`, and `Album`. `Favorite Status - Track` and `Track Like Rating` map into the same favorite/disliked flags, while `Track Count On Album` updates `albums.track_count`.
+  * **Library Activity JSON:** `Apple Music Library Activity.json` transaction arrays process nested `Tracks`, including later update records that reference only `Track Identifier`. This keeps affinity flags and album track counts synchronized as Apple reports library changes over time.
+  * **Play telemetry CSV:** `Apple Music Play Activity.csv` rows are stored in `apple_music_play_activity` with `end_reason_type`, `play_duration_ms`, and a computed `was_skipped` flag whenever the end reason contains `SKIP`.
+  * **Track Play History CSV:** `Apple Music - Track Play History.csv` stores compact playback rows in the same telemetry table after parsing `Track Name` values formatted as `Artist - Title` and converting Apple epoch-millisecond timestamps to UTC.
+* **Noise Filtering:** Play telemetry skips ambient/background signatures such as `White Noise`, `Bedtime Mix`, `Rain Sounds`, `Sleeping`, `Ocean Waves`, and `Radiance` before writing analytics facts.
 
 ---
 
