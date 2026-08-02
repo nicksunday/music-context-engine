@@ -39,26 +39,26 @@ const (
 	defaultTasteArtistLimit = 12
 	defaultTasteGenreLimit  = 20
 
-	recommendationToolInstructions = `Use the local affinity/topography data as grounding. Enforce the sourcing hierarchy when researching: Metal Depth -> Encyclopaedia Metallum (metal-archives.com) and Shreddit Release Tracker; Progressive/Rock/Fusion -> ProgArchives (progarchives.com) and Fecking Bahamas (feckingbahamas.com); Roots/Virtuosic Acoustic -> Bluegrass Today (bluegrasstoday.com) and No Depression (nodepression.com); Hip Hop/Rap/Production -> HipHopDX (hiphopdx.com), Passion of the Weiss (passionweiss.com), and Dead End Hip Hop (deadendhiphop.com); Experimental/Electronic/Avant-Garde -> The Quietus (thequietus.com) and Resident Advisor (residentadvisor.net); Historical Canon -> 1001 Albums You Must Hear Before You Die and community-curated variations. Cross-reference musician pedigree and prefer sonic topology overlap over broad commercial genres. Final recommendation output must be grouped under Direct Adjacencies and Cross-Genre Wildcards.
+	recommendationToolInstructions = `Ground every recommendation only in data actually returned by these tools: the local affinity/topography context and each candidate's genre_tags field. Do not claim to have consulted, cross-referenced, or sourced from any external publication, database, or website (e.g. metal-archives.com, ProgArchives, HipHopDX, Resident Advisor) — you have no live access to them, and describing them as sources fabricates provenance. Prefer overlap between a candidate's genre_tags and the local genre topography over broad commercial genre labels. Final recommendation output must be grouped under Direct Adjacencies and Cross-Genre Wildcards.
 
 CRITICAL OUTPUT CONTRACT:
 1. STRICT TWO-SENTENCE LIMIT: The structural breakdown for each track MUST be exactly two sentences long. No run-on sentences, semicolons, or excessive comma splices to bypass this limit.
-2. ANTI-GASLIGHTING RULE: If your pre-training data lacks deep, explicit knowledge of a track's actual sonic arrangements, you are FORBIDDEN from inventing descriptions (e.g., fabricating guitar style, production credits, or vocal style).
-3. KNOWLEDGE FALLBACK: For obscure tracks, pivot the two sentences strictly to verifiable historical context, such as: "Returned via canonical tags [X]. While exact tracking arrangements are outside local parameters, [Artist] emerged from the [Year] [Scene/Subgenre] movement, mirroring the structural timeline of your request."`
+2. ANTI-GASLIGHTING RULE: If your pre-training data lacks deep, explicit knowledge of a track's actual sonic arrangements, you are FORBIDDEN from inventing descriptions (e.g., fabricating guitar style, production credits, vocal style, press coverage, or reviews).
+3. KNOWLEDGE FALLBACK: If genre_tags is empty, or your pre-training knowledge of the track is thin, pivot the two sentences strictly to what was actually returned, such as: "Returned via genre_tags [X, Y]. While exact sonic arrangement details are outside local parameters, [Artist]'s presence in that tag space overlaps with your [subgenre] affinity."`
 )
 
 func NewServer(db *sql.DB) *server.MCPServer {
-	return newServer(db, defaultDiscoverySource())
+	return newServer(db, defaultDiscoverySource(), defaultSimilarArtistSource())
 }
 
-func newServer(db *sql.DB, discovery discoverySource) *server.MCPServer {
+func newServer(db *sql.DB, discovery discoverySource, similar similarArtistSource) *server.MCPServer {
 	s := server.NewMCPServer(
 		serverName,
 		serverVersion,
 		server.WithToolCapabilities(false),
 	)
 
-	registerTools(s, db, discovery)
+	registerTools(s, db, discovery, similar)
 
 	return s
 }
@@ -67,7 +67,7 @@ func ServeStdio(db *sql.DB) error {
 	return server.ServeStdio(NewServer(db))
 }
 
-func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource) {
+func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, similar similarArtistSource) {
 	s.AddTool(
 		mcpsdk.NewTool(getLibraryTracksToolName,
 			mcpsdk.WithDescription("Search local library tracks by artist or title."),
@@ -129,7 +129,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource) {
 
 	s.AddTool(
 		mcpsdk.NewTool(getTasteAdjacenciesToolName,
-			mcpsdk.WithDescription("Return local artist affinity and micro-genre topography context for discovery. "+recommendationToolInstructions),
+			mcpsdk.WithDescription("Return local artist affinity, micro-genre topography, and Last.fm-derived real adjacent-artist context for discovery. "+recommendationToolInstructions),
 			mcpsdk.WithArray("seed_artists",
 				mcpsdk.Description("Optional artist names to build outward from. If omitted or empty, the user's top high-affinity artists are used."),
 				mcpsdk.WithStringItems(),
@@ -138,7 +138,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource) {
 				mcpsdk.Description("Optional sonic, technical, or mood descriptor to guide the discovery search."),
 			),
 		),
-		getTasteAdjacenciesHandler(db),
+		getTasteAdjacenciesHandler(db, similar),
 	)
 
 	s.AddTool(
@@ -332,7 +332,7 @@ func getAlbumTracksHandler(db *sql.DB) server.ToolHandlerFunc {
 	}
 }
 
-func getTasteAdjacenciesHandler(db *sql.DB) server.ToolHandlerFunc {
+func getTasteAdjacenciesHandler(db *sql.DB, similar similarArtistSource) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		seedArtists, validationErr := optionalStringSliceArgument(request, "seed_artists")
 		if validationErr != nil {
@@ -343,7 +343,7 @@ func getTasteAdjacenciesHandler(db *sql.DB) server.ToolHandlerFunc {
 			return validationErr, nil
 		}
 
-		profile, err := fetchTasteAdjacencyProfile(ctx, db, seedArtists)
+		profile, err := fetchTasteAdjacencyProfile(ctx, db, seedArtists, similar)
 		if err != nil {
 			log.Printf("failed to query taste adjacency profile: %v", err)
 			return mcpsdk.NewToolResultError("Unable to query taste adjacency context right now."), nil
@@ -510,10 +510,21 @@ type albumTrack struct {
 }
 
 type tasteAdjacencyProfile struct {
-	seedArtists        []string
-	missingSeedArtists []string
-	artistAffinities   []artistAffinityContext
-	genreTopography    []genreTopographyContext
+	seedArtists                []string
+	missingSeedArtists         []string
+	artistAffinities           []artistAffinityContext
+	genreTopography            []genreTopographyContext
+	realAdjacentArtists        []realAdjacentArtist
+	similarArtistDataAvailable bool
+}
+
+// realAdjacentArtist is an artist Last.fm reports as similar to one of the
+// user's seed artists, and who does not already appear in the local
+// library. matchScore is Last.fm's own similarity score (roughly 0-1).
+type realAdjacentArtist struct {
+	artist          string
+	similarToArtist string
+	matchScore      float64
 }
 
 type artistAffinityContext struct {
@@ -822,7 +833,7 @@ func fetchAlbumTracks(ctx context.Context, db *sql.DB, artist, album string) ([]
 	return tracks, nil
 }
 
-func fetchTasteAdjacencyProfile(ctx context.Context, db *sql.DB, seedArtists []string) (tasteAdjacencyProfile, error) {
+func fetchTasteAdjacencyProfile(ctx context.Context, db *sql.DB, seedArtists []string, similar similarArtistSource) (tasteAdjacencyProfile, error) {
 	seedArtists = compactStrings(seedArtists)
 	profile := tasteAdjacencyProfile{
 		seedArtists: seedArtists,
@@ -863,7 +874,99 @@ func fetchTasteAdjacencyProfile(ctx context.Context, db *sql.DB, seedArtists []s
 		return tasteAdjacencyProfile{}, err
 	}
 
+	profile.similarArtistDataAvailable = similar != nil
+	if similar != nil {
+		profile.realAdjacentArtists, err = fetchRealAdjacentArtists(ctx, db, similar, profile.artistAffinities)
+		if err != nil {
+			return tasteAdjacencyProfile{}, err
+		}
+	}
+
 	return profile, nil
+}
+
+// fetchRealAdjacentArtists queries Last.fm for artists similar to the
+// highest-affinity seed artists, then filters out anything already present
+// in the local library so the result is genuinely new-to-the-user adjacency
+// data rather than the LLM's own guess at what's "adjacent." A per-seed
+// lookup failure is logged and skipped rather than failing the whole call,
+// since Last.fm coverage for obscure artists is inconsistent.
+func fetchRealAdjacentArtists(ctx context.Context, db *sql.DB, similar similarArtistSource, seeds []artistAffinityContext) ([]realAdjacentArtist, error) {
+	if similar == nil || len(seeds) == 0 {
+		return nil, nil
+	}
+
+	seedCount := len(seeds)
+	if seedCount > maxAdjacencySeedArtists {
+		seedCount = maxAdjacencySeedArtists
+	}
+
+	best := make(map[string]realAdjacentArtist)
+	for _, seed := range seeds[:seedCount] {
+		results, err := similar.SimilarArtists(ctx, seed.artist, maxSimilarArtistsPerSeed)
+		if err != nil {
+			log.Printf("last.fm similar-artist lookup failed for %q: %v", seed.artist, err)
+			continue
+		}
+
+		for _, candidate := range results {
+			cleanCandidate, err := utils.NormalizeSearchText(candidate.Name)
+			if err != nil || cleanCandidate == "" || cleanCandidate == seed.cleanArtist {
+				continue
+			}
+
+			inLibrary, err := artistExistsInLibrary(ctx, db, cleanCandidate)
+			if err != nil {
+				return nil, err
+			}
+			if inLibrary {
+				continue
+			}
+
+			existing, ok := best[cleanCandidate]
+			if !ok || candidate.Match > existing.matchScore {
+				best[cleanCandidate] = realAdjacentArtist{
+					artist:          candidate.Name,
+					similarToArtist: seed.artist,
+					matchScore:      candidate.Match,
+				}
+			}
+		}
+	}
+
+	adjacents := make([]realAdjacentArtist, 0, len(best))
+	for _, adjacent := range best {
+		adjacents = append(adjacents, adjacent)
+	}
+	sort.SliceStable(adjacents, func(i, j int) bool {
+		if adjacents[i].matchScore != adjacents[j].matchScore {
+			return adjacents[i].matchScore > adjacents[j].matchScore
+		}
+		return strings.ToLower(adjacents[i].artist) < strings.ToLower(adjacents[j].artist)
+	})
+	if len(adjacents) > maxRealAdjacentArtists {
+		adjacents = adjacents[:maxRealAdjacentArtists]
+	}
+
+	return adjacents, nil
+}
+
+// artistExistsInLibrary reports whether clean_artist already has at least
+// one track or album row, i.e. whether the user's library already contains
+// this artist in some form.
+func artistExistsInLibrary(ctx context.Context, db *sql.DB, cleanArtist string) (bool, error) {
+	const stmt = `
+		SELECT EXISTS(
+			SELECT 1 FROM tracks WHERE clean_artist = ?
+			UNION
+			SELECT 1 FROM albums WHERE clean_artist = ?
+		)`
+
+	var exists bool
+	if err := db.QueryRowContext(ctx, stmt, cleanArtist, cleanArtist).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func fetchTopArtistAffinityContexts(ctx context.Context, db *sql.DB, limit int) ([]artistAffinityContext, error) {
@@ -1229,10 +1332,9 @@ func formatTasteAdjacencyProfileMarkdown(profile tasteAdjacencyProfile, targetVi
 	builder.WriteString("\n")
 
 	builder.WriteString("### LLM Recommendation Contract\n")
-	builder.WriteString("- Prioritize the sourcing hierarchy in the tool definition before broad web or memory claims.\n")
-	builder.WriteString("- Cross-reference musician pedigree, side projects, guest/session personnel, and production credits.\n")
-	builder.WriteString("- Rank by sonic topology overlap: technical density, rhythm, arrangement, and execution over generic genre labels.\n")
-	builder.WriteString("- Final recommendation output must use exactly these groups: Direct Adjacencies and Cross-Genre Wildcards.\n\n")
+	builder.WriteString("- Ground adjacency claims in the Real Adjacent Artists table below (real Last.fm similarity data), not in unverified pedigree, side-project, or session-credit claims.\n")
+	builder.WriteString("- Prefer overlap between a candidate's genre_tags (from get_verified_discovery_candidates) and this profile's genre topography over broad commercial genre labels.\n")
+	builder.WriteString("- Final recommendation output must use exactly these groups: Direct Adjacencies and Cross-Genre Wildcards. Omit Cross-Genre Wildcards entirely rather than inventing a weak fit if nothing here supports one.\n\n")
 
 	builder.WriteString("### Artist Affinity Matrix\n")
 	if len(profile.artistAffinities) == 0 {
@@ -1255,6 +1357,26 @@ func formatTasteAdjacencyProfileMarkdown(profile tasteAdjacencyProfile, targetVi
 	}
 	if len(profile.missingSeedArtists) > 0 {
 		fmt.Fprintf(&builder, "\nMissing seed artists in local affinity view: %s\n", strings.Join(profile.missingSeedArtists, ", "))
+	}
+	builder.WriteString("\n")
+
+	builder.WriteString("### Real Adjacent Artists (Last.fm similarity, not yet in your library)\n")
+	if !profile.similarArtistDataAvailable {
+		builder.WriteString("Last.fm similarity lookup is not configured (LASTFM_API_KEY unset); no real-data adjacency available for this call.\n")
+	} else if len(profile.realAdjacentArtists) == 0 {
+		builder.WriteString("No similar-artist data returned for these seed artists.\n")
+	} else {
+		builder.WriteString("| Artist | Similar To | Match |\n")
+		builder.WriteString("| --- | --- | ---: |\n")
+		for _, adjacent := range profile.realAdjacentArtists {
+			fmt.Fprintf(
+				&builder,
+				"| %s | %s | %.2f |\n",
+				formatMarkdownTableCell(adjacent.artist),
+				formatMarkdownTableCell(adjacent.similarToArtist),
+				adjacent.matchScore,
+			)
+		}
 	}
 	builder.WriteString("\n")
 

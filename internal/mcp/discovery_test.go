@@ -28,8 +28,8 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 		if got := request.URL.Query().Get("fmt"); got != "json" {
 			t.Errorf("fmt = %q, want json", got)
 		}
-		if got := request.URL.Query().Get("inc"); got != "artist-rels+release-groups+aliases" {
-			t.Errorf("inc = %q, want artist-rels+release-groups+aliases", got)
+		if got := request.URL.Query().Get("inc"); got != "artist-rels+release-groups+aliases+tags" {
+			t.Errorf("inc = %q, want artist-rels+release-groups+aliases+tags", got)
 		}
 		if got := request.URL.Query().Get("limit"); got != "20" {
 			t.Errorf("limit = %q, want 20", got)
@@ -93,7 +93,12 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 						"status": "Official",
 						"date": "1974-03-29",
 						"release-group": {"primary-type": "Album"}
-					}]
+					}],
+					"tags": [
+						{"name": "progressive rock", "count": 12},
+						{"name": "canterbury scene", "count": 3},
+						{"name": "Progressive Rock", "count": 1}
+					]
 				},
 				{
 					"title": "Missing Runtime",
@@ -140,6 +145,7 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 		Album:       "Starless and Bible Black",
 		Runtime:     "11:11",
 		ReleaseYear: 1974,
+		GenreTags:   []string{"progressive rock", "canterbury scene"},
 	}}
 	if !reflect.DeepEqual(candidates, want) {
 		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want %#v", candidates, want)
@@ -365,6 +371,24 @@ func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAliases(t *testing.T) {
 				t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want title variant to be excluded", candidates)
 			}
 		})
+	}
+}
+
+func TestMusicBrainzTagNamesSortsDedupesAndLimits(t *testing.T) {
+	tags := []musicBrainzTag{
+		{Name: "idm", Count: 5},
+		{Name: "  ", Count: 99},
+		{Name: "Math Rock", Count: 20},
+		{Name: "math rock", Count: 1},
+		{Name: "breakcore", Count: 12},
+		{Name: "electronic", Count: 3},
+		{Name: "experimental", Count: 2},
+	}
+
+	got := musicBrainzTagNames(tags, 3)
+	want := []string{"Math Rock", "breakcore", "idm"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("musicBrainzTagNames() = %#v, want %#v", got, want)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,16 +27,18 @@ const (
 	defaultMusicBrainzBaseURL      = "https://musicbrainz.org/ws/2"
 	defaultDiscoveryUserAgent      = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
 	maxDiscoveryResponseBytes      = 4 << 20
+	maxCandidateGenreTags          = 6
 )
 
 // DiscoveryCandidate is metadata returned by the external discovery source
 // after validation and local-library exclusion.
 type DiscoveryCandidate struct {
-	TrackName   string `json:"track_name"`
-	Artist      string `json:"artist"`
-	Album       string `json:"album"`
-	Runtime     string `json:"runtime"`
-	ReleaseYear int    `json:"release_year"`
+	TrackName   string   `json:"track_name"`
+	Artist      string   `json:"artist"`
+	Album       string   `json:"album"`
+	Runtime     string   `json:"runtime"`
+	ReleaseYear int      `json:"release_year"`
+	GenreTags   []string `json:"genre_tags,omitempty"`
 
 	trackExclusionNames []string
 	albumExclusionNames []string
@@ -75,6 +78,14 @@ type musicBrainzRecording struct {
 	Aliases          []musicBrainzAlias        `json:"aliases"`
 	ArtistCredit     []musicBrainzArtistCredit `json:"artist-credit"`
 	Releases         []musicBrainzRelease      `json:"releases"`
+	Tags             []musicBrainzTag          `json:"tags"`
+}
+
+// musicBrainzTag is a community folksonomy tag on a recording. Count is the
+// number of users who applied it, which we use as a relevance proxy.
+type musicBrainzTag struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
 }
 
 type musicBrainzAlias struct {
@@ -332,7 +343,7 @@ func (client *musicBrainzDiscoveryClient) searchEndpoint(searchTags []string, li
 
 	query := endpoint.Query()
 	query.Set("fmt", "json")
-	query.Set("inc", "artist-rels+release-groups+aliases")
+	query.Set("inc", "artist-rels+release-groups+aliases+tags")
 	query.Set("limit", strconv.Itoa(min(limit, maxMusicBrainzSearchLimit)))
 	query.Set(
 		"query",
@@ -426,6 +437,7 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 			Album:       album,
 			Runtime:     runtimeFromMilliseconds(recording.Length),
 			ReleaseYear: releaseYear,
+			GenreTags:   musicBrainzTagNames(recording.Tags, maxCandidateGenreTags),
 		}
 		if trackAlias != "" {
 			candidate.trackExclusionNames = []string{recording.Title, trackAlias}
@@ -440,6 +452,37 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+// musicBrainzTagNames returns up to limit deduplicated tag names from tags,
+// ordered by how many users applied each one (most-applied first). This is
+// what lets a caller see *why* a candidate matched a tag search instead of
+// just getting a bare track/artist/album triple.
+func musicBrainzTagNames(tags []musicBrainzTag, limit int) []string {
+	sorted := make([]musicBrainzTag, len(tags))
+	copy(sorted, tags)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Count > sorted[j].Count
+	})
+
+	names := make([]string, 0, limit)
+	seen := make(map[string]bool, len(sorted))
+	for _, tag := range sorted {
+		name := strings.TrimSpace(tag.Name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		names = append(names, name)
+		if len(names) == limit {
+			break
+		}
+	}
+	return names
 }
 
 func musicBrainzDisplayTitle(

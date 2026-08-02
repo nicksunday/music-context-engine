@@ -57,7 +57,8 @@ Once raw data is ingested, the library state is extended via asynchronous metada
 
 Rather than relying on LLMs to blind-guess music recommendations and validating them reactively, the platform implements a proactive filtering design over the Model Context Protocol:
 * **Pre-Exclusion Filtering:** The server builds an in-memory database exclusion map of your entire track, album, and artist history using Unicode string normalization rules.
-* **MusicBrainz Integration:** External discovery requests leverage live MusicBrainz metadata queries wrapped in a padded fetch buffer (`limit * 4`) to prevent result starvation during data stripping.
+* **MusicBrainz Integration:** External discovery requests leverage live MusicBrainz metadata queries wrapped in a padded fetch buffer (`limit * 4`) to prevent result starvation during data stripping. Matched community genre tags are returned alongside each candidate (`genre_tags`) so the LLM can ground its reasoning in what actually matched, rather than inventing sourcing.
+* **Real Artist Adjacency:** If a `LASTFM_API_KEY` is present, `get_taste_adjacencies` also queries Last.fm's `artist.getsimilar` for your top-affinity artists and surfaces similar artists that are **not** already in your local library, so "adjacent" reflects real listening/tagging data instead of the LLM's own guess at what's similar. Without a key, this section is omitted rather than faked.
 * **Monotony & Anti-Anchoring Guardrails:** The protocol layer enforces a strict limit of 2 tracks per artist to ensure discovery variety, while forcing the LLM to prioritize your active "target vibe" over past library anchors.
 
 ## Technical Stack & Layout

@@ -27,6 +27,16 @@ func (fn discoverySourceFunc) Search(
 	return fn(ctx, searchTags, limit)
 }
 
+type similarArtistSourceFunc func(context.Context, string, int) ([]similarArtist, error)
+
+func (fn similarArtistSourceFunc) SimilarArtists(
+	ctx context.Context,
+	artist string,
+	limit int,
+) ([]similarArtist, error) {
+	return fn(ctx, artist, limit)
+}
+
 func TestSearchLibraryTracksNormalizesQuery(t *testing.T) {
 	db := openTestDB(t)
 
@@ -350,7 +360,7 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 				ReleaseYear: 2009,
 			},
 		}, nil
-	}))
+	}), nil)
 	tools := mcpServer.ListTools()
 	wantToolNames := []string{
 		getLibraryTracksToolName,
@@ -411,6 +421,70 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 	assertToolResponseContains(getTasteAdjacenciesToolName, map[string]any{"seed_artists": []any{"Mastodon"}, "target_vibe": "erratic rhythm section"}, "Direct Adjacencies")
 	assertToolResponseContains(getVerifiedCandidatesToolName, map[string]any{"target_vibe": "erratic rhythm section", "limit": 1}, `"track_name":"CAFO"`)
 	assertToolResponseContains(logAlbumRatingToolName, map[string]any{"artist": "Beyoncé", "album": "I Am... Sasha Fierce", "rating": 4.2}, "Updated")
+}
+
+func TestFetchTasteAdjacencyProfileSurfacesRealAdjacentArtistsNotInLibrary(t *testing.T) {
+	db := openTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO tracks (id, title, album, artist, clean_title, clean_artist, genres, is_favorite)
+		VALUES
+			('track-1', 'Blood and Thunder', 'Leviathan', 'Mastodon', 'blood and thunder', 'mastodon', '["sludge metal"]', 1),
+			('track-2', 'Halo', 'I Am... Sasha Fierce', 'Beyoncé', 'halo', 'beyonce', '["pop"]', 0)`)
+	if err != nil {
+		t.Fatalf("failed to insert fixtures: %v", err)
+	}
+
+	similar := similarArtistSourceFunc(func(_ context.Context, artist string, _ int) ([]similarArtist, error) {
+		if artist != "Mastodon" {
+			t.Fatalf("SimilarArtists() called with unexpected artist %q", artist)
+		}
+		return []similarArtist{
+			{Name: "Gojira", Match: 0.91},
+			{Name: "Beyoncé", Match: 0.5}, // already in library; must be excluded
+		}, nil
+	})
+
+	profile, err := fetchTasteAdjacencyProfile(context.Background(), db.Ctx, []string{"Mastodon"}, similar)
+	if err != nil {
+		t.Fatalf("fetchTasteAdjacencyProfile() error = %v", err)
+	}
+
+	if !profile.similarArtistDataAvailable {
+		t.Fatal("similarArtistDataAvailable = false, want true when a similarArtistSource is provided")
+	}
+	if len(profile.realAdjacentArtists) != 1 {
+		t.Fatalf("realAdjacentArtists = %#v, want exactly one entry", profile.realAdjacentArtists)
+	}
+	got := profile.realAdjacentArtists[0]
+	if got.artist != "Gojira" || got.similarToArtist != "Mastodon" || !floatClose(got.matchScore, 0.91) {
+		t.Fatalf("realAdjacentArtists[0] = %#v, want Gojira similar to Mastodon at 0.91", got)
+	}
+
+	markdown := formatTasteAdjacencyProfileMarkdown(profile, "")
+	if !strings.Contains(markdown, "Gojira") {
+		t.Fatalf("markdown = %q, want it to contain Gojira", markdown)
+	}
+	if strings.Contains(markdown, "| Beyoncé |") {
+		t.Fatalf("markdown = %q, want already-in-library Beyoncé excluded from the adjacency table", markdown)
+	}
+}
+
+func TestFetchTasteAdjacencyProfileWithoutSimilarSourceNotesUnavailable(t *testing.T) {
+	db := openTestDB(t)
+
+	profile, err := fetchTasteAdjacencyProfile(context.Background(), db.Ctx, nil, nil)
+	if err != nil {
+		t.Fatalf("fetchTasteAdjacencyProfile() error = %v", err)
+	}
+	if profile.similarArtistDataAvailable {
+		t.Fatal("similarArtistDataAvailable = true, want false when no similarArtistSource is provided")
+	}
+
+	markdown := formatTasteAdjacencyProfileMarkdown(profile, "")
+	if !strings.Contains(markdown, "not configured") {
+		t.Fatalf("markdown = %q, want it to note Last.fm similarity is not configured", markdown)
+	}
 }
 
 func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
@@ -559,7 +633,7 @@ func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *test
 			{TrackName: "T69 Collapse", Artist: "Aphex Twin", Album: "Collapse EP", Runtime: "5:22", ReleaseYear: 2018},
 		}, nil
 	})
-	tool, ok := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	tool, ok := newServer(db.Ctx, discovery, nil).ListTools()[getVerifiedCandidatesToolName]
 	if !ok {
 		t.Fatalf("registered tool %q not found", getVerifiedCandidatesToolName)
 	}
@@ -627,7 +701,7 @@ func TestVerifiedDiscoveryCandidatesHandlerRoutesFallbackTagsToDiscoverySource(t
 			ReleaseYear: 2009,
 		}}, nil
 	})
-	tool := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	tool := newServer(db.Ctx, discovery, nil).ListTools()[getVerifiedCandidatesToolName]
 	testServer, err := mcptest.NewServer(t, *tool)
 	if err != nil {
 		t.Fatalf("failed to start MCP test server: %v", err)
@@ -675,7 +749,7 @@ func TestVerifiedDiscoveryCandidatesHandlerClampsLimitAndIncludesInstructions(t 
 			ReleaseYear: 1987,
 		}}, nil
 	})
-	tool := newServer(db.Ctx, discovery).ListTools()[getVerifiedCandidatesToolName]
+	tool := newServer(db.Ctx, discovery, nil).ListTools()[getVerifiedCandidatesToolName]
 	testServer, err := mcptest.NewServer(t, *tool)
 	if err != nil {
 		t.Fatalf("failed to start MCP test server: %v", err)
