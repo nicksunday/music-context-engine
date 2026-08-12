@@ -196,8 +196,10 @@ func runEnrich(args []string) {
 	flags := flag.NewFlagSet("enrich", flag.ExitOnError)
 	var dbPath string
 	registerDatabaseFlag(flags, &dbPath)
+	maxRetries := flags.Int("max-retries", enrich.DefaultMaxTransientRetries, "max retries for a transient (5xx/429) upstream error before skipping the record for this run")
+	retryDelay := flags.Duration("retry-delay", enrich.DefaultTransientRetryDelay, "base backoff delay between retries, doubled each attempt (e.g. 2s, 5s)")
 	flags.Usage = func() {
-		fmt.Fprintf(flags.Output(), "Usage: music-vault enrich [--db path]\n")
+		fmt.Fprintf(flags.Output(), "Usage: music-vault enrich [--db path] [--max-retries n] [--retry-delay duration]\n")
 	}
 	if err := flags.Parse(args); err != nil {
 		log.Fatalf("failed to parse enrich args: %v", err)
@@ -216,6 +218,8 @@ func runEnrich(args []string) {
 	config := enrich.DefaultConfig()
 	config.LastFMAPIKey = os.Getenv(enrich.LastFMAPIKeyEnv)
 	config.Logger = log.Default()
+	config.MaxTransientRetries = *maxRetries
+	config.TransientRetryDelay = *retryDelay
 
 	if config.LastFMAPIKey == "" {
 		fmt.Printf("%s is not set; Last.fm tags will be skipped.\n", enrich.LastFMAPIKeyEnv)
@@ -228,8 +232,14 @@ func runEnrich(args []string) {
 
 	fmt.Printf("Scanned albums: %d\n", result.AlbumsScanned)
 	fmt.Printf("Albums enriched: %d\n", result.AlbumsUpdated)
+	if result.AlbumsSkippedTransient > 0 {
+		fmt.Printf("Albums skipped this run due to transient upstream errors (will retry next run): %d\n", result.AlbumsSkippedTransient)
+	}
 	fmt.Printf("Scanned artists: %d\n", result.ArtistsScanned)
 	fmt.Printf("Artists enriched: %d\n", result.ArtistsUpdated)
+	if result.ArtistsSkippedTransient > 0 {
+		fmt.Printf("Artists skipped this run due to transient upstream errors (will retry next run): %d\n", result.ArtistsSkippedTransient)
+	}
 	fmt.Printf("Records updated: %d\n", result.RecordsUpdated)
 }
 

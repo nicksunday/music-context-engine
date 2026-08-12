@@ -46,7 +46,7 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `fallback_tags` (array of strings, optional): Canonical MusicBrainz genre tags derived from an abstract phrase. For example, `"erratic rhythm section"` becomes `["math rock", "idm", "breakcore"]`.
   - `limit` (integer, optional): Maximum candidates to return (Default: 5; maximum: 50).
 - **Validation:** At least one of `target_vibe` or `fallback_tags` is required. When both are supplied, `fallback_tags` takes precedence.
-- **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world track metadata).
+- **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world recording metadata with album fields). Recommendation clients should present candidates as album recommendations by default and use `track_name` as the starter track to sample.
 
 ### Tool: `log_album_rating`
 - **Description:** Persist a local album rating to `albums.user_rating` using Specification 07 clean key normalization; insert a UUID-backed album row if absent.

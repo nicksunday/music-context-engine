@@ -198,6 +198,7 @@ func getVerifiedDiscoveryCandidates(
 
 	candidates := make([]DiscoveryCandidate, 0, limit)
 	seen := make(map[string]bool)
+	seenAlbums := make(map[string]bool)
 	artistCount := make(map[string]int)
 	for _, candidate := range liveCandidates {
 		if err := validateDiscoveryCandidate(candidate); err != nil {
@@ -236,13 +237,19 @@ func getVerifiedDiscoveryCandidates(
 		if seen[candidateKey] {
 			continue
 		}
-		seen[candidateKey] = true
+
+		albumKeys := discoveryAlbumKeys(cleanArtist, cleanAlbum, cleanAlbumNames)
+		if containsSeenValue(seenAlbums, albumKeys) {
+			continue
+		}
 
 		if artistCount[cleanArtist] >= 2 {
 			continue
 		}
 
 		candidates = append(candidates, candidate)
+		seen[candidateKey] = true
+		markSeenValues(seenAlbums, albumKeys)
 		artistCount[cleanArtist]++
 		if len(candidates) == limit {
 			break
@@ -261,6 +268,40 @@ func discoverySearchLimit(limit int) int {
 		searchLimit = maxMusicBrainzSearchLimit
 	}
 	return searchLimit
+}
+
+func discoveryAlbumKeys(cleanArtist string, cleanAlbum string, alternateCleanAlbums []string) []string {
+	values := append([]string{cleanAlbum}, alternateCleanAlbums...)
+	keys := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := cleanArtist + "\x00" + value
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func containsSeenValue(seen map[string]bool, values []string) bool {
+	for _, value := range values {
+		if seen[value] {
+			return true
+		}
+	}
+	return false
+}
+
+func markSeenValues(seen map[string]bool, values []string) {
+	for _, value := range values {
+		seen[value] = true
+	}
 }
 
 func (client *musicBrainzDiscoveryClient) Search(

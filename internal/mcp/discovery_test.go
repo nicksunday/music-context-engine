@@ -183,6 +183,35 @@ func TestGetVerifiedDiscoveryCandidatesCapsResultsPerArtist(t *testing.T) {
 	}
 }
 
+func TestGetVerifiedDiscoveryCandidatesDeduplicatesAlbums(t *testing.T) {
+	candidates, err := getVerifiedDiscoveryCandidates(
+		context.Background(),
+		discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
+			return []DiscoveryCandidate{
+				{TrackName: "Starter One", Artist: "Album Project", Album: "One Album", Runtime: "3:01", ReleaseYear: 2020},
+				{TrackName: "Starter Two", Artist: "Album Project", Album: "One Album", Runtime: "3:02", ReleaseYear: 2020},
+				{TrackName: "Next Album", Artist: "Album Project", Album: "Second Album", Runtime: "3:03", ReleaseYear: 2021},
+				{TrackName: "Other One", Artist: "Other Project", Album: "Other Album", Runtime: "3:04", ReleaseYear: 2022},
+			}, nil
+		}),
+		[]string{"industrial"},
+		4,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
+	}
+
+	want := []DiscoveryCandidate{
+		{TrackName: "Starter One", Artist: "Album Project", Album: "One Album", Runtime: "3:01", ReleaseYear: 2020},
+		{TrackName: "Next Album", Artist: "Album Project", Album: "Second Album", Runtime: "3:03", ReleaseYear: 2021},
+		{TrackName: "Other One", Artist: "Other Project", Album: "Other Album", Runtime: "3:04", ReleaseYear: 2022},
+	}
+	if !reflect.DeepEqual(candidates, want) {
+		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want %#v", candidates, want)
+	}
+}
+
 func TestGetVerifiedDiscoveryCandidatesCapsResultsPerNormalizedArtist(t *testing.T) {
 	candidates, err := getVerifiedDiscoveryCandidates(
 		context.Background(),

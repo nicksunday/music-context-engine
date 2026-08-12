@@ -279,6 +279,273 @@ func TestWorkerRateLimitsOutboundRequests(t *testing.T) {
 	}
 }
 
+func TestWorkerRunSkipsAlbumAfterExhaustingRetriesOnTransientError(t *testing.T) {
+	db := newTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist)
+		VALUES ('album-1', 'Dare to Be Stupid', '"Weird Al" Yankovic', 'dare to be stupid', 'weird al yankovic');`)
+	if err != nil {
+		t.Fatalf("failed to insert test row: %v", err)
+	}
+
+	var releaseSearchRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/mb/release":
+			releaseSearchRequests++
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error": "The MusicBrainz web server is currently busy. Please try again later."}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	worker := NewWorker(db.Ctx, Config{
+		MusicBrainzBaseURL:  server.URL + "/mb",
+		DisableRateLimit:    true,
+		MaxTransientRetries: 2,
+		TransientRetryDelay: time.Millisecond,
+		Logger:              log.New(&logs, "", 0),
+	})
+
+	result, err := worker.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want the transient failure to be skipped rather than aborting the run", err)
+	}
+	if result.AlbumsSkippedTransient != 1 {
+		t.Fatalf("AlbumsSkippedTransient = %d, want 1", result.AlbumsSkippedTransient)
+	}
+	if result.AlbumsUpdated != 0 {
+		t.Fatalf("AlbumsUpdated = %d, want 0 (skipped album should not be committed)", result.AlbumsUpdated)
+	}
+
+	// 1 initial attempt + 2 retries = 3 total requests to the release search endpoint.
+	if releaseSearchRequests != 3 {
+		t.Fatalf("releaseSearchRequests = %d, want 3 (initial attempt + MaxTransientRetries retries)", releaseSearchRequests)
+	}
+
+	wantLog := "Skipping album Dare to Be Stupid"
+	if !strings.Contains(logs.String(), wantLog) {
+		t.Fatalf("logs = %q, want to contain %q", logs.String(), wantLog)
+	}
+	wantRetryLog := "Retrying"
+	if !strings.Contains(logs.String(), wantRetryLog) {
+		t.Fatalf("logs = %q, want to contain a %q log line", logs.String(), wantRetryLog)
+	}
+}
+
+func TestWorkerRunBackfillsEmptyGenreArraysFromLinkedRows(t *testing.T) {
+	db := newTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, track_count)
+		VALUES
+			('album-from-track', 'Tagged By Tracks', 'Local Artist', 'tagged by tracks', 'local artist', '[]', 8),
+			('album-to-track', 'Tagged Album', 'Album Artist', 'tagged album', 'album artist', '["progressive rock","jazz fusion"]', 9);
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, genres)
+		VALUES
+			('track-source-1', 'album-from-track', 'Source One', 'Tagged By Tracks', 'Local Artist', 'source one', 'local artist', '["jazz fusion","progressive rock"]'),
+			('track-source-2', 'album-from-track', 'Source Two', 'Tagged By Tracks', 'Local Artist', 'source two', 'local artist', '["jazz fusion"]'),
+			('track-target', 'album-to-track', 'Needs Tags', 'Tagged Album', 'Album Artist', 'needs tags', 'album artist', '[]');`)
+	if err != nil {
+		t.Fatalf("failed to insert test rows: %v", err)
+	}
+
+	worker := NewWorker(db.Ctx, Config{DisableRateLimit: true})
+	result, err := worker.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.RecordsUpdated != 2 {
+		t.Fatalf("RecordsUpdated = %d, want 2", result.RecordsUpdated)
+	}
+
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-from-track'"), []string{"jazz fusion", "progressive rock"})
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM tracks WHERE id = 'track-target'"), []string{"progressive rock", "jazz fusion"})
+}
+
+func TestWorkerRunUsesDecodedAlbumLookupForEmptyGenres(t *testing.T) {
+	db := newTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres)
+		VALUES ('album-1', 'Brain Salad Surgery', 'Emerson, Lake &amp; Palmer', 'brain salad surgery', 'emerson lake and amp palmer', '[]');`)
+	if err != nil {
+		t.Fatalf("failed to insert test row: %v", err)
+	}
+
+	var sawDecodedArtistQuery bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/mb/release":
+			query := r.URL.Query().Get("query")
+			if strings.Contains(query, `artist:"emerson lake and palmer"`) {
+				sawDecodedArtistQuery = true
+				w.Write([]byte(`{"releases":[{"id":"release-1"}]}`))
+				return
+			}
+			w.Write([]byte(`{"releases":[]}`))
+		case "/mb/release/release-1":
+			w.Write([]byte(`{
+				"genres": [
+					{"name": "Progressive Rock", "count": 100},
+					{"name": "Symphonic Prog", "count": 60}
+				],
+				"media": [{"track-count": 8}]
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	worker := NewWorker(db.Ctx, Config{
+		MusicBrainzBaseURL: server.URL + "/mb",
+		DisableRateLimit:   true,
+	})
+
+	result, err := worker.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.AlbumsUpdated != 1 {
+		t.Fatalf("AlbumsUpdated = %d, want 1", result.AlbumsUpdated)
+	}
+	if !sawDecodedArtistQuery {
+		t.Fatalf("MusicBrainz release search did not retry with decoded artist text")
+	}
+
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-1'"), []string{"progressive rock", "symphonic prog"})
+	assertTrackCount(t, db.Ctx.QueryRow("SELECT track_count FROM albums WHERE id = 'album-1'"), 8)
+}
+
+func TestWorkerRunUsesReleaseGroupFallbackForEmptyGenres(t *testing.T) {
+	db := newTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, track_count)
+		VALUES ('album-1', 'The Dethalbum (Expanded Edition)', 'Metalocalypse: Dethklok', 'the dethalbum expanded edition', 'metalocalypse dethklok', '[]', 24);`)
+	if err != nil {
+		t.Fatalf("failed to insert test row: %v", err)
+	}
+
+	var sawStrippedReleaseGroupQuery bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/mb/release":
+			w.Write([]byte(`{"releases":[]}`))
+		case "/mb/release-group":
+			query := r.URL.Query().Get("query")
+			if strings.Contains(query, `releasegroup:"the dethalbum"`) {
+				sawStrippedReleaseGroupQuery = true
+				w.Write([]byte(`{"release-groups":[{"id":"rg-1"}]}`))
+				return
+			}
+			w.Write([]byte(`{"release-groups":[]}`))
+		case "/mb/release-group/rg-1":
+			w.Write([]byte(`{
+				"tags": [
+					{"name": "Melodic Death Metal", "count": 70},
+					{"name": "Comedy Metal", "count": 20}
+				]
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	worker := NewWorker(db.Ctx, Config{
+		MusicBrainzBaseURL: server.URL + "/mb",
+		DisableRateLimit:   true,
+	})
+
+	result, err := worker.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.AlbumsUpdated != 1 {
+		t.Fatalf("AlbumsUpdated = %d, want 1", result.AlbumsUpdated)
+	}
+	if !sawStrippedReleaseGroupQuery {
+		t.Fatalf("MusicBrainz release-group search did not use stripped title fallback")
+	}
+
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-1'"), []string{"melodic death metal", "comedy metal"})
+}
+
+func TestWorkerRunUsesLastFMAlbumTagsWhenMusicBrainzAlbumTagsAreEmpty(t *testing.T) {
+	db := newTestDB(t)
+
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, track_count)
+		VALUES ('album-1', 'Infest the Rats'' Nest', 'King Gizzard & The Lizard Wizard', 'infest the rats nest', 'king gizzard and the lizard wizard', '[]', 9);`)
+	if err != nil {
+		t.Fatalf("failed to insert test row: %v", err)
+	}
+
+	var sawLastFMAlbumTags bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.URL.Path {
+		case "/mb/release":
+			w.Write([]byte(`{"releases":[{"id":"release-1"}]}`))
+		case "/mb/release/release-1":
+			w.Write([]byte(`{"genres":[],"tags":[],"media":[{"track-count":9}]}`))
+		case "/mb/release-group":
+			w.Write([]byte(`{"release-groups":[]}`))
+		case "/lastfm":
+			if got := r.URL.Query().Get("method"); got == "album.gettoptags" {
+				sawLastFMAlbumTags = true
+				w.Write([]byte(`{
+					"toptags": {
+						"tag": [
+							{"name": "seen live", "count": "999"},
+							{"name": "Thrash Metal", "count": "100"},
+							{"name": "Psychedelic Rock", "count": "80"}
+						]
+					}
+				}`))
+				return
+			}
+			w.Write([]byte(`{"toptags":{"tag":[]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	worker := NewWorker(db.Ctx, Config{
+		MusicBrainzBaseURL: server.URL + "/mb",
+		LastFMBaseURL:      server.URL + "/lastfm",
+		LastFMAPIKey:       "test-key",
+		DisableRateLimit:   true,
+	})
+
+	result, err := worker.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.AlbumsUpdated != 1 {
+		t.Fatalf("AlbumsUpdated = %d, want 1", result.AlbumsUpdated)
+	}
+	if !sawLastFMAlbumTags {
+		t.Fatalf("Last.fm album.gettoptags fallback was not called")
+	}
+
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-1'"), []string{"thrash metal", "psychedelic rock"})
+}
+
 func newTestDB(t *testing.T) *database.DBClient {
 	t.Helper()
 

@@ -39,12 +39,14 @@ const (
 	defaultTasteArtistLimit = 12
 	defaultTasteGenreLimit  = 20
 
-	recommendationToolInstructions = `Ground every recommendation only in data actually returned by these tools: the local affinity/topography context and each candidate's genre_tags field. Do not claim to have consulted, cross-referenced, or sourced from any external publication, database, or website (e.g. metal-archives.com, ProgArchives, HipHopDX, Resident Advisor) — you have no live access to them, and describing them as sources fabricates provenance. Prefer overlap between a candidate's genre_tags and the local genre topography over broad commercial genre labels. Final recommendation output must be grouped under Direct Adjacencies and Cross-Genre Wildcards.
+	recommendationToolInstructions = `Ground every recommendation only in data actually returned by these tools: the local affinity/topography context and each candidate's genre_tags field. Do not claim to have consulted, cross-referenced, or sourced from any external publication, database, or website (e.g. metal-archives.com, ProgArchives, HipHopDX, Resident Advisor); you have no live access to them, and describing them as sources fabricates provenance. Prefer overlap between a candidate's genre_tags and the local genre topography over broad commercial genre labels.
 
-CRITICAL OUTPUT CONTRACT:
-1. STRICT TWO-SENTENCE LIMIT: The structural breakdown for each track MUST be exactly two sentences long. No run-on sentences, semicolons, or excessive comma splices to bypass this limit.
-2. ANTI-GASLIGHTING RULE: If your pre-training data lacks deep, explicit knowledge of a track's actual sonic arrangements, you are FORBIDDEN from inventing descriptions (e.g., fabricating guitar style, production credits, vocal style, press coverage, or reviews).
-3. KNOWLEDGE FALLBACK: If genre_tags is empty, or your pre-training knowledge of the track is thin, pivot the two sentences strictly to what was actually returned, such as: "Returned via genre_tags [X, Y]. While exact sonic arrangement details are outside local parameters, [Artist]'s presence in that tag space overlaps with your [subgenre] affinity."`
+RECOMMENDATION OUTPUT CONTRACT:
+1. ALBUM-FIRST: Present a small handful of album recommendations. Use each candidate's album as the recommendation and its track_name as a starter track or first song to sample.
+2. SIMPLE FORMAT: Do not force category headers such as Direct Adjacencies or Cross-Genre Wildcards. A plain shortlist is preferred unless the user asks for grouping.
+3. CONCISE NOTES: Keep each album note to at most two short sentences. Avoid run-on clauses and long structural essays.
+4. ANTI-GASLIGHTING RULE: If your pre-training data lacks deep, explicit knowledge of an album or starter track's actual sonic arrangements, do not invent descriptions, production credits, vocal style, press coverage, or reviews.
+5. KNOWLEDGE FALLBACK: If genre_tags is empty, or your pre-training knowledge is thin, say what was returned, such as: "Returned via genre_tags [X, Y]. That overlaps with your [subgenre] affinity, but exact arrangement details are outside local parameters."`
 )
 
 func NewServer(db *sql.DB) *server.MCPServer {
@@ -143,7 +145,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 
 	s.AddTool(
 		mcpsdk.NewTool(getVerifiedCandidatesToolName,
-			mcpsdk.WithDescription("Search live MusicBrainz recording metadata by a raw canonical vibe or semantic fallback tags, then exclude artists, albums, and tracks already present in the local library. For abstract, non-canonical phrases, translate the phrase into canonical MusicBrainz genre tags before calling this tool; for example, map \"erratic rhythm section\" to fallback_tags [\"math rock\", \"idm\", \"breakcore\"]. Provide target_vibe or fallback_tags. "+recommendationToolInstructions),
+			mcpsdk.WithDescription("Search live MusicBrainz recording metadata by a raw canonical vibe or semantic fallback tags, then exclude artists, albums, and tracks already present in the local library. Results are recording-backed but should normally be presented as album recommendations, using track_name as the starter track to sample. For abstract, non-canonical phrases, translate the phrase into canonical MusicBrainz genre tags before calling this tool; for example, map \"erratic rhythm section\" to fallback_tags [\"math rock\", \"idm\", \"breakcore\"]. Provide target_vibe or fallback_tags. "+recommendationToolInstructions),
 			mcpsdk.WithString("target_vibe",
 				mcpsdk.Description("Optional raw vibe or canonical MusicBrainz genre tag. A comma-separated canonical tag list is also accepted. Use fallback_tags instead when the original phrase is abstract or unlikely to be a MusicBrainz tag."),
 			),
@@ -162,7 +164,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 
 	s.AddTool(
 		mcpsdk.NewTool(logAlbumRatingToolName,
-			mcpsdk.WithDescription("Persist a local album rating directly to albums.user_rating using Specification 07 clean key normalization; insert a UUID-backed album row if absent. "+recommendationToolInstructions),
+			mcpsdk.WithDescription("Persist a local album rating directly to albums.user_rating using Specification 07 clean key normalization; insert a UUID-backed album row if absent."),
 			mcpsdk.WithString("artist",
 				mcpsdk.Required(),
 				mcpsdk.Description("The album artist name. The server normalizes by lowercasing, converting & to and, and stripping punctuation."),
@@ -1334,7 +1336,8 @@ func formatTasteAdjacencyProfileMarkdown(profile tasteAdjacencyProfile, targetVi
 	builder.WriteString("### LLM Recommendation Contract\n")
 	builder.WriteString("- Ground adjacency claims in the Real Adjacent Artists table below (real Last.fm similarity data), not in unverified pedigree, side-project, or session-credit claims.\n")
 	builder.WriteString("- Prefer overlap between a candidate's genre_tags (from get_verified_discovery_candidates) and this profile's genre topography over broad commercial genre labels.\n")
-	builder.WriteString("- Final recommendation output must use exactly these groups: Direct Adjacencies and Cross-Genre Wildcards. Omit Cross-Genre Wildcards entirely rather than inventing a weak fit if nothing here supports one.\n\n")
+	builder.WriteString("- Present a small, album-first shortlist unless the user explicitly asks for track-only recommendations. Use a returned track_name as the starter track for the album.\n")
+	builder.WriteString("- Do not force category headers; concise plain recommendations are preferred.\n\n")
 
 	builder.WriteString("### Artist Affinity Matrix\n")
 	if len(profile.artistAffinities) == 0 {

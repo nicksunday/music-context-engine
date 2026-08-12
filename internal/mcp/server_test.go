@@ -378,7 +378,8 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 	if _, ok := tools["check_album_history"]; ok {
 		t.Fatal("deprecated check_album_history tool is still registered")
 	}
-	if description := tools[getVerifiedCandidatesToolName].Tool.Description; !strings.Contains(description, "STRICT TWO-SENTENCE LIMIT") ||
+	if description := tools[getVerifiedCandidatesToolName].Tool.Description; !strings.Contains(description, "ALBUM-FIRST") ||
+		!strings.Contains(description, "SIMPLE FORMAT") ||
 		!strings.Contains(description, "ANTI-GASLIGHTING RULE") ||
 		!strings.Contains(description, "KNOWLEDGE FALLBACK") {
 		t.Fatalf("%s description does not include critical recommendation instructions: %q", getVerifiedCandidatesToolName, description)
@@ -418,7 +419,7 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 	assertToolResponseContains(getTopRatedAlbumsToolName, map[string]any{"min_rating": 4.5, "genre": "progressive"}, "Crack the Skye")
 	assertToolResponseContains(getGenreDistributionToolName, nil, "| Subgenre | Total Occurrences |")
 	assertToolResponseContains(getAlbumTracksToolName, map[string]any{"artist": "Mastodon", "album": "Crack the Skye"}, "Oblivion")
-	assertToolResponseContains(getTasteAdjacenciesToolName, map[string]any{"seed_artists": []any{"Mastodon"}, "target_vibe": "erratic rhythm section"}, "Direct Adjacencies")
+	assertToolResponseContains(getTasteAdjacenciesToolName, map[string]any{"seed_artists": []any{"Mastodon"}, "target_vibe": "erratic rhythm section"}, "album-first shortlist")
 	assertToolResponseContains(getVerifiedCandidatesToolName, map[string]any{"target_vibe": "erratic rhythm section", "limit": 1}, `"track_name":"CAFO"`)
 	assertToolResponseContains(logAlbumRatingToolName, map[string]any{"artist": "Beyoncé", "album": "I Am... Sasha Fierce", "rating": 4.2}, "Updated")
 }
@@ -661,7 +662,8 @@ func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *test
 	if response.EffectiveLimit != 10 {
 		t.Fatalf("effective limit = %d, want 10", response.EffectiveLimit)
 	}
-	if !strings.Contains(response.Instructions, "STRICT TWO-SENTENCE LIMIT") ||
+	if !strings.Contains(response.Instructions, "ALBUM-FIRST") ||
+		!strings.Contains(response.Instructions, "SIMPLE FORMAT") ||
 		!strings.Contains(response.Instructions, "ANTI-GASLIGHTING RULE") ||
 		!strings.Contains(response.Instructions, "KNOWLEDGE FALLBACK") {
 		t.Fatalf("instructions missing critical output contract: %q", response.Instructions)
@@ -777,7 +779,8 @@ func TestVerifiedDiscoveryCandidatesHandlerClampsLimitAndIncludesInstructions(t 
 	if gotLimit != maxMusicBrainzSearchLimit {
 		t.Fatalf("discovery search limit = %d, want capped external search limit %d", gotLimit, maxMusicBrainzSearchLimit)
 	}
-	if !strings.Contains(response.Instructions, "STRICT TWO-SENTENCE LIMIT") ||
+	if !strings.Contains(response.Instructions, "ALBUM-FIRST") ||
+		!strings.Contains(response.Instructions, "SIMPLE FORMAT") ||
 		!strings.Contains(response.Instructions, "ANTI-GASLIGHTING RULE") ||
 		!strings.Contains(response.Instructions, "KNOWLEDGE FALLBACK") {
 		t.Fatalf("instructions missing critical output contract: %q", response.Instructions)
