@@ -48,7 +48,10 @@ func getExclusionList(ctx context.Context, db *sql.DB) (map[string]bool, error) 
 		FROM tracks
 		UNION ALL
 		SELECT artist, title, NULL
-		FROM albums`)
+		FROM albums
+		UNION ALL
+		SELECT artist, album, starter_track
+		FROM recommendation_feedback`)
 	if err != nil {
 		return nil, fmt.Errorf("query exclusion names: %w", err)
 	}

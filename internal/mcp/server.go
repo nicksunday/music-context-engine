@@ -35,6 +35,7 @@ const (
 	getTasteAdjacenciesToolName   = "get_taste_adjacencies"
 	getVerifiedCandidatesToolName = "get_verified_discovery_candidates"
 	logAlbumRatingToolName        = "log_album_rating"
+	logRecommendationFeedbackName = "log_recommendation_feedback"
 
 	defaultTasteArtistLimit = 12
 	defaultTasteGenreLimit  = 20
@@ -181,6 +182,40 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 			),
 		),
 		logAlbumRatingHandler(db),
+	)
+
+	s.AddTool(
+		mcpsdk.NewTool(logRecommendationFeedbackName,
+			mcpsdk.WithDescription("Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Use this for batch reactions such as disliked, not_for_me_today, ok, good, great, or already_know; feedback entries are added to future discovery exclusions."),
+			mcpsdk.WithString("artist",
+				mcpsdk.Required(),
+				mcpsdk.Description("The recommended album artist name."),
+			),
+			mcpsdk.WithString("album",
+				mcpsdk.Required(),
+				mcpsdk.Description("The recommended album title."),
+			),
+			mcpsdk.WithString("verdict",
+				mcpsdk.Required(),
+				mcpsdk.Description("Reaction label. Accepted canonical values: disliked, not_for_me_today, ok, good, great, already_know. Natural aliases like \"it's ok\" and \"not today\" are accepted."),
+			),
+			mcpsdk.WithString("starter_track",
+				mcpsdk.Description("Optional starter track that was suggested from the album."),
+			),
+			mcpsdk.WithString("batch_id",
+				mcpsdk.Description("Optional recommendation batch ID to link later frontend sessions."),
+			),
+			mcpsdk.WithString("candidate_id",
+				mcpsdk.Description("Optional recommendation candidate ID to link later frontend sessions."),
+			),
+			mcpsdk.WithString("mood",
+				mcpsdk.Description("Optional mood/context string for why the feedback landed this way."),
+			),
+			mcpsdk.WithString("notes",
+				mcpsdk.Description("Optional freeform note about the recommendation."),
+			),
+		),
+		logRecommendationFeedbackHandler(db),
 	)
 }
 
@@ -381,25 +416,18 @@ func getVerifiedDiscoveryCandidatesHandler(db *sql.DB, discovery discoverySource
 		if limit <= 0 {
 			return mcpsdk.NewToolResultError("The limit argument must be a positive integer."), nil
 		}
-		limit = clampDiscoveryCandidateLimit(limit)
 
-		exclusions, err := (&database.DB{Ctx: db}).GetExclusionListContext(ctx)
-		if err != nil {
-			log.Printf("failed to build discovery exclusion list: %v", err)
-			return mcpsdk.NewToolResultError("Unable to build the discovery exclusion list right now."), nil
-		}
-
-		candidates, err := getVerifiedDiscoveryCandidates(ctx, discovery, searchTags, limit, exclusions)
+		result, err := getVerifiedDiscoveryCandidatesFromSource(ctx, &database.DB{Ctx: db}, discovery, VerifiedDiscoveryQuery{
+			TargetVibe:   targetVibe,
+			FallbackTags: searchTags,
+			Limit:        limit,
+		})
 		if err != nil {
 			log.Printf("failed to get verified discovery candidates: %v", err)
 			return mcpsdk.NewToolResultError("Unable to retrieve verified discovery candidates right now."), nil
 		}
 
-		payload, err := json.Marshal(verifiedDiscoveryCandidatesToolResult{
-			Instructions:   recommendationToolInstructions,
-			EffectiveLimit: limit,
-			Candidates:     candidates,
-		})
+		payload, err := json.Marshal(result)
 		if err != nil {
 			log.Printf("failed to encode verified discovery candidates: %v", err)
 			return mcpsdk.NewToolResultError("Unable to encode verified discovery candidates right now."), nil
@@ -476,6 +504,72 @@ func logAlbumRatingHandler(db *sql.DB) server.ToolHandlerFunc {
 		}
 
 		return mcpsdk.NewToolResultText(formatAlbumRatingLogMarkdown(result)), nil
+	}
+}
+
+func logRecommendationFeedbackHandler(db *sql.DB) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		artist, validationErr := requireStringArgument(request, "artist")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		album, validationErr := requireStringArgument(request, "album")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		verdict, validationErr := requireStringArgument(request, "verdict")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		starterTrack, validationErr := optionalStringArgument(request, "starter_track")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		batchID, validationErr := optionalStringArgument(request, "batch_id")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		candidateID, validationErr := optionalStringArgument(request, "candidate_id")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		mood, validationErr := optionalStringArgument(request, "mood")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+		notes, validationErr := optionalStringArgument(request, "notes")
+		if validationErr != nil {
+			return validationErr, nil
+		}
+
+		if strings.TrimSpace(artist) == "" || strings.TrimSpace(album) == "" {
+			return mcpsdk.NewToolResultError("Please provide non-empty artist and album arguments."), nil
+		}
+
+		canonicalVerdict, ok := database.CanonicalRecommendationVerdict(verdict)
+		if !ok {
+			return mcpsdk.NewToolResultError("The verdict argument must be one of: disliked, not_for_me_today, ok, good, great, already_know."), nil
+		}
+
+		result, err := database.LogRecommendationFeedback(ctx, db, database.RecommendationFeedbackInput{
+			Artist:       artist,
+			Album:        album,
+			StarterTrack: starterTrack,
+			BatchID:      batchID,
+			CandidateID:  candidateID,
+			Verdict:      canonicalVerdict,
+			Mood:         mood,
+			Notes:        notes,
+		})
+		if err != nil {
+			log.Printf("failed to log recommendation feedback: %v", err)
+			return mcpsdk.NewToolResultError("Unable to log recommendation feedback right now."), nil
+		}
+		if result.CleanArtist == "" || result.CleanTitle == "" {
+			return mcpsdk.NewToolResultError("Please provide artist and album arguments that normalize to non-empty lookup tokens."), nil
+		}
+
+		return mcpsdk.NewToolResultText(formatRecommendationFeedbackMarkdown(result)), nil
 	}
 }
 
@@ -1214,16 +1308,7 @@ func logAlbumRating(ctx context.Context, db *sql.DB, artist, album string, ratin
 }
 
 func normalizeAlbumLookup(artist, album string) (string, string, error) {
-	cleanArtist, err := utils.NormalizeSearchText(artist)
-	if err != nil {
-		return "", "", err
-	}
-	cleanTitle, err := utils.NormalizeSearchText(album)
-	if err != nil {
-		return "", "", err
-	}
-
-	return cleanArtist, cleanTitle, nil
+	return database.NormalizeAlbumLookup(artist, album)
 }
 
 func formatGenresJSON(genres sql.NullString) string {
@@ -1450,6 +1535,26 @@ func formatAlbumRatingLogMarkdown(result albumRatingLog) string {
 	} else {
 		fmt.Fprintf(&builder, "- albums rows updated: %d\n", result.rowsUpdated)
 	}
+
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+func formatRecommendationFeedbackMarkdown(result database.RecommendationFeedbackLog) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Logged recommendation feedback for **%s** by *%s*: `%s`.\n", result.Album, result.Artist, result.Verdict)
+	fmt.Fprintf(&builder, "- Feedback ID: `%s`\n", result.ID)
+	fmt.Fprintf(&builder, "- Clean lookup: `%s` / `%s`\n", result.CleanArtist, result.CleanTitle)
+	if result.StarterTrack != "" {
+		fmt.Fprintf(&builder, "- Starter track: %s\n", result.StarterTrack)
+	}
+	if result.Mood != "" {
+		fmt.Fprintf(&builder, "- Mood/context: %s\n", result.Mood)
+	}
+	if result.Notes != "" {
+		fmt.Fprintf(&builder, "- Notes: %s\n", result.Notes)
+	}
+	fmt.Fprintf(&builder, "- recommendation_feedback rows inserted: %d\n", result.RowsInserted)
+	builder.WriteString("- Future discovery candidate batches will treat this artist/album/track as known.")
 
 	return strings.TrimRight(builder.String(), "\n")
 }

@@ -50,7 +50,7 @@ This platform treats your listening history as entirely private, local-first sta
 
 Once raw data is ingested, the library state is extended via asynchronous metadata loops (`music-vault enrich`):
 * **Artist & Genre Tagging:** Scans for records with missing genre text arrays and queries the **MusicBrainz** API.
-* **Community Tag Aggregation:** If a `LASTFM_API_KEY` is present, it pulls community top-tags and passes them through a strict, internal whitelist to filter out low-value noise (e.g., filtering out tags like "seen live" or "awesome" while keeping strict subgenres).
+* **Community Tag Aggregation:** If a `LASTFM_API_KEY` is present, it pulls community top-tags and rejects obvious non-musical/social noise (e.g., "seen live", favorites, ownership tags, URL/platform tags, and year/decade buckets) without requiring a hard-coded genre whitelist.
 * **Idempotency:** Empty arrays are explicitly committed for missing or unresolvable artists, ensuring the engine doesn't waste network resources or rate-limits retrying dead endpoints.
 
 ### Proactive Discovery & LLM Anti-Hallucination
@@ -65,5 +65,12 @@ Rather than relying on LLMs to blind-guess music recommendations and validating 
 
 * **Language:** Go 1.25.5
 * **Database:** Embedded SQLite (`data/music_vault.db`) via `mattn/go-sqlite3` with strict Unicode normalization for clean search indexing.
-* **Protocol Interface:** `mark3labs/mcp-go` exposing local context tools via `stdin`/`stdout`. This includes semantic discovery routing (`get_verified_discovery_candidates`), structural taste mapping (`get_taste_adjacencies`), and instantaneous local metadata logging (`log_album_rating`).
+* **Protocol Interface:** `mark3labs/mcp-go` exposing local context tools via `stdin`/`stdout`. This includes semantic discovery routing (`get_verified_discovery_candidates`), structural taste mapping (`get_taste_adjacencies`), and local metadata/recommendation logging (`log_album_rating`, `log_recommendation_feedback`).
+* **Local Web UI:** `music-vault web` serves a localhost recommendation chat and album feedback surface. It reads the same SQLite profile context, uses Ollama to translate prompts into discovery tags and rank candidates, routes candidate retrieval through the MCP verified-discovery implementation, persists `recommendation_batches` / `recommendation_candidates`, and writes verdict buttons back through `recommendation_feedback`.
 * **Local Inference Engine:** Ollama running Qwen Mixture of Experts (MoE) models to execute high-fidelity context reasoning and routing.
+
+Run the web UI:
+
+```sh
+./bin/music-vault web --addr 127.0.0.1:8787 --model qwen3:latest --ollama-timeout 3m
+```

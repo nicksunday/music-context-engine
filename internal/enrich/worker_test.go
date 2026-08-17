@@ -512,7 +512,9 @@ func TestWorkerRunUsesLastFMAlbumTagsWhenMusicBrainzAlbumTagsAreEmpty(t *testing
 						"tag": [
 							{"name": "seen live", "count": "999"},
 							{"name": "Thrash Metal", "count": "100"},
-							{"name": "Psychedelic Rock", "count": "80"}
+							{"name": "Psychedelic Rock", "count": "80"},
+							{"name": "Jazz Rap", "count": "70"},
+							{"name": "1990s", "count": "60"}
 						]
 					}
 				}`))
@@ -543,7 +545,30 @@ func TestWorkerRunUsesLastFMAlbumTagsWhenMusicBrainzAlbumTagsAreEmpty(t *testing
 		t.Fatalf("Last.fm album.gettoptags fallback was not called")
 	}
 
-	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-1'"), []string{"thrash metal", "psychedelic rock"})
+	assertGenres(t, db.Ctx.QueryRow("SELECT genres FROM albums WHERE id = 'album-1'"), []string{"thrash metal", "psychedelic rock", "jazz rap"})
+}
+
+func TestUsefulLastFMTagRejectsNoiseWithoutGenreWhitelist(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "seen live", want: false},
+		{name: "Awesome", want: false},
+		{name: "albums I own", want: false},
+		{name: "1990s", want: false},
+		{name: "jazz rap", want: true},
+		{name: "new weird america", want: true},
+		{name: "zeuhl", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isUsefulLastFMTag(tt.name); got != tt.want {
+				t.Fatalf("isUsefulLastFMTag(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
 }
 
 func newTestDB(t *testing.T) *database.DBClient {

@@ -6,14 +6,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nicksunday/music-context-platform/internal/database"
 	"github.com/nicksunday/music-context-platform/internal/enrich"
 	"github.com/nicksunday/music-context-platform/internal/ingest"
 	mcpserver "github.com/nicksunday/music-context-platform/internal/mcp"
+	webserver "github.com/nicksunday/music-context-platform/internal/web"
 )
 
 const (
@@ -41,6 +44,8 @@ func main() {
 		runProfile(os.Args[2:])
 	case "serve":
 		runServe(os.Args[2:])
+	case "web":
+		runWeb(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -351,6 +356,49 @@ func runServe(args []string) {
 	}
 }
 
+func runWeb(args []string) {
+	flags := flag.NewFlagSet("web", flag.ExitOnError)
+	var dbPath string
+	var addr string
+	var ollamaURL string
+	var model string
+	var ollamaTimeout time.Duration
+	registerDatabaseFlag(flags, &dbPath)
+	flags.StringVar(&addr, "addr", "127.0.0.1:8787", "HTTP listen address")
+	flags.StringVar(&ollamaURL, "ollama-url", defaultOllamaURL(), "Ollama base URL")
+	flags.StringVar(&model, "model", defaultWebModel(), "Ollama model name")
+	flags.DurationVar(&ollamaTimeout, "ollama-timeout", 3*time.Minute, "maximum time to wait for an Ollama recommendation response")
+	flags.Usage = func() {
+		fmt.Fprintf(flags.Output(), "Usage: music-vault web [--db path] [--addr host:port] [--ollama-url url] [--model name] [--ollama-timeout duration]\n")
+	}
+	if err := flags.Parse(args); err != nil {
+		log.Fatalf("failed to parse web args: %v", err)
+	}
+	if len(flags.Args()) > 0 {
+		flags.Usage()
+		os.Exit(2)
+	}
+
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("failed to initialize database: %v", err)
+	}
+	defer db.Ctx.Close()
+
+	handler := webserver.NewServer(db.Ctx, webserver.Options{
+		Recommender:  webserver.NewMCPGroundedOllamaRecommender(db.Ctx, ollamaURL, model, ollamaTimeout),
+		ReleaseRadar: webserver.NewMusicBrainzReleaseRadar(),
+		Model:        model,
+		OllamaURL:    ollamaURL,
+		Timeout:      ollamaTimeout,
+	})
+
+	log.Printf("music-vault web listening on http://%s", addr)
+	if err := http.ListenAndServe(addr, handler); err != nil {
+		log.Fatalf("web server error: %v", err)
+	}
+}
+
 func registerDatabaseFlag(flags *flag.FlagSet, target *string) {
 	flags.StringVar(target, "db", "", databaseFlagUsage)
 }
@@ -466,6 +514,20 @@ func formatMarkdownTableCell(value string) string {
 	return value
 }
 
+func defaultOllamaURL() string {
+	if value := strings.TrimSpace(os.Getenv("OLLAMA_HOST")); value != "" {
+		return value
+	}
+	return "http://127.0.0.1:11434"
+}
+
+func defaultWebModel() string {
+	if value := strings.TrimSpace(os.Getenv("MUSIC_VAULT_WEB_MODEL")); value != "" {
+		return value
+	}
+	return "qwen3:latest"
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve> [args]")
+	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve|web> [args]")
 }

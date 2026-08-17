@@ -44,6 +44,18 @@ type DiscoveryCandidate struct {
 	albumExclusionNames []string
 }
 
+type VerifiedDiscoveryQuery struct {
+	TargetVibe   string
+	FallbackTags []string
+	Limit        int
+}
+
+type VerifiedDiscoveryResult struct {
+	Instructions   string               `json:"instructions"`
+	EffectiveLimit int                  `json:"effective_limit"`
+	Candidates     []DiscoveryCandidate `json:"candidates"`
+}
+
 type discoverySource interface {
 	Search(context.Context, []string, int) ([]DiscoveryCandidate, error)
 }
@@ -159,6 +171,54 @@ func defaultDiscoverySource() discoverySource {
 	return newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{
 		RequestDelay: defaultDiscoveryRequestDelay,
 	})
+}
+
+func GetVerifiedDiscoveryCandidates(
+	ctx context.Context,
+	db exclusionsDatabase,
+	query VerifiedDiscoveryQuery,
+) (VerifiedDiscoveryResult, error) {
+	return getVerifiedDiscoveryCandidatesFromSource(ctx, db, defaultDiscoverySource(), query)
+}
+
+type exclusionsDatabase interface {
+	GetExclusionListContext(context.Context) (map[string]bool, error)
+}
+
+func getVerifiedDiscoveryCandidatesFromSource(
+	ctx context.Context,
+	db exclusionsDatabase,
+	source discoverySource,
+	query VerifiedDiscoveryQuery,
+) (VerifiedDiscoveryResult, error) {
+	fallbackTags := compactStrings(query.FallbackTags)
+	searchTags := fallbackTags
+	if len(searchTags) == 0 && strings.TrimSpace(query.TargetVibe) != "" {
+		searchTags = []string{query.TargetVibe}
+	}
+	if len(searchTags) == 0 {
+		return VerifiedDiscoveryResult{}, fmt.Errorf("provide a non-empty target_vibe or fallback_tags")
+	}
+	if query.Limit <= 0 {
+		return VerifiedDiscoveryResult{}, fmt.Errorf("candidate limit must be positive")
+	}
+	limit := clampDiscoveryCandidateLimit(query.Limit)
+
+	exclusions, err := db.GetExclusionListContext(ctx)
+	if err != nil {
+		return VerifiedDiscoveryResult{}, fmt.Errorf("build discovery exclusion list: %w", err)
+	}
+
+	candidates, err := getVerifiedDiscoveryCandidates(ctx, source, searchTags, limit, exclusions)
+	if err != nil {
+		return VerifiedDiscoveryResult{}, err
+	}
+
+	return VerifiedDiscoveryResult{
+		Instructions:   recommendationToolInstructions,
+		EffectiveLimit: limit,
+		Candidates:     candidates,
+	}, nil
 }
 
 func getVerifiedDiscoveryCandidates(

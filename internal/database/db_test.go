@@ -122,6 +122,41 @@ func TestInitDBCreatesParentDirectory(t *testing.T) {
 	}
 }
 
+func TestInitDBCreatesRecommendationFeedbackSchema(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "feedback.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	_, err = db.Ctx.Exec(`
+		INSERT INTO recommendation_batches (id, prompt, mood, notes)
+		VALUES ('batch-1', 'surprise me', 'open', 'test batch');
+		INSERT INTO recommendation_candidates (
+			id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank
+		) VALUES (
+			'candidate-1', 'batch-1', 'black midi', 'Hellfire', 'black midi', 'hellfire', 'Sugar/Tzu', 2022, '["avant-prog"]', 1
+		);
+		INSERT INTO recommendation_feedback (
+			id, batch_id, candidate_id, artist, album, clean_artist, clean_title, starter_track, verdict, mood, notes
+		) VALUES (
+			'feedback-1', 'batch-1', 'candidate-1', 'black midi', 'Hellfire', 'black midi', 'hellfire', 'Sugar/Tzu', 'great', 'focused', 'landed immediately'
+		);`)
+	if err != nil {
+		t.Fatalf("failed to insert recommendation feedback fixtures: %v", err)
+	}
+
+	var verdict string
+	if err := db.Ctx.QueryRow("SELECT verdict FROM recommendation_feedback WHERE id = 'feedback-1'").Scan(&verdict); err != nil {
+		t.Fatalf("failed to query recommendation feedback: %v", err)
+	}
+	if verdict != "great" {
+		t.Fatalf("verdict = %q, want great", verdict)
+	}
+}
+
 func TestInitDBAddsAndBackfillsCleanColumns(t *testing.T) {
 	unsetMusicVaultDBPathEnv(t)
 
@@ -485,7 +520,9 @@ func TestGetExclusionListIncludesAllTracksAndAlbums(t *testing.T) {
 		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, is_favorite)
 		VALUES
 			('track-1', NULL, 'Jóga', 'Homogenic!!!', 'BJÖRK', 'joga', 'bjork', 1),
-			('track-2', NULL, 'Ignored', 'Ignored Album', 'Ignored Artist', 'ignored', 'ignored artist', 0);`)
+			('track-2', NULL, 'Ignored', 'Ignored Album', 'Ignored Artist', 'ignored', 'ignored artist', 0);
+		INSERT INTO recommendation_feedback (id, artist, album, clean_artist, clean_title, starter_track, verdict)
+		VALUES ('feedback-1', 'black midi', 'Hellfire!!!', 'black midi', 'hellfire', 'Sugar/Tzu', 'great');`)
 	if err != nil {
 		t.Fatalf("failed to insert exclusion fixtures: %v", err)
 	}
@@ -506,6 +543,9 @@ func TestGetExclusionListIncludesAllTracksAndAlbums(t *testing.T) {
 		"ignored",
 		"ignored artist",
 		"ignored album",
+		"black midi",
+		"hellfire",
+		"sugar tzu",
 	} {
 		if !exclusions[want] {
 			t.Errorf("GetExclusionList()[%q] = false, want true", want)

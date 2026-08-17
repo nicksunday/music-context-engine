@@ -371,6 +371,7 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 		getTasteAdjacenciesToolName,
 		getVerifiedCandidatesToolName,
 		logAlbumRatingToolName,
+		logRecommendationFeedbackName,
 	}
 	if len(tools) != len(wantToolNames) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(wantToolNames))
@@ -422,6 +423,7 @@ func TestNewServerRegistersAndRoutesSpecTools(t *testing.T) {
 	assertToolResponseContains(getTasteAdjacenciesToolName, map[string]any{"seed_artists": []any{"Mastodon"}, "target_vibe": "erratic rhythm section"}, "album-first shortlist")
 	assertToolResponseContains(getVerifiedCandidatesToolName, map[string]any{"target_vibe": "erratic rhythm section", "limit": 1}, `"track_name":"CAFO"`)
 	assertToolResponseContains(logAlbumRatingToolName, map[string]any{"artist": "Beyoncé", "album": "I Am... Sasha Fierce", "rating": 4.2}, "Updated")
+	assertToolResponseContains(logRecommendationFeedbackName, map[string]any{"artist": "Animals as Leaders", "album": "Animals as Leaders", "starter_track": "CAFO", "verdict": "great"}, "Logged recommendation feedback")
 }
 
 func TestFetchTasteAdjacencyProfileSurfacesRealAdjacentArtistsNotInLibrary(t *testing.T) {
@@ -501,6 +503,7 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 		*tools[getTasteAdjacenciesToolName],
 		*tools[getVerifiedCandidatesToolName],
 		*tools[logAlbumRatingToolName],
+		*tools[logRecommendationFeedbackName],
 	)
 	if err != nil {
 		t.Fatalf("failed to start MCP test server: %v", err)
@@ -567,6 +570,12 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 			toolName:    logAlbumRatingToolName,
 			args:        map[string]any{"artist": "Mastodon", "album": "Crack the Skye", "rating": "4.5"},
 			wantMessage: "rating argument must be a number",
+		},
+		{
+			name:        "recommendation feedback verdict must be supported",
+			toolName:    logRecommendationFeedbackName,
+			args:        map[string]any{"artist": "Mastodon", "album": "Crack the Skye", "verdict": "shrug"},
+			wantMessage: "verdict argument must be one of",
 		},
 	}
 
@@ -1020,6 +1029,55 @@ func TestLogAlbumRatingInsertsUUIDAlbumWithCleanTokens(t *testing.T) {
 	}
 	if !floatClose(rating, 3.5) {
 		t.Fatalf("rating = %v, want 3.5", rating)
+	}
+}
+
+func TestLogRecommendationFeedbackStoresCanonicalVerdictAndExcludesAlbum(t *testing.T) {
+	db := openTestDB(t)
+
+	result, err := database.LogRecommendationFeedback(context.Background(), db.Ctx, database.RecommendationFeedbackInput{
+		Artist:       "Neutral Milk Hotel",
+		Album:        "In the Aeroplane Over the Sea!!!",
+		StarterTrack: "Holland, 1945",
+		Verdict:      "it's ok",
+		Mood:         "wrong mood",
+		Notes:        "may click later",
+	})
+	if err != nil {
+		t.Fatalf("LogRecommendationFeedback() error = %v", err)
+	}
+	if _, err := uuid.Parse(result.ID); err != nil {
+		t.Fatalf("feedback ID is not a UUID: %q", result.ID)
+	}
+	if result.Verdict != "ok" {
+		t.Fatalf("result.Verdict = %q, want ok", result.Verdict)
+	}
+	if result.CleanArtist != "neutral milk hotel" || result.CleanTitle != "in the aeroplane over the sea" {
+		t.Fatalf("clean lookup = %q/%q, want neutral milk hotel/in the aeroplane over the sea", result.CleanArtist, result.CleanTitle)
+	}
+
+	var verdict, mood, notes string
+	err = db.Ctx.QueryRow(`
+		SELECT verdict, mood, notes
+		FROM recommendation_feedback
+		WHERE id = ?`,
+		result.ID,
+	).Scan(&verdict, &mood, &notes)
+	if err != nil {
+		t.Fatalf("failed to query feedback row: %v", err)
+	}
+	if verdict != "ok" || mood != "wrong mood" || notes != "may click later" {
+		t.Fatalf("feedback row = %q/%q/%q, want ok/wrong mood/may click later", verdict, mood, notes)
+	}
+
+	exclusions, err := db.GetExclusionList()
+	if err != nil {
+		t.Fatalf("GetExclusionList() error = %v", err)
+	}
+	for _, want := range []string{"neutral milk hotel", "in the aeroplane over the sea", "holland 1945"} {
+		if !exclusions[want] {
+			t.Fatalf("exclusions[%q] = false, want true", want)
+		}
 	}
 }
 

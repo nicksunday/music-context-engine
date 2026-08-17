@@ -33,52 +33,52 @@ const (
 	DefaultMaxTransientRetries = 3
 )
 
-var lastFMGenreWhitelist = []string{
-	"acid",
-	"ambient",
-	"art",
-	"avant-garde",
-	"avant garde",
-	"black",
-	"bluegrass",
-	"blues",
-	"breakbeat",
-	"breakcore",
-	"classical",
-	"core",
-	"country",
-	"death",
-	"djent",
-	"doom",
-	"drum and bass",
-	"electronic",
-	"electronica",
-	"experimental",
-	"folk",
-	"funk",
-	"garage",
-	"grind",
-	"hardcore",
-	"hip hop",
-	"house",
-	"idm",
-	"industrial",
-	"instrumental",
-	"jazz",
-	"metal",
-	"pop",
-	"prog",
-	"psychedelic",
-	"punk",
-	"r&b",
-	"rap",
-	"rock",
-	"soul",
-	"stoner",
-	"symphonic",
-	"technical",
-	"techno",
-	"thrash",
+var lastFMNoiseTags = map[string]bool{
+	"awesome":                 true,
+	"best":                    true,
+	"best of":                 true,
+	"better than radiohead":   true,
+	"cd":                      true,
+	"favorite":                true,
+	"favorites":               true,
+	"favourite":               true,
+	"favourites":              true,
+	"good":                    true,
+	"great":                   true,
+	"lastfm":                  true,
+	"love":                    true,
+	"loved":                   true,
+	"mp3":                     true,
+	"my favorites":            true,
+	"my favourites":           true,
+	"owned":                   true,
+	"seen live":               true,
+	"songs":                   true,
+	"spotify":                 true,
+	"streamable":              true,
+	"tracks":                  true,
+	"under 2000 listeners":    true,
+	"under 3000 listeners":    true,
+	"under 5000 listeners":    true,
+	"under 10000 listeners":   true,
+	"vinyl":                   true,
+	"youtube":                 true,
+	"you should listen to it": true,
+}
+
+var lastFMNoiseTagFragments = []string{
+	".com",
+	"album i own",
+	"albums i own",
+	"audioscrobbler",
+	"favorite track",
+	"favourite track",
+	"http://",
+	"https://",
+	"last.fm",
+	"my collection",
+	"seen live",
+	"www.",
 }
 
 var errArtistNotFound = errors.New("artist not found externally")
@@ -731,7 +731,7 @@ func (w *Worker) fetchLastFMGenres(ctx context.Context, artist string) ([]string
 		return nil, fmt.Errorf("last.fm returned error %d: %s", response.Error, response.Message)
 	}
 
-	return orderedTagNames(response.TopTags.Tags, isAllowedLastFMTag), nil
+	return orderedTagNames(response.TopTags.Tags, isUsefulLastFMTag), nil
 }
 
 func (w *Worker) fetchLastFMAlbumGenres(ctx context.Context, album albumRecord) ([]string, error) {
@@ -762,7 +762,7 @@ func (w *Worker) fetchLastFMAlbumGenres(ctx context.Context, album albumRecord) 
 		}
 
 		found = true
-		genres := orderedTagNames(response.TopTags.Tags, isAllowedLastFMTag)
+		genres := orderedTagNames(response.TopTags.Tags, isUsefulLastFMTag)
 		if len(genres) > 0 {
 			return genres, nil
 		}
@@ -1331,14 +1331,46 @@ func orderedTagNames(tags []apiTag, filter func(string) bool) []string {
 	return mergeGenres(names)
 }
 
-func isAllowedLastFMTag(name string) bool {
+func isUsefulLastFMTag(name string) bool {
 	name = normalizeGenreName(name)
-	for _, allowed := range lastFMGenreWhitelist {
-		if strings.Contains(name, allowed) {
-			return true
+	if name == "" || lastFMNoiseTags[name] || isYearOrDecadeTag(name) || hasTooManyWords(name, 8) {
+		return false
+	}
+	for _, fragment := range lastFMNoiseTagFragments {
+		if strings.Contains(name, fragment) {
+			return false
 		}
 	}
+	return true
+}
+
+func isYearOrDecadeTag(name string) bool {
+	if len(name) == 4 && allDigits(name) {
+		return true
+	}
+	if len(name) >= 3 && len(name) <= 5 && strings.HasSuffix(name, "s") {
+		return allDigits(strings.TrimSuffix(name, "s"))
+	}
 	return false
+}
+
+func allDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func hasTooManyWords(value string, maxWords int) bool {
+	if maxWords <= 0 {
+		return false
+	}
+	return len(strings.Fields(value)) > maxWords
 }
 
 func mergeGenres(groups ...[]string) []string {

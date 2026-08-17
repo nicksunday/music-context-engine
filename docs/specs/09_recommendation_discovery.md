@@ -1,7 +1,7 @@
 # Specification 09: Relational Discovery & Adjacency Engine
 
 ## 1. Objective
-Establish an MCP tool framework that handles complex, multidimensional artist and genre recommendations and allows instant local rating updates. This engine anchors your local Ollama instance using your existing database metrics and explicit authority domains to hunt for music, verify history, and log ratings directly.
+Establish an MCP tool framework that handles complex, multidimensional artist and genre recommendations and allows instant local rating and recommendation-feedback updates. This engine anchors your local Ollama instance using your existing database metrics and explicit authority domains to hunt for music, verify history, and log reactions directly.
 
 ## 2. MCP Tool Schema Contract
 
@@ -32,6 +32,20 @@ Enables you or the LLM to commit a new album rating instantly to the database.
   - `rating` (float, required)
 - **Execution Logic:** Normalizes the input text, finds the target album (or inserts a new row if it doesn't exist), and updates the `user_rating` column directly in the `albums` table.
 
+### D. Tool: `log_recommendation_feedback`
+Captures recommendation-batch reactions without forcing them into the formal album rating scale.
+- **Input Parameters:**
+  - `artist` (string, required)
+  - `album` (string, required)
+  - `verdict` (string, required): `disliked`, `not_for_me_today`, `ok`, `good`, `great`, or `already_know`.
+  - `starter_track` (string, optional)
+  - `batch_id` (string, optional)
+  - `candidate_id` (string, optional)
+  - `mood` (string, optional)
+  - `notes` (string, optional)
+- **Execution Logic:** Normalizes artist and album keys, stores the reaction in `recommendation_feedback`, and adds the artist/album/starter-track tokens to future discovery exclusions.
+- **Rating Boundary:** This tool MUST NOT update `albums.user_rating`. Use `log_album_rating` only when the user intends a durable 0-5 album score.
+
 ## 3. LLM Recommendation Strategy & Bias Controls
 
 When processing discovery candidate payloads, the LLM must evaluate, filter, and justify recommendations using strict logical invariants, while actively combating profile anchoring.
@@ -45,6 +59,10 @@ When processing discovery candidate payloads, the LLM must evaluate, filter, and
 1. **Absolute User Veto:** If the user states an artist or style is "not the vibe" or rejects a recommendation, that artist and their entire catalog are strictly blacklisted for the remainder of the session. The LLM is forbidden from recommending different tracks by them or defending the original choice.
 2. **Passive Filtering vs. Active Steering:** The user's historical affinity matrix functions *strictly* as a passive filter to gauge technical complexity limits and enforce local database exclusions. When a user requests a highly distinct target vibe (e.g., "Rage Against the Machine vibes"), the LLM must prioritize the core DNA of that requested target (e.g., funk-metal, rap-metal, staccato groove) over historical metal statistics. Do not force an unwanted heavy metal crossover onto distinct genres.
 3. **Strict Monotony Ban:** The discovery list must represent a diverse array of distinct musical projects. The server must return at most one candidate per normalized artist/album pair and at most 2 candidates from the same normalized artist in a single discovery payload.
+4. **Feedback Memory:** Albums logged through `recommendation_feedback` count as known for discovery exclusion even when they are not in the Apple Music library and have no RYM/user rating.
+5. **Prompt Ingredient Preservation:** Active prompt descriptors such as "funky", "groove", "weird", or "experimental" must survive tag planning and candidate ranking even when the user's historical profile heavily favors metal-adjacent tags.
+6. **Interpretive Vibe Planning:** Natural-language prompts should be interpreted as musical intent before tag selection. The planner should infer energy, rhythm feel, texture, density, mood, novelty, and hard constraints, then separate true requirements from flexible vibe cues.
+7. **Trait Logic & Bass Proxying:** Prompts that use "or" should be treated as any-of requests with a preference for candidates that satisfy multiple traits. Requests for "bass lines", "low end", or rhythm-section feel should be translated through MusicBrainz-compatible proxy tags such as `funk`, `funk rock`, `funk metal`, `groove metal`, `post-punk`, `dance-punk`, `dub`, or `jazz-funk`, because MusicBrainz rarely encodes bass performance directly.
 
 ### C. Tool Input Pre-Processing (Semantic Fallback Rule)
 1. **Aggressive Fallback Mapping:** For abstract, non-canonical, or cross-genre requests, the LLM must map the user's text to a broad array of precise canonical MusicBrainz tags via the `fallback_tags` parameter. This parameter takes precedence over `target_vibe` and ensures the MusicBrainz client queries a rich, diverse slice of data.
@@ -60,6 +78,20 @@ When processing discovery candidate payloads, the LLM must evaluate, filter, and
 2. **No Comma-Splice Cheating:** Do not use excessive comma splices, semicolons, or run-on dependent clauses to bypass this restriction. Break your thoughts down into clean, easily scannable sentences.
 
 ## 4. Output Contract
-* **Album-First Formatting:** Present a small handful of album recommendations by default. Use the exact `artist`, `album`, `release_year`, and `track_name` strings from the tool payload, with `track_name` framed as the starter track to sample from that album.
+* **Album-First Formatting:** Present a small handful of album recommendations by default. Use the exact `artist`, `album`, `release_year`, and `track_name` strings from the tool payload, with `track_name` framed as the matched track that caused the album to enter the candidate set.
 * **Simple Structure:** Do not force headings such as Direct Adjacencies or Cross-Genre Wildcards unless the user explicitly asks for categories.
-* **Honest Breakdown:** Provide a concise note, at most 2 short sentences, explaining how the album and starter track fit the *user's prompt request*, without forcing fake comparisons to unrelated bands in the user's history.
+* **Honest Breakdown:** Provide a concise note, at most 2 short sentences, explaining how the album and matched track fit the *user's prompt request*, without forcing fake comparisons to unrelated bands in the user's history.
+
+## 5. Local Web Feedback Surface
+The `music-vault web` command serves a localhost-only recommendation chat UI.
+
+### A. Runtime Contract
+- Reads artist affinity, genre topography, and recent recommendation feedback from SQLite.
+- Sends the user prompt plus compact local context to a configured local Ollama model to infer the intended vibe, separate required and flexible traits, and translate that interpretation into canonical discovery tags.
+- Routes candidate retrieval through the same `get_verified_discovery_candidates` implementation used by the MCP server, including MusicBrainz lookup, local-library exclusion, recommendation-feedback exclusion, and matched-track-backed album metadata.
+- Sends only those verified MCP candidates back to Ollama for ranking and short notes. The model returns candidate indexes, not freeform artist/album names.
+- Persists generated batches to `recommendation_batches` and `recommendation_candidates`.
+- Writes verdict button clicks to `recommendation_feedback` using the same canonical labels as `log_recommendation_feedback`.
+
+### B. Product Boundary
+The web UI is a fast local feedback loop over the MCP discovery engine. The LLM is responsible for translating intent and ranking verified candidates; it is not allowed to invent the displayed artist, album, or starter-track fields.

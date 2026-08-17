@@ -95,6 +95,43 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		was_skipped INTEGER DEFAULT 0,
 		source_type TEXT,
 		is_user_initiated INTEGER
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_batches (
+		id TEXT PRIMARY KEY,
+		prompt TEXT,
+		mood TEXT,
+		notes TEXT,
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_candidates (
+		id TEXT PRIMARY KEY,
+		batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+		artist TEXT NOT NULL,
+		album TEXT NOT NULL,
+		clean_artist TEXT NOT NULL,
+		clean_title TEXT NOT NULL,
+		starter_track TEXT,
+		release_year INTEGER,
+		genre_tags TEXT,
+		rank INTEGER,
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_feedback (
+		id TEXT PRIMARY KEY,
+		batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE SET NULL,
+		candidate_id TEXT REFERENCES recommendation_candidates(id) ON DELETE SET NULL,
+		artist TEXT NOT NULL,
+		album TEXT NOT NULL,
+		clean_artist TEXT NOT NULL,
+		clean_title TEXT NOT NULL,
+		starter_track TEXT,
+		verdict TEXT NOT NULL CHECK (verdict IN ('disliked', 'not_for_me_today', 'ok', 'good', 'great', 'already_know')),
+		mood TEXT,
+		notes TEXT,
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = db.Exec(schema)
@@ -192,6 +229,9 @@ func ensureAlignedSchema(db *sql.DB) error {
 		return err
 	}
 	if err := ensureAppleMusicPlayActivitySchema(db); err != nil {
+		return err
+	}
+	if err := ensureRecommendationSchema(db); err != nil {
 		return err
 	}
 	return nil
@@ -294,6 +334,50 @@ func ensureAppleMusicPlayActivitySchema(db *sql.DB) error {
 	return nil
 }
 
+func ensureRecommendationSchema(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS recommendation_batches (
+			id TEXT PRIMARY KEY,
+			prompt TEXT,
+			mood TEXT,
+			notes TEXT,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS recommendation_candidates (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+			artist TEXT NOT NULL,
+			album TEXT NOT NULL,
+			clean_artist TEXT NOT NULL,
+			clean_title TEXT NOT NULL,
+			starter_track TEXT,
+			release_year INTEGER,
+			genre_tags TEXT,
+			rank INTEGER,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE TABLE IF NOT EXISTS recommendation_feedback (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE SET NULL,
+			candidate_id TEXT REFERENCES recommendation_candidates(id) ON DELETE SET NULL,
+			artist TEXT NOT NULL,
+			album TEXT NOT NULL,
+			clean_artist TEXT NOT NULL,
+			clean_title TEXT NOT NULL,
+			starter_track TEXT,
+			verdict TEXT NOT NULL CHECK (verdict IN ('disliked', 'not_for_me_today', 'ok', 'good', 'great', 'already_know')),
+			mood TEXT,
+			notes TEXT,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`)
+	if err != nil {
+		return fmt.Errorf("failed to ensure recommendation feedback schema: %w", err)
+	}
+	return nil
+}
+
 func ensureSearchColumnsNormalized(db *sql.DB) error {
 	for _, table := range []string{"albums", "tracks"} {
 		if err := refreshCleanSearchColumns(db, table); err != nil {
@@ -311,6 +395,10 @@ func ensureIndexes(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_tracks_clean_title_artist ON tracks(clean_title, clean_artist);
 		CREATE INDEX IF NOT EXISTS idx_albums_clean_title_artist ON albums(clean_title, clean_artist);
 		CREATE INDEX IF NOT EXISTS idx_apple_music_play_activity_event_timestamp ON apple_music_play_activity(event_timestamp);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_candidates_batch_rank ON recommendation_candidates(batch_id, rank);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_candidates_clean_album ON recommendation_candidates(clean_artist, clean_title);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_feedback_clean_album ON recommendation_feedback(clean_artist, clean_title);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_feedback_created_at ON recommendation_feedback(created_at);
 	`)
 	return err
 }

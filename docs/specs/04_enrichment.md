@@ -18,3 +18,4 @@ The background enrichment worker scans the database for records missing structur
 ### C. Payload Extraction & Commit Invariants
 - **For Albums:** Extracts the top 3–5 high-confidence subgenre strings and the absolute physical track count, issuing an `UPDATE` transaction to the target row in the `albums` table.
 - **For Tracks:** Extracts or inherits the verified high-confidence subgenre array to mirror parent/artist metadata, committing an `UPDATE` transaction directly to the target row in the `tracks` table.
+- **Last.fm Tag Filtering:** Last.fm tags are not constrained by a hard-coded genre whitelist. The worker accepts normalized musical descriptors broadly and only rejects obvious non-musical/social noise such as `seen live`, favorites/ownership tags, URL/platform tags, and year/decade buckets.

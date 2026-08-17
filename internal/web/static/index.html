@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Music Vault</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <main class="shell">
+    <aside class="rail" aria-label="Discovery context">
+      <div class="brand">
+        <div>
+          <h1>Music Vault</h1>
+          <p id="modelLine">Loading context</p>
+        </div>
+      </div>
+
+      <details class="panel" open>
+        <summary>New Releases</summary>
+        <div id="releaseList" class="stack compact"></div>
+      </details>
+
+      <details class="panel" open>
+        <summary>Recent Feedback</summary>
+        <div id="feedbackList" class="stack compact"></div>
+      </details>
+    </aside>
+
+    <section class="workspace">
+      <header class="toolbar">
+        <div>
+          <h2>Recommendation Engine</h2>
+          <p>MCP-verified album batches with feedback written to the local database.</p>
+        </div>
+        <button id="refreshContext" class="button secondary" type="button">Refresh</button>
+      </header>
+
+      <form id="promptForm" class="composer">
+        <div class="field-grid">
+          <label>
+            <span>Prompt</span>
+            <textarea id="message" name="message" rows="2" required>Give me a handful of high-impact albums to check out next.</textarea>
+          </label>
+          <label>
+            <span>Mood</span>
+            <input id="mood" name="mood" type="text" placeholder="dense, weird, energetic">
+          </label>
+          <label>
+            <span>Avoid</span>
+            <input id="avoid" name="avoid" type="text" placeholder="soft atmospheric art-electronic">
+          </label>
+          <label>
+            <span>Limit</span>
+            <input id="limit" name="limit" type="number" min="1" max="10" value="6">
+          </label>
+        </div>
+        <div class="actions">
+          <button id="sendButton" class="button primary" type="submit">Generate Batch</button>
+          <span id="statusLine" class="status"></span>
+        </div>
+      </form>
+
+      <div class="workbench">
+        <section class="results-panel" aria-label="Current recommendation batch">
+          <div class="section-header">
+            <div>
+              <h3>Current Batch</h3>
+              <p id="batchMeta">No current batch</p>
+            </div>
+          </div>
+          <div id="candidateList" class="candidate-list"></div>
+        </section>
+
+        <aside class="sidecar" aria-label="Session and feedback tools">
+          <section class="session-panel">
+            <div class="panel-title">Session</div>
+            <section id="thread" class="thread" aria-live="polite"></section>
+          </section>
+
+          <form id="quickFeedback" class="quick-feedback">
+            <div class="panel-title">Quick Feedback</div>
+            <label>
+              <span>Artist</span>
+              <input name="artist" required>
+            </label>
+            <label>
+              <span>Album</span>
+              <input name="album" required>
+            </label>
+            <label>
+              <span>Verdict</span>
+              <select name="verdict">
+                <option value="good">good</option>
+                <option value="great">great</option>
+                <option value="ok">ok</option>
+                <option value="not_for_me_today">not today</option>
+                <option value="disliked">disliked</option>
+                <option value="already_know">already know</option>
+              </select>
+            </label>
+            <label>
+              <span>Notes</span>
+              <textarea name="notes" rows="3"></textarea>
+            </label>
+            <button class="button secondary" type="submit">Log Feedback</button>
+          </form>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

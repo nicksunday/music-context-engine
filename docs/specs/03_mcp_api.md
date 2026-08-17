@@ -46,7 +46,7 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `fallback_tags` (array of strings, optional): Canonical MusicBrainz genre tags derived from an abstract phrase. For example, `"erratic rhythm section"` becomes `["math rock", "idm", "breakcore"]`.
   - `limit` (integer, optional): Maximum candidates to return (Default: 5; maximum: 50).
 - **Validation:** At least one of `target_vibe` or `fallback_tags` is required. When both are supplied, `fallback_tags` takes precedence.
-- **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world recording metadata with album fields). Recommendation clients should present candidates as album recommendations by default and use `track_name` as the starter track to sample.
+- **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world recording metadata with album fields). Recommendation clients should present candidates as album recommendations by default and use `track_name` as the matched track/sample entry point.
 
 ### Tool: `log_album_rating`
 - **Description:** Persist a local album rating to `albums.user_rating` using Specification 07 clean key normalization; insert a UUID-backed album row if absent.
@@ -54,3 +54,15 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `artist` (string, required): The album artist name.
   - `album` (string, required): The album title.
   - `rating` (real, required): Personal score on the local 0.0 to 5.0 scale.
+
+### Tool: `log_recommendation_feedback`
+- **Description:** Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Feedback rows are included in future discovery exclusions.
+- **Input Arguments:**
+  - `artist` (string, required): The recommended album artist name.
+  - `album` (string, required): The recommended album title.
+  - `verdict` (string, required): One of `disliked`, `not_for_me_today`, `ok`, `good`, `great`, `already_know`. Natural aliases like `it's ok` and `not today` are accepted.
+  - `starter_track` (string, optional): Matched track/sample entry point from the album.
+  - `batch_id` (string, optional): Recommendation batch ID for frontend/chat sessions.
+  - `candidate_id` (string, optional): Recommendation candidate ID for frontend/chat sessions.
+  - `mood` (string, optional): Listening context.
+  - `notes` (string, optional): Freeform reaction.
