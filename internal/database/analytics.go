@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
@@ -25,6 +27,73 @@ type GenreTopography struct {
 	AvgAlbumRating      sql.NullFloat64
 }
 
+type AlbumExclusionSet struct {
+	pairs map[string]map[string]bool
+}
+
+func NewAlbumExclusionSet() AlbumExclusionSet {
+	return AlbumExclusionSet{pairs: make(map[string]map[string]bool)}
+}
+
+func (exclusions *AlbumExclusionSet) Add(artist, album string) error {
+	if exclusions == nil {
+		return fmt.Errorf("album exclusion set is nil")
+	}
+	cleanArtist, err := utils.NormalizeSearchText(artist)
+	if err != nil {
+		return fmt.Errorf("normalize exclusion artist %q: %w", artist, err)
+	}
+	cleanAlbum, err := utils.NormalizeSearchText(album)
+	if err != nil {
+		return fmt.Errorf("normalize exclusion album %q: %w", album, err)
+	}
+	exclusions.AddNormalized(cleanArtist, cleanAlbum)
+	return nil
+}
+
+func (exclusions *AlbumExclusionSet) AddNormalized(cleanArtist, cleanAlbum string) {
+	if exclusions == nil {
+		return
+	}
+	if cleanArtist == "" || cleanAlbum == "" {
+		return
+	}
+	if exclusions.pairs == nil {
+		exclusions.pairs = make(map[string]map[string]bool)
+	}
+	if exclusions.pairs[cleanArtist] == nil {
+		exclusions.pairs[cleanArtist] = make(map[string]bool)
+	}
+	exclusions.pairs[cleanArtist][cleanAlbum] = true
+}
+
+func (exclusions AlbumExclusionSet) Contains(artist, album string) (bool, error) {
+	cleanArtist, err := utils.NormalizeSearchText(artist)
+	if err != nil {
+		return false, fmt.Errorf("normalize candidate artist %q: %w", artist, err)
+	}
+	cleanAlbum, err := utils.NormalizeSearchText(album)
+	if err != nil {
+		return false, fmt.Errorf("normalize candidate album %q: %w", album, err)
+	}
+	return exclusions.ContainsNormalized(cleanArtist, cleanAlbum), nil
+}
+
+func (exclusions AlbumExclusionSet) ContainsNormalized(cleanArtist, cleanAlbum string) bool {
+	if exclusions.pairs == nil || cleanArtist == "" || cleanAlbum == "" {
+		return false
+	}
+	return exclusions.pairs[cleanArtist][cleanAlbum]
+}
+
+func (exclusions AlbumExclusionSet) Len() int {
+	count := 0
+	for _, albums := range exclusions.pairs {
+		count += len(albums)
+	}
+	return count
+}
+
 // GetExclusionList returns normalized artist, album, and track names from the
 // user's library.
 func (db *DB) GetExclusionList() (map[string]bool, error) {
@@ -38,6 +107,14 @@ func (db *DB) GetExclusionListContext(ctx context.Context) (map[string]bool, err
 	}
 
 	return getExclusionList(ctx, db.Ctx)
+}
+
+func (db *DB) GetDiscoveryAlbumExclusionsContext(ctx context.Context) (AlbumExclusionSet, error) {
+	if db == nil || db.Ctx == nil {
+		return AlbumExclusionSet{}, fmt.Errorf("database is not initialized")
+	}
+
+	return getDiscoveryAlbumExclusions(ctx, db.Ctx, time.Now())
 }
 
 func getExclusionList(ctx context.Context, db *sql.DB) (map[string]bool, error) {
@@ -75,6 +152,66 @@ func getExclusionList(ctx context.Context, db *sql.DB) (map[string]bool, error) 
 	return exclusions, nil
 }
 
+func getDiscoveryAlbumExclusions(ctx context.Context, db *sql.DB, now time.Time) (AlbumExclusionSet, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	exclusions := NewAlbumExclusionSet()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT artist, title
+		FROM albums
+		WHERE user_rating IS NOT NULL
+		UNION ALL
+		SELECT artist, album
+		FROM recommendation_feedback
+		WHERE verdict IN ('disliked', 'ok', 'good', 'great', 'already_know')`)
+	if err != nil {
+		return AlbumExclusionSet{}, fmt.Errorf("query durable discovery album exclusions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var artist, album sql.NullString
+		if err := rows.Scan(&artist, &album); err != nil {
+			return AlbumExclusionSet{}, fmt.Errorf("scan durable discovery album exclusion: %w", err)
+		}
+		if err := addAlbumExclusion(&exclusions, artist, album); err != nil {
+			return AlbumExclusionSet{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return AlbumExclusionSet{}, fmt.Errorf("iterate durable discovery album exclusions: %w", err)
+	}
+
+	notTodayRows, err := db.QueryContext(ctx, `
+		SELECT artist, album, created_at
+		FROM recommendation_feedback
+		WHERE verdict = 'not_for_me_today'`)
+	if err != nil {
+		return AlbumExclusionSet{}, fmt.Errorf("query not-today discovery album exclusions: %w", err)
+	}
+	defer notTodayRows.Close()
+
+	for notTodayRows.Next() {
+		var artist, album, createdAt sql.NullString
+		if err := notTodayRows.Scan(&artist, &album, &createdAt); err != nil {
+			return AlbumExclusionSet{}, fmt.Errorf("scan not-today discovery album exclusion: %w", err)
+		}
+		if !sameLocalCalendarDay(createdAt.String, now) {
+			continue
+		}
+		if err := addAlbumExclusion(&exclusions, artist, album); err != nil {
+			return AlbumExclusionSet{}, err
+		}
+	}
+	if err := notTodayRows.Err(); err != nil {
+		return AlbumExclusionSet{}, fmt.Errorf("iterate not-today discovery album exclusions: %w", err)
+	}
+
+	return exclusions, nil
+}
+
 func addNormalizedExclusion(exclusions map[string]bool, value sql.NullString) error {
 	if !value.Valid {
 		return nil
@@ -88,6 +225,44 @@ func addNormalizedExclusion(exclusions map[string]bool, value sql.NullString) er
 		exclusions[normalized] = true
 	}
 	return nil
+}
+
+func addAlbumExclusion(exclusions *AlbumExclusionSet, artist, album sql.NullString) error {
+	if !artist.Valid || !album.Valid {
+		return nil
+	}
+	return exclusions.Add(artist.String, album.String)
+}
+
+func sameLocalCalendarDay(createdAt string, now time.Time) bool {
+	createdAt = strings.TrimSpace(createdAt)
+	if createdAt == "" {
+		return false
+	}
+	created, ok := parseRecommendationCreatedAt(createdAt)
+	if !ok {
+		return false
+	}
+	location := now.Location()
+	created = created.In(location)
+	now = now.In(location)
+	createdYear, createdMonth, createdDay := created.Date()
+	nowYear, nowMonth, nowDay := now.Date()
+	return createdYear == nowYear && createdMonth == nowMonth && createdDay == nowDay
+}
+
+func parseRecommendationCreatedAt(value string) (time.Time, bool) {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, true
+		}
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02"} {
+		if parsed, err := time.ParseInLocation(layout, value, time.UTC); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func dropAnalyticalViews(db *sql.DB) error {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
@@ -563,7 +564,7 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 			name:        "discovery requires vibe or fallback tags",
 			toolName:    getVerifiedCandidatesToolName,
 			args:        map[string]any{},
-			wantMessage: "provide a non-empty target_vibe or fallback_tags",
+			wantMessage: "provide a non-empty target_vibe, fallback_tags, or seed_artists",
 		},
 		{
 			name:        "log rating must be number",
@@ -592,7 +593,20 @@ func TestMCPToolsReturnErrorsForMalformedArgumentTypes(t *testing.T) {
 	}
 }
 
-func TestGetVerifiedDiscoveryCandidatesNormalizesExclusions(t *testing.T) {
+func TestGetVerifiedDiscoveryCandidatesNormalizesAlbumExclusions(t *testing.T) {
+	exclusions := database.NewAlbumExclusionSet()
+	for _, album := range []struct {
+		artist string
+		title  string
+	}{
+		{artist: "AUTECHRE!!!", title: "Gantz Graf"},
+		{artist: "Aphex Twin", title: "collapse ep"},
+	} {
+		if err := exclusions.Add(album.artist, album.title); err != nil {
+			t.Fatalf("failed to add exclusion: %v", err)
+		}
+	}
+
 	candidates, err := getVerifiedDiscoveryCandidates(
 		context.Background(),
 		discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
@@ -604,11 +618,7 @@ func TestGetVerifiedDiscoveryCandidatesNormalizesExclusions(t *testing.T) {
 		}),
 		[]string{"experimental electronic"},
 		10,
-		map[string]bool{
-			"AUTECHRE!!!": true,
-			"collapse ep": true,
-			"STORY 2!!!":  true,
-		},
+		exclusions,
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -621,18 +631,35 @@ func TestGetVerifiedDiscoveryCandidatesNormalizesExclusions(t *testing.T) {
 		if candidate.Album == "Collapse EP" {
 			t.Fatalf("excluded album leaked into candidates: %#v", candidate)
 		}
-		if candidate.TrackName == "Story 2" {
-			t.Fatalf("excluded track leaked into candidates: %#v", candidate)
+		if candidate.TrackName == "Story 2" && candidate.Artist == "clipping." {
+			return
 		}
 	}
+	t.Fatalf("track-title-only candidate was excluded; candidates = %#v", candidates)
 }
 
-func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *testing.T) {
+func TestVerifiedDiscoveryCandidatesHandlerUsesAlbumLevelExclusions(t *testing.T) {
 	db := openTestDB(t)
 
+	now := time.Now()
+	today := now.UTC().Format("2006-01-02 15:04:05")
+	yesterday := now.AddDate(0, 0, -1).UTC().Format("2006-01-02 15:04:05")
 	_, err := db.Ctx.Exec(`
-		INSERT INTO albums (id, title, artist, clean_title, clean_artist)
-		VALUES ('album-autechre', 'Gantz Graf', 'Autechre', 'gantz graf', 'autechre')`)
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, user_rating)
+		VALUES
+			('album-autechre', 'Gantz Graf', 'Autechre', 'gantz graf', 'autechre', NULL),
+			('album-aphex', 'Collapse EP', 'Aphex Twin', 'collapse ep', 'aphex twin', 4.0);
+		INSERT INTO tracks (id, title, album, artist, clean_title, clean_artist, is_favorite)
+		VALUES ('track-history', 'Liked Track', 'Track History Album', 'Track History Artist', 'liked track', 'track history artist', 1);
+		INSERT INTO recommendation_feedback (id, artist, album, clean_artist, clean_title, verdict, created_at)
+		VALUES
+			('feedback-durable', 'Feedback Artist', 'Feedback Album', 'feedback artist', 'feedback album', 'good', ?),
+			('feedback-today', 'Today Artist', 'Today Album', 'today artist', 'today album', 'not_for_me_today', ?),
+			('feedback-yesterday', 'Yesterday Artist', 'Yesterday Album', 'yesterday artist', 'yesterday album', 'not_for_me_today', ?)`,
+		today,
+		today,
+		yesterday,
+	)
 	if err != nil {
 		t.Fatalf("failed to insert exclusion fixture: %v", err)
 	}
@@ -641,6 +668,10 @@ func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *test
 		return []DiscoveryCandidate{
 			{TrackName: "Gantz Graf", Artist: "Autechre", Album: "Gantz Graf", Runtime: "3:58", ReleaseYear: 2002},
 			{TrackName: "T69 Collapse", Artist: "Aphex Twin", Album: "Collapse EP", Runtime: "5:22", ReleaseYear: 2018},
+			{TrackName: "Liked Track", Artist: "Track History Artist", Album: "Track History Album", Runtime: "4:00", ReleaseYear: 2020},
+			{TrackName: "Starter", Artist: "Feedback Artist", Album: "Feedback Album", Runtime: "4:01", ReleaseYear: 2021},
+			{TrackName: "Today Track", Artist: "Today Artist", Album: "Today Album", Runtime: "4:02", ReleaseYear: 2022},
+			{TrackName: "Yesterday Track", Artist: "Yesterday Artist", Album: "Yesterday Album", Runtime: "4:03", ReleaseYear: 2023},
 		}, nil
 	})
 	tool, ok := newServer(db.Ctx, discovery, nil).ListTools()[getVerifiedCandidatesToolName]
@@ -678,17 +709,27 @@ func TestVerifiedDiscoveryCandidatesHandlerExcludesIndexedArtistFromJSON(t *test
 		t.Fatalf("instructions missing critical output contract: %q", response.Instructions)
 	}
 
-	foundUnexcludedCandidate := false
+	found := map[string]bool{}
 	for _, candidate := range response.Candidates {
-		if candidate.Artist == "Autechre" {
-			t.Fatalf("excluded artist leaked into JSON response: %#v", candidate)
-		}
-		if candidate.Artist == "Aphex Twin" {
-			foundUnexcludedCandidate = true
+		found[candidate.Artist+"/"+candidate.Album] = true
+	}
+	for _, blocked := range []string{
+		"Aphex Twin/Collapse EP",
+		"Feedback Artist/Feedback Album",
+		"Today Artist/Today Album",
+	} {
+		if found[blocked] {
+			t.Fatalf("blocked candidate %q leaked into JSON response: %#v", blocked, response.Candidates)
 		}
 	}
-	if !foundUnexcludedCandidate {
-		t.Fatalf("JSON response omitted valid unexcluded candidate: %#v", response.Candidates)
+	for _, want := range []string{
+		"Autechre/Gantz Graf",
+		"Track History Artist/Track History Album",
+		"Yesterday Artist/Yesterday Album",
+	} {
+		if !found[want] {
+			t.Fatalf("JSON response omitted valid candidate %q: %#v", want, response.Candidates)
+		}
 	}
 }
 
@@ -807,7 +848,7 @@ func TestGetVerifiedDiscoveryCandidatesReturnsOnlyStrictVibeMatches(t *testing.T
 		}),
 		[]string{"not a registered sonic topology"},
 		5,
-		nil,
+		database.NewAlbumExclusionSet(),
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)

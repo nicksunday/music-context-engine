@@ -115,6 +115,7 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		starter_track TEXT,
 		release_year INTEGER,
 		genre_tags TEXT,
+		streaming_url TEXT,
 		rank INTEGER,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -232,6 +233,9 @@ func ensureAlignedSchema(db *sql.DB) error {
 		return err
 	}
 	if err := ensureRecommendationSchema(db); err != nil {
+		return err
+	}
+	if err := ensureRecommendationStreamingURLColumn(db); err != nil {
 		return err
 	}
 	return nil
@@ -354,6 +358,7 @@ func ensureRecommendationSchema(db *sql.DB) error {
 			starter_track TEXT,
 			release_year INTEGER,
 			genre_tags TEXT,
+			streaming_url TEXT,
 			rank INTEGER,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
@@ -374,6 +379,21 @@ func ensureRecommendationSchema(db *sql.DB) error {
 		);`)
 	if err != nil {
 		return fmt.Errorf("failed to ensure recommendation feedback schema: %w", err)
+	}
+	return nil
+}
+
+func ensureRecommendationStreamingURLColumn(db *sql.DB) error {
+	exists, err := columnExists(db, "recommendation_candidates", "streaming_url")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	if _, err := db.Exec("ALTER TABLE recommendation_candidates ADD COLUMN streaming_url TEXT"); err != nil {
+		return fmt.Errorf("failed to add recommendation_candidates.streaming_url column: %w", err)
 	}
 	return nil
 }

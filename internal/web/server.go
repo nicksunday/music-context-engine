@@ -20,29 +20,33 @@ import (
 
 	"github.com/nicksunday/music-context-platform/internal/database"
 	mcpserver "github.com/nicksunday/music-context-platform/internal/mcp"
+	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
 const (
-	defaultArtistLimit         = 12
-	defaultGenreLimit          = 20
-	defaultFeedbackLimit       = 25
-	defaultBatchLimit          = 6
-	maxBatchLimit              = 10
-	defaultOllamaTimeout       = 3 * time.Minute
-	defaultVerifyTimeout       = 10 * time.Second
-	defaultVerifyDelay         = time.Second
-	defaultRadarTimeout        = 25 * time.Second
-	defaultRadarArtists        = 50
-	defaultRadarReleases       = 8
-	defaultRadarCacheTTL       = 12 * time.Hour
-	defaultRadarErrorTTL       = 5 * time.Minute
-	defaultRadarRefreshTimeout = 3 * time.Minute
-	listenBrainzResponseLimit  = 32 << 20
-	newReleaseWindowDays       = 90
-	listenBrainzBaseURL        = "https://api.listenbrainz.org/1"
-	musicBrainzBaseURL         = "https://musicbrainz.org/ws/2"
-	iTunesSearchBaseURL        = "https://itunes.apple.com/search"
-	webUserAgent               = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
+	defaultArtistLimit             = 12
+	defaultGenreLimit              = 20
+	defaultFeedbackLimit           = 25
+	defaultBatchLimit              = 6
+	defaultSessionListLimit        = 25
+	maxBatchLimit                  = 10
+	defaultOllamaTimeout           = 3 * time.Minute
+	defaultVerifyTimeout           = 10 * time.Second
+	defaultVerifyDelay             = time.Second
+	defaultLinkerTimeout           = 10 * time.Second
+	defaultRadarTimeout            = 25 * time.Second
+	defaultRadarArtists            = 1500
+	defaultMusicBrainzRadarArtists = 50
+	defaultRadarReleases           = 16
+	defaultRadarCacheTTL           = 12 * time.Hour
+	defaultRadarErrorTTL           = 5 * time.Minute
+	defaultRadarRefreshTimeout     = 3 * time.Minute
+	listenBrainzResponseLimit      = 32 << 20
+	newReleaseWindowDays           = 90
+	listenBrainzBaseURL            = "https://api.listenbrainz.org/1"
+	musicBrainzBaseURL             = "https://musicbrainz.org/ws/2"
+	iTunesSearchBaseURL            = "https://itunes.apple.com/search"
+	webUserAgent                   = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
 )
 
 var errReleaseRadarRefreshInProgress = errors.New("release radar refresh is in progress")
@@ -54,6 +58,7 @@ type Options struct {
 	Recommender  Recommender
 	Verifier     CandidateVerifier
 	ReleaseRadar ReleaseRadarProvider
+	LinkResolver StreamingLinkResolver
 	Model        string
 	OllamaURL    string
 	Timeout      time.Duration
@@ -64,6 +69,7 @@ type Server struct {
 	recommender  Recommender
 	verifier     CandidateVerifier
 	releaseRadar ReleaseRadarProvider
+	linkResolver StreamingLinkResolver
 	model        string
 	ollamaURL    string
 }
@@ -80,6 +86,10 @@ type CandidateVerifier interface {
 	Verify(context.Context, database.RecommendationCandidateInput) (database.RecommendationCandidateInput, bool, error)
 }
 
+type StreamingLinkResolver interface {
+	Resolve(context.Context, database.RecommendationCandidateInput) (string, error)
+}
+
 type ReleaseRadarProvider interface {
 	NewReleases(context.Context, []database.ArtistAffinity, time.Time, time.Time, int) ([]NewRelease, error)
 }
@@ -87,6 +97,7 @@ type ReleaseRadarProvider interface {
 type DiscoveryRequest struct {
 	TargetVibe   string
 	FallbackTags []string
+	SeedArtists  []string
 	Limit        int
 }
 
@@ -122,6 +133,14 @@ type RecommendationResponse struct {
 	Batch database.RecommendationBatch `json:"batch"`
 }
 
+type BatchResponse struct {
+	Batch *database.RecommendationBatch `json:"batch"`
+}
+
+type BatchesResponse struct {
+	Batches []database.RecommendationBatchSummary `json:"batches"`
+}
+
 type RailResponse struct {
 	NewReleases  []NewRelease `json:"new_releases"`
 	ReleaseError string       `json:"release_error,omitempty"`
@@ -142,6 +161,7 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 		recommender:  options.Recommender,
 		verifier:     options.Verifier,
 		releaseRadar: options.ReleaseRadar,
+		linkResolver: options.LinkResolver,
 		model:        strings.TrimSpace(options.Model),
 		ollamaURL:    normalizeBaseURL(options.OllamaURL),
 	}
@@ -149,6 +169,9 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/context", server.handleContext)
 	mux.HandleFunc("GET /api/rail", server.handleRail)
+	mux.HandleFunc("GET /api/batch/latest", server.handleLatestBatch)
+	mux.HandleFunc("GET /api/batch", server.handleBatchByID)
+	mux.HandleFunc("GET /api/batches", server.handleBatches)
 	mux.HandleFunc("POST /api/recommendations", server.handleRecommendations)
 	mux.HandleFunc("POST /api/feedback", server.handleFeedback)
 	mux.Handle("/", staticHandler())
@@ -233,6 +256,7 @@ func (server *Server) handleRail(writer http.ResponseWriter, request *http.Reque
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load artist context for the sidebar.")
 		return
 	}
+	artists = releaseRadarAffinityArtists(artists)
 
 	response := RailResponse{}
 	if server.releaseRadar != nil {
@@ -279,11 +303,12 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load music profile context.")
 		return
 	}
-	exclusions, err := (&database.DB{Ctx: server.db}).GetExclusionListContext(request.Context())
+	exclusions, err := (&database.DB{Ctx: server.db}).GetDiscoveryAlbumExclusionsContext(request.Context())
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load local discovery exclusions.")
 		return
 	}
+	avoidTags := requestAvoidTags(input)
 
 	draft, err := server.recommender.Recommend(request.Context(), input, profile)
 	if err != nil {
@@ -295,8 +320,9 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		return
 	}
 	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
 	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned artists or albums already in the local library or recent feedback. Try again with a more specific prompt.")
+		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
 		return
 	}
 	draft.Candidates, err = server.verifyCandidates(request.Context(), draft.Candidates)
@@ -304,13 +330,22 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadGateway, err.Error())
 		return
 	}
+	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
 	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived external verification. Try again with a more specific prompt.")
+		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived external verification, album-level exclusions, and avoid filters. Try again with a more specific prompt.")
+		return
+	}
+	draft.Candidates = applyRecommendationBatchDiversity(input, draft.Candidates)
+	if len(draft.Candidates) == 0 {
+		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived final artist-diversity filtering. Try again with a broader prompt.")
 		return
 	}
 	if len(draft.Candidates) > input.Limit {
 		draft.Candidates = draft.Candidates[:input.Limit]
+		resetRecommendationCandidateRanks(draft.Candidates)
 	}
+	draft.Candidates = server.resolveCandidateLinks(request.Context(), draft.Candidates)
 
 	batch, err := database.CreateRecommendationBatch(request.Context(), server.db, database.RecommendationBatchInput{
 		Prompt:     input.Message,
@@ -356,6 +391,50 @@ func (server *Server) handleFeedback(writer http.ResponseWriter, request *http.R
 	writeJSON(writer, http.StatusOK, result)
 }
 
+func (server *Server) handleLatestBatch(writer http.ResponseWriter, request *http.Request) {
+	batch, err := database.FetchLatestRecommendationBatch(request.Context(), server.db)
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load the latest recommendation batch.")
+		return
+	}
+	if batch.ID == "" {
+		writeJSON(writer, http.StatusOK, BatchResponse{Batch: nil})
+		return
+	}
+	writeJSON(writer, http.StatusOK, BatchResponse{Batch: &batch})
+}
+
+func (server *Server) handleBatchByID(writer http.ResponseWriter, request *http.Request) {
+	id := strings.TrimSpace(request.URL.Query().Get("id"))
+	if id == "" {
+		writeJSONError(writer, http.StatusBadRequest, "Missing id query parameter.")
+		return
+	}
+
+	batch, err := database.FetchRecommendationBatchByID(request.Context(), server.db, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(writer, http.StatusNotFound, "Recommendation batch not found.")
+			return
+		}
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load the recommendation batch.")
+		return
+	}
+	writeJSON(writer, http.StatusOK, BatchResponse{Batch: &batch})
+}
+
+func (server *Server) handleBatches(writer http.ResponseWriter, request *http.Request) {
+	batches, err := database.ListRecommendationBatches(request.Context(), server.db, defaultSessionListLimit)
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load past recommendation sessions.")
+		return
+	}
+	if batches == nil {
+		batches = []database.RecommendationBatchSummary{}
+	}
+	writeJSON(writer, http.StatusOK, BatchesResponse{Batches: batches})
+}
+
 func (server *Server) fetchProfileContext(ctx context.Context) (ProfileContext, error) {
 	artists, err := database.FetchTopArtistAffinities(ctx, server.db, defaultArtistLimit)
 	if err != nil {
@@ -399,6 +478,29 @@ func (server *Server) verifyCandidates(
 	return verified, nil
 }
 
+func (server *Server) resolveCandidateLinks(
+	ctx context.Context,
+	candidates []database.RecommendationCandidateInput,
+) []database.RecommendationCandidateInput {
+	if server.linkResolver == nil || len(candidates) == 0 {
+		return candidates
+	}
+
+	resolved := make([]database.RecommendationCandidateInput, 0, len(candidates))
+	for _, candidate := range candidates {
+		streamingURL, err := server.linkResolver.Resolve(ctx, candidate)
+		if err != nil {
+			// Graceful degradation: keep the candidate without a streaming URL
+			// so batch generation never fails on streaming lookups.
+			resolved = append(resolved, candidate)
+			continue
+		}
+		candidate.StreamingURL = strings.TrimSpace(streamingURL)
+		resolved = append(resolved, candidate)
+	}
+	return resolved
+}
+
 type OllamaRecommender struct {
 	baseURL string
 	model   string
@@ -412,14 +514,29 @@ type MCPDiscoveryProvider struct {
 type MCPGroundedOllamaRecommender struct {
 	ollama    *OllamaRecommender
 	discovery DiscoveryProvider
+	similar   mcpserver.SimilarArtistSource
+}
+
+// WithSimilarArtists attaches a real similar-artist source (normally Last.fm)
+// used to anchor discovery on artists similar to the user's top affinity
+// artists, so recommendations are grounded in compositional adjacency rather
+// than guessed genre tags alone.
+func (recommender *MCPGroundedOllamaRecommender) WithSimilarArtists(source mcpserver.SimilarArtistSource) *MCPGroundedOllamaRecommender {
+	recommender.similar = source
+	return recommender
 }
 
 type modelDiscoveryPlan struct {
-	VibeSummary    string   `json:"vibe_summary"`
-	RequiredTraits []string `json:"required_traits"`
-	FlexibleTraits []string `json:"flexible_traits"`
-	TargetVibe     string   `json:"target_vibe"`
-	FallbackTags   []string `json:"fallback_tags"`
+	VibeSummary         string   `json:"vibe_summary"`
+	RequiredTraits      []string `json:"required_traits"`
+	FlexibleTraits      []string `json:"flexible_traits"`
+	ReferenceAnchors    []string `json:"reference_anchors"`
+	ComparisonTraits    []string `json:"comparison_traits"`
+	FalseFriendTraits   []string `json:"false_friend_traits"`
+	BridgeTraits        []string `json:"bridge_traits"`
+	ComparisonModifiers []string `json:"comparison_modifiers"`
+	TargetVibe          string   `json:"target_vibe"`
+	FallbackTags        []string `json:"fallback_tags"`
 }
 
 type modelCandidateSelection struct {
@@ -528,14 +645,125 @@ type listenBrainzFreshRelease struct {
 	ReleaseTags             []string `json:"release_tags"`
 }
 
+type listenBrainzReleaseCandidate struct {
+	release         NewRelease
+	releaseGroupID  string
+	artistForLookup string
+	albumForLookup  string
+}
+
 type iTunesSearchResponse struct {
 	Results []iTunesSearchResult `json:"results"`
 }
 
 type iTunesSearchResult struct {
-	ArtistName       string `json:"artistName"`
-	CollectionName   string `json:"collectionName"`
-	PrimaryGenreName string `json:"primaryGenreName"`
+	ArtistName        string `json:"artistName"`
+	CollectionName    string `json:"collectionName"`
+	PrimaryGenreName  string `json:"primaryGenreName"`
+	CollectionViewURL string `json:"collectionViewUrl"`
+}
+
+type AppleMusicLinker struct {
+	baseURL      string
+	client       *http.Client
+	requestDelay time.Duration
+
+	requestMu sync.Mutex
+	lastCall  time.Time
+}
+
+func NewAppleMusicLinker() *AppleMusicLinker {
+	return &AppleMusicLinker{
+		baseURL:      iTunesSearchBaseURL,
+		client:       &http.Client{Timeout: defaultLinkerTimeout},
+		requestDelay: defaultVerifyDelay,
+	}
+}
+
+func (linker *AppleMusicLinker) Resolve(ctx context.Context, candidate database.RecommendationCandidateInput) (string, error) {
+	if linker == nil || linker.client == nil {
+		return "", nil
+	}
+
+	targetCleanArtist, targetCleanAlbum, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
+	if err != nil {
+		return "", err
+	}
+	if targetCleanArtist == "" || targetCleanAlbum == "" {
+		return "", nil
+	}
+
+	endpoint, err := url.Parse(linker.baseURL)
+	if err != nil {
+		return "", err
+	}
+	query := endpoint.Query()
+	query.Set("term", strings.Join([]string{candidate.Artist, candidate.Album}, " "))
+	query.Set("media", "music")
+	query.Set("entity", "album")
+	query.Set("limit", "10")
+	endpoint.RawQuery = query.Encode()
+
+	if err := linker.waitForRateLimit(ctx); err != nil {
+		return "", err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("User-Agent", webUserAgent)
+
+	response, err := linker.client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return "", fmt.Errorf("iTunes returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+
+	var payload iTunesSearchResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload); err != nil {
+		return "", err
+	}
+	for _, result := range payload.Results {
+		resultCleanArtist, resultCleanAlbum, err := database.NormalizeAlbumLookup(result.ArtistName, result.CollectionName)
+		if err != nil {
+			return "", err
+		}
+		if resultCleanArtist != targetCleanArtist || !equivalentAlbumTitle(targetCleanAlbum, resultCleanAlbum) {
+			continue
+		}
+		return strings.TrimSpace(result.CollectionViewURL), nil
+	}
+	return "", nil
+}
+
+func (linker *AppleMusicLinker) waitForRateLimit(ctx context.Context) error {
+	if linker.requestDelay <= 0 {
+		return nil
+	}
+
+	linker.requestMu.Lock()
+	defer linker.requestMu.Unlock()
+
+	if !linker.lastCall.IsZero() {
+		wait := linker.requestDelay - time.Since(linker.lastCall)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	linker.lastCall = time.Now()
+	return nil
 }
 
 func NewMusicBrainzAlbumVerifier() *MusicBrainzAlbumVerifier {
@@ -665,6 +893,9 @@ func (radar *MusicBrainzReleaseRadar) musicBrainzNewReleases(
 	until time.Time,
 	limit int,
 ) ([]NewRelease, error) {
+	if len(artists) > defaultMusicBrainzRadarArtists {
+		artists = artists[:defaultMusicBrainzRadarArtists]
+	}
 	candidates := make([]NewRelease, 0, limit)
 	seen := make(map[string]bool)
 	var firstErr error
@@ -757,12 +988,9 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 	}
 
 	artistSet := affinityArtistSet(artists)
-	candidates := make([]NewRelease, 0, limit)
+	candidates := make([]listenBrainzReleaseCandidate, 0, limit)
 	seen := make(map[string]bool)
 	for _, release := range payload.Payload.Releases {
-		if len(candidates) == limit {
-			break
-		}
 		if !strings.EqualFold(strings.TrimSpace(release.ReleaseGroupPrimaryType), "album") {
 			continue
 		}
@@ -772,7 +1000,7 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 			continue
 		}
 		cleanArtist, cleanAlbum, err := database.NormalizeAlbumLookup(release.ArtistCreditName, release.ReleaseName)
-		if err != nil || cleanArtist == "" || cleanAlbum == "" || !artistSet[cleanArtist] {
+		if err != nil || cleanArtist == "" || cleanAlbum == "" || !artistMatchesAffinitySet(release.ArtistCreditName, cleanArtist, artistSet) {
 			continue
 		}
 		key := cleanArtist + "\x00" + cleanAlbum
@@ -782,25 +1010,41 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 		seen[key] = true
 
 		genreTags := cleanReleaseTags(release.ReleaseTags, 4)
-		if len(genreTags) == 0 {
-			genreTags, _ = radar.releaseGroupTags(ctx, release.ReleaseGroupMBID)
-		}
-		if len(genreTags) == 0 {
-			genreTags, _ = radar.iTunesAlbumTags(ctx, release.ArtistCreditName, release.ReleaseName)
-		}
-		candidates = append(candidates, NewRelease{
-			Artist:      strings.TrimSpace(release.ArtistCreditName),
-			Album:       strings.TrimSpace(release.ReleaseName),
-			ReleaseDate: releaseDate,
-			ReleaseType: release.ReleaseGroupPrimaryType,
-			GenreTags:   genreTags,
-			Blurb:       releaseBlurb(genreTags),
+		artistName := strings.TrimSpace(release.ArtistCreditName)
+		albumName := strings.TrimSpace(release.ReleaseName)
+		candidates = append(candidates, listenBrainzReleaseCandidate{
+			release: NewRelease{
+				Artist:      artistName,
+				Album:       albumName,
+				ReleaseDate: releaseDate,
+				ReleaseType: release.ReleaseGroupPrimaryType,
+				GenreTags:   genreTags,
+				Blurb:       releaseBlurb(genreTags),
+			},
+			releaseGroupID:  release.ReleaseGroupMBID,
+			artistForLookup: artistName,
+			albumForLookup:  albumName,
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return releaseDateSortKey(candidates[i].ReleaseDate) > releaseDateSortKey(candidates[j].ReleaseDate)
+		return releaseDateSortKey(candidates[i].release.ReleaseDate) > releaseDateSortKey(candidates[j].release.ReleaseDate)
 	})
-	return candidates, nil
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	releases := make([]NewRelease, 0, len(candidates))
+	for _, candidate := range candidates {
+		release := candidate.release
+		if len(release.GenreTags) == 0 {
+			release.GenreTags, _ = radar.releaseGroupTags(ctx, candidate.releaseGroupID)
+		}
+		if len(release.GenreTags) == 0 {
+			release.GenreTags, _ = radar.iTunesAlbumTags(ctx, candidate.artistForLookup, candidate.albumForLookup)
+		}
+		release.Blurb = releaseBlurb(release.GenreTags)
+		releases = append(releases, release)
+	}
+	return releases, nil
 }
 
 func (radar *MusicBrainzReleaseRadar) searchReleaseGroupsInWindow(
@@ -1336,6 +1580,7 @@ func (provider *MCPDiscoveryProvider) Discover(
 	result, err := mcpserver.GetVerifiedDiscoveryCandidates(ctx, &database.DB{Ctx: provider.db}, mcpserver.VerifiedDiscoveryQuery{
 		TargetVibe:   request.TargetVibe,
 		FallbackTags: request.FallbackTags,
+		SeedArtists:  request.SeedArtists,
 		Limit:        request.Limit,
 	})
 	if err != nil {
@@ -1367,6 +1612,7 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 	candidates, err := recommender.discovery.Discover(ctx, DiscoveryRequest{
 		TargetVibe:   plan.TargetVibe,
 		FallbackTags: compactWebStrings(plan.FallbackTags),
+		SeedArtists:  recommender.similarSeedArtists(ctx, profile.Artists),
 		Limit:        discoveryCandidateFetchLimit(request.Limit),
 	})
 	if err != nil {
@@ -1375,6 +1621,11 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 	if len(candidates) == 0 {
 		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates for those tags. Try a slightly broader prompt.")
 	}
+	candidates = filterAvoidedDiscoveryCandidates(candidates, requestAvoidTags(request))
+	if len(candidates) == 0 {
+		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates after applying avoid filters. Try a slightly broader prompt or fewer avoided styles.")
+	}
+	candidates = rankDiscoveryCandidatesForPrompt(request, plan, candidates)
 
 	return recommender.selectDiscoveryCandidates(ctx, request, profile, plan, candidates)
 }
@@ -1396,10 +1647,45 @@ func (recommender *MCPGroundedOllamaRecommender) planDiscovery(
 	plan.VibeSummary = strings.TrimSpace(plan.VibeSummary)
 	plan.RequiredTraits = compactWebStrings(plan.RequiredTraits)
 	plan.FlexibleTraits = compactWebStrings(plan.FlexibleTraits)
+	plan.ReferenceAnchors = compactWebStrings(plan.ReferenceAnchors)
+	plan.ComparisonTraits = compactWebStrings(plan.ComparisonTraits)
+	plan.FalseFriendTraits = compactWebStrings(plan.FalseFriendTraits)
+	plan.BridgeTraits = compactWebStrings(plan.BridgeTraits)
+	plan.ComparisonModifiers = compactWebStrings(plan.ComparisonModifiers)
 	plan.TargetVibe = strings.TrimSpace(plan.TargetVibe)
 	plan.FallbackTags = compactWebStrings(plan.FallbackTags)
 	plan = calibrateDiscoveryPlanForPrompt(request, plan)
 	return plan, nil
+}
+
+// similarSeedArtists derives the artist-names used to anchor discovery from the
+// user's top affinity artists via the configured real similar-artist source
+// (Last.fm), excluding anything already in the local library. It returns nil
+// when no similar source is configured so discovery falls back to genre tags.
+func (recommender *MCPGroundedOllamaRecommender) similarSeedArtists(
+	ctx context.Context,
+	artists []database.ArtistAffinity,
+) []string {
+	if recommender.similar == nil || len(artists) == 0 {
+		return nil
+	}
+
+	exclude := make(map[string]bool, len(artists))
+	var seeds []string
+	for _, affinity := range artists {
+		clean, err := utils.NormalizeSearchText(affinity.Artist)
+		if err != nil || clean == "" {
+			continue
+		}
+		exclude[clean] = true
+		if len(seeds) < 4 {
+			seeds = append(seeds, affinity.Artist)
+		}
+	}
+	if len(seeds) == 0 {
+		return nil
+	}
+	return mcpserver.SimilarArtistNames(ctx, recommender.similar, seeds, exclude, 4)
 }
 
 func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
@@ -1416,12 +1702,12 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 		discoverySelectionUserPrompt(request, profile, plan, candidates, limit),
 	)
 	if err != nil {
-		return fallbackDiscoveryDraft(candidates, plan, limit), nil
+		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
 	}
 
 	var selection modelCandidateSelectionResponse
 	if err := json.Unmarshal([]byte(extractJSONObject(content)), &selection); err != nil {
-		return fallbackDiscoveryDraft(candidates, plan, limit), nil
+		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
 	}
 
 	draft := RecommendationDraft{Reply: strings.TrimSpace(selection.Reply)}
@@ -1437,12 +1723,14 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 			len(draft.Candidates)+1,
 			selected.Note,
 		))
-		if len(draft.Candidates) == limit {
-			break
-		}
+	}
+	draft.Candidates = applyRecommendationBatchDiversity(request, draft.Candidates)
+	if len(draft.Candidates) > limit {
+		draft.Candidates = draft.Candidates[:limit]
+		resetRecommendationCandidateRanks(draft.Candidates)
 	}
 	if len(draft.Candidates) == 0 {
-		return fallbackDiscoveryDraft(candidates, plan, limit), nil
+		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
 	}
 	if draft.Reply == "" {
 		draft.Reply = "Here are verified albums from the MCP discovery search."
@@ -1453,16 +1741,24 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 func discoveryPlanSystemPrompt() string {
 	return `You interpret personal music recommendation prompts into a musical discovery plan, then map that plan to canonical MusicBrainz genre/tag searches.
 Return only JSON with this exact shape:
-{"vibe_summary":"short musical intent","required_traits":["trait"],"flexible_traits":["trait"],"target_vibe":"","fallback_tags":["tag one","tag two"]}
+{"vibe_summary":"short musical intent","required_traits":["trait"],"flexible_traits":["trait"],"reference_anchors":["artist or style"],"comparison_traits":["trait"],"false_friend_traits":["trait"],"bridge_traits":["trait"],"comparison_modifiers":["modifier"],"target_vibe":"","fallback_tags":["tag one","tag two"]}
 
 Rules:
 - Treat the user's words as evidence of the intended listening feel, not a literal checklist, unless they use explicit hard constraints like "must", "only", "no", or "avoid".
 - Infer musical intent across energy, rhythm feel, texture, density, vocal/lyric importance, novelty, and mood before choosing tags.
 - Put true hard requirements in required_traits. Put vibe cues, loose descriptors, and "or" alternatives in flexible_traits.
+- For comparison prompts using named artists/styles or phrases like "like", "similar to", "same vibe as", "but heavier", "less", or "more", decompose the reference before choosing tags.
+- Put named comparison artists/styles in reference_anchors.
+- Put the musical dimensions the user likely wants from the comparison in comparison_traits.
+- Put superficial broad matches that could miss the requested tone in false_friend_traits.
+- Put indirect but acceptable matches in bridge_traits.
+- Put comparative changes such as heavier, lighter, less harsh, more electronic, more melodic, less death metal, or more groove-focused in comparison_modifiers.
+- Treat requested performance features such as virtuosic, virtuoso, shredding, lead playing, neoclassical playing, Symphony X, or Children of Bodom as core musical intent. Put them in required_traits unless the user clearly frames them as optional.
 - For prompts like "heavy or funky or both", do not require every candidate to be both heavy and funky; search broadly enough to find strong candidates from either side, while preferring overlap.
 - Prefer fallback_tags with 3 to 8 lower-case genre, style, or scene tags likely to exist in MusicBrainz.
 - Use target_vibe only when the prompt is already one canonical tag.
 - Active prompt ingredients outrank the user's historical genre profile. Use profile context only for calibration, never to erase requested traits.
+- Comparison intent outranks broad genre overlap. For example, Rage Against the Machine implies funk metal, rap metal, alternative metal, rhythmic groove, and staccato riffs before generic heaviness; KNOWER implies jazz-funk/electronic/fusion/groove traits; Opeth with "less death metal" should preserve progressive, melodic, atmospheric, and dynamic traits while de-emphasizing death metal.
 - Do not add metal/heavy tags merely because the user's profile is metal-heavy. Only include metal/heavy tags when the current prompt asks for metal, heavy, sludge, death, thrash, doom, grind, or adjacent weight.
 - For cross-genre prompts, include each important vibe ingredient as separate tags instead of collapsing everything into one phrase.
 - When the prompt references non-metal artists/styles such as KNOWER, jazz-funk, funk, fusion, electronic, country, bluegrass, or dubstep, search those spaces directly instead of translating them into metal-adjacent tags.
@@ -1471,6 +1767,7 @@ Rules:
 - When the prompt names KNOWER or similar jazz/electronic fusion acts, include tags such as "jazz-funk", "jazz fusion", "electropop", "synth-pop", and "funk".
 - When the prompt says "weird", "experimental", or "left-field", include tags such as "avant-garde metal", "experimental rock", "noise rock", "math rock", or "art rock" when musically compatible.
 - When the prompt says "heavy", include specific heavy tags that preserve any other requested ingredients, such as "funk metal", "alternative metal", "progressive metal", "death metal", or "sludge metal".
+- When the prompt asks for virtuosic metal like Symphony X or Children of Bodom, prefer tags such as "neoclassical metal", "power metal", "progressive metal", "symphonic metal", and "melodic metal"; use "melodic death metal" as a secondary bridge, not the whole search.
 - Do not output artist names, album names, vague adjectives, moods, or prose in fallback_tags.
 - Avoid tags that recent feedback says are not aligned with the user.`
 }
@@ -1489,12 +1786,16 @@ Rules:
 - Prefer high-impact matches to the user's current prompt over generic taste-anchor similarity.
 - Treat taste anchors as guardrails and quality calibration, not as target genres. Do not pull the batch toward metal unless the current prompt asks for metal/heavy.
 - Preserve non-metal request terms such as jazz, funk, groove, electronic, country, dubstep, weird, or experimental even when the user's profile has strong metal affinities.
+- Prefer one album per artist unless the prompt explicitly requests a catalog, discography, deep-dive, or multiple albums by the same artist.
+- Use comparison anchors, comparison traits, false friends, bridge traits, and modifiers as ranking guidance. Do not treat a named reference artist as just a broad genre label.
+- Rank candidates matching comparison_traits above candidates that only match broad genre, scene, or heaviness overlap. Treat false_friend_traits as weak or negative evidence unless bridge_traits or comparison_traits compensate.
 - Prefer candidates whose genre_tags cover multiple prompt ingredients over candidates that only match the broadest or most familiar tag.
 - Use supported_prompt_traits and unsupported_prompt_traits exactly as provided. Do not claim an unsupported trait in a note.
 - If the prompt asks for funk/funky/groove, rank candidates with supported_prompt_traits containing funk/groove above candidates where that trait is unsupported.
+- If the prompt asks for virtuosic playing, shredding, neoclassical leads, Symphony X, or Children of Bodom, rank candidates with supported_prompt_traits containing virtuosic/lead-playing above generic melodic death or progressive metal candidates that do not support that trait.
 - If prompt_trait_logic says any-of, candidates may satisfy either side of an "or" request; describe only their supported traits.
 - Never mention unsupported_prompt_traits, unsupported traits, or support-status bookkeeping in the user-facing reply or notes.
-- Keep each note to one short sentence and do not invent sourcing, reviews, credits, or track details.`
+- Keep each note to one short sentence and do not invent sourcing, reviews, credits, direct reference-artist similarity, instrumentation, or track details.`
 }
 
 func recommendationSystemPrompt() string {
@@ -1630,6 +1931,21 @@ func discoverySelectionUserPrompt(
 	if len(plan.FlexibleTraits) > 0 {
 		fmt.Fprintf(&builder, "Flexible traits: %s\n", strings.Join(plan.FlexibleTraits, ", "))
 	}
+	if len(plan.ReferenceAnchors) > 0 {
+		fmt.Fprintf(&builder, "Comparison anchors: %s\n", strings.Join(plan.ReferenceAnchors, ", "))
+	}
+	if len(plan.ComparisonTraits) > 0 {
+		fmt.Fprintf(&builder, "Comparison traits: %s\n", strings.Join(plan.ComparisonTraits, ", "))
+	}
+	if len(plan.FalseFriendTraits) > 0 {
+		fmt.Fprintf(&builder, "False-friend traits: %s\n", strings.Join(plan.FalseFriendTraits, ", "))
+	}
+	if len(plan.BridgeTraits) > 0 {
+		fmt.Fprintf(&builder, "Bridge traits: %s\n", strings.Join(plan.BridgeTraits, ", "))
+	}
+	if len(plan.ComparisonModifiers) > 0 {
+		fmt.Fprintf(&builder, "Comparison modifiers: %s\n", strings.Join(plan.ComparisonModifiers, ", "))
+	}
 	fmt.Fprintf(&builder, "Selection limit: %d\n", limit)
 	if len(plan.FallbackTags) > 0 {
 		fmt.Fprintf(&builder, "MCP fallback_tags used: %s\n", strings.Join(plan.FallbackTags, ", "))
@@ -1661,7 +1977,7 @@ func discoverySelectionUserPrompt(
 		if len(candidate.GenreTags) > 0 {
 			fmt.Fprintf(&builder, "; genre_tags=%s", strings.Join(candidate.GenreTags, ", "))
 		}
-		supported, unsupported := promptTraitCoverage(request, candidate)
+		supported, unsupported := promptTraitCoverageForPlan(request, plan, candidate)
 		if len(supported) > 0 {
 			fmt.Fprintf(&builder, "; supported_prompt_traits=%s", strings.Join(supported, ", "))
 		}
@@ -1718,19 +2034,58 @@ func calibrateDiscoveryPlanForPrompt(
 		return plan
 	}
 
+	derivedComparison := promptDerivedComparisonPlan(promptText)
+	plan.ReferenceAnchors = mergeCompactWebStrings(plan.ReferenceAnchors, derivedComparison.ReferenceAnchors)
+	plan.ComparisonTraits = mergeCompactWebStrings(plan.ComparisonTraits, derivedComparison.ComparisonTraits)
+	plan.FalseFriendTraits = mergeCompactWebStrings(plan.FalseFriendTraits, derivedComparison.FalseFriendTraits)
+	plan.BridgeTraits = mergeCompactWebStrings(plan.BridgeTraits, derivedComparison.BridgeTraits)
+	plan.ComparisonModifiers = mergeCompactWebStrings(plan.ComparisonModifiers, derivedComparison.ComparisonModifiers)
+
 	tags := compactWebStrings(plan.FallbackTags)
+	derivedTags := promptDerivedDiscoveryTags(promptText)
 	if promptRequestsHeavyMusic(promptText) {
-		if len(tags) == 0 {
-			tags = prependDiscoveryTags(promptDerivedDiscoveryTags(promptText), nil, 8)
+		if promptRequestsVirtuosicPlaying(promptText) || promptRequestsComparison(promptText) {
+			tags = prependDiscoveryTags(derivedTags, tags, 8)
+		} else if len(tags) == 0 {
+			tags = prependDiscoveryTags(derivedTags, nil, 8)
 		}
 	} else {
 		tags = filterDiscoveryTags(tags, func(tag string) bool {
 			return !isMetalDiscoveryTag(tag)
 		})
-		tags = prependDiscoveryTags(promptDerivedDiscoveryTags(promptText), tags, 8)
+		tags = prependDiscoveryTags(derivedTags, tags, 8)
+	}
+	avoidTags := requestAvoidTags(request)
+	tags = filterAvoidedDiscoveryTags(tags, avoidTags)
+	if len(tags) == 0 {
+		tags = filterAvoidedDiscoveryTags(derivedTags, avoidTags)
+	}
+	if styleMatchesAnyAvoidTag(plan.TargetVibe, avoidTags) {
+		plan.TargetVibe = ""
 	}
 	plan.FallbackTags = tags
 	return plan
+}
+
+func mergeCompactWebStrings(left []string, right []string) []string {
+	return compactWebStrings(append(append([]string(nil), left...), right...))
+}
+
+func promptRequestsComparison(promptText string) bool {
+	promptText = " " + strings.Join(strings.Fields(strings.ToLower(promptText)), " ") + " "
+	if containsAny(promptText, []string{
+		" like ",
+		" similar to ",
+		" same vibe ",
+		" vibes ",
+		" in the style of ",
+		" but ",
+		" less ",
+		" more ",
+	}) {
+		return true
+	}
+	return len(promptDerivedComparisonPlan(promptText).ReferenceAnchors) > 0
 }
 
 func promptRequestsHeavyMusic(promptText string) bool {
@@ -1744,6 +2099,21 @@ func promptRequestsHeavyMusic(promptText string) bool {
 		"black metal",
 		"grind",
 		"hardcore",
+	})
+}
+
+func promptRequestsVirtuosicPlaying(promptText string) bool {
+	return containsAny(promptText, []string{
+		"virtuosic",
+		"vituosic",
+		"virtuoso",
+		"shred",
+		"shredding",
+		"lead playing",
+		"lead guitar",
+		"neoclassical",
+		"symphony x",
+		"children of bodom",
 	})
 }
 
@@ -1766,6 +2136,16 @@ func promptDerivedDiscoveryTags(promptText string) []string {
 		tags = append(tags, values...)
 	}
 
+	add(promptDerivedComparisonPlan(promptText).FallbackTags...)
+	if promptRequestsVirtuosicPlaying(promptText) {
+		add("neoclassical metal", "power metal", "progressive metal", "symphonic metal", "melodic metal")
+	}
+	if containsAny(promptText, []string{"children of bodom"}) {
+		add("melodic death metal")
+	}
+	if promptRequestsHeavyMusic(promptText) && containsAny(promptText, []string{"melodic", "melody"}) {
+		add("melodic metal", "power metal", "melodic death metal")
+	}
 	if containsAny(promptText, []string{"knower", "louis cole", "clown core"}) {
 		add("jazz-funk", "jazz fusion", "electropop", "synth-pop", "funk")
 	}
@@ -1788,6 +2168,235 @@ func promptDerivedDiscoveryTags(promptText string) []string {
 		add("art pop", "experimental", "art rock")
 	}
 	return compactWebStrings(tags)
+}
+
+func promptDerivedComparisonPlan(promptText string) modelDiscoveryPlan {
+	promptText = strings.ToLower(promptText)
+	var plan modelDiscoveryPlan
+	addAnchors := func(values ...string) {
+		plan.ReferenceAnchors = append(plan.ReferenceAnchors, values...)
+	}
+	addTraits := func(values ...string) {
+		plan.ComparisonTraits = append(plan.ComparisonTraits, values...)
+	}
+	addFalseFriends := func(values ...string) {
+		plan.FalseFriendTraits = append(plan.FalseFriendTraits, values...)
+	}
+	addBridgeTraits := func(values ...string) {
+		plan.BridgeTraits = append(plan.BridgeTraits, values...)
+	}
+	addModifiers := func(values ...string) {
+		plan.ComparisonModifiers = append(plan.ComparisonModifiers, values...)
+	}
+	addTags := func(values ...string) {
+		plan.FallbackTags = append(plan.FallbackTags, values...)
+	}
+
+	if containsAny(promptText, []string{"rage against the machine", "ratm"}) {
+		addAnchors("rage against the machine")
+		addTraits("funk metal", "rap metal", "rhythmic groove", "staccato riffs")
+		addFalseFriends("generic heavy metal")
+		addBridgeTraits("alternative metal", "funk rock")
+		addTags("funk metal", "rap metal", "alternative metal", "funk rock")
+	}
+	if containsAny(promptText, []string{"knower", "louis cole", "clown core"}) {
+		addAnchors("knower")
+		addTraits("jazz-funk", "jazz fusion", "electronic fusion", "synth", "groove", "rhythm-section energy")
+		addFalseFriends("generic heavy metal")
+		addBridgeTraits("electro-funk", "synth-pop", "funk metal")
+		addTags("jazz-funk", "jazz fusion", "electro-funk", "synth-pop", "funk")
+		if promptRequestsHeavyMusic(promptText) {
+			addModifiers("heavier")
+			addBridgeTraits("added weight", "funk metal", "progressive rock")
+			addTags("funk metal", "progressive rock")
+		}
+	}
+	if containsAny(promptText, []string{"opeth"}) {
+		addAnchors("opeth")
+		addTraits("progressive metal", "melodic", "atmospheric", "dynamic contrast")
+		addBridgeTraits("progressive rock", "melodic metal")
+		addTags("progressive metal", "progressive rock", "melodic metal")
+		if containsAny(promptText, []string{"less death", "less death metal", "without death", "no death"}) {
+			addModifiers("less death metal")
+			addFalseFriends("death metal", "technical death metal")
+		} else {
+			addBridgeTraits("death metal")
+			addTags("death metal")
+		}
+	}
+	if containsAny(promptText, []string{"symphony x", "children of bodom"}) {
+		if containsAny(promptText, []string{"symphony x"}) {
+			addAnchors("symphony x")
+		}
+		if containsAny(promptText, []string{"children of bodom"}) {
+			addAnchors("children of bodom")
+		}
+		addTraits("melodic", "neoclassical", "power metal", "progressive metal", "symphonic metal", "speed metal")
+		addFalseFriends("technical death metal", "brutal death metal", "deathcore", "grindcore", "generic death metal")
+		addBridgeTraits("melodic death metal")
+		addTags("neoclassical metal", "power metal", "progressive metal", "symphonic metal", "melodic metal", "melodic death metal")
+	}
+
+	if containsAny(promptText, []string{"but heavier", "heavier"}) {
+		addModifiers("heavier")
+		addBridgeTraits("added weight")
+	}
+	if containsAny(promptText, []string{"less harsh", "lighter"}) {
+		addModifiers("less harsh")
+	}
+	if containsAny(promptText, []string{"more electronic", "electronic but", "more synth"}) {
+		addModifiers("more electronic")
+		addTraits("electronic", "synth")
+	}
+	if containsAny(promptText, []string{"more melodic", "melodic but"}) {
+		addModifiers("more melodic")
+		addTraits("melodic")
+	}
+	if containsAny(promptText, []string{"more groove", "groove-focused", "groove focused"}) {
+		addModifiers("more groove-focused")
+		addTraits("groove")
+	}
+
+	plan.ReferenceAnchors = compactWebStrings(plan.ReferenceAnchors)
+	plan.ComparisonTraits = compactWebStrings(plan.ComparisonTraits)
+	plan.FalseFriendTraits = compactWebStrings(plan.FalseFriendTraits)
+	plan.BridgeTraits = compactWebStrings(plan.BridgeTraits)
+	plan.ComparisonModifiers = compactWebStrings(plan.ComparisonModifiers)
+	plan.FallbackTags = compactWebStrings(plan.FallbackTags)
+	return plan
+}
+
+func requestAvoidTags(request RecommendationRequest) []string {
+	return parseAvoidTags(request.Avoid)
+}
+
+func parseAvoidTags(value string) []string {
+	seen := make(map[string]bool)
+	var tags []string
+	for _, raw := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n'
+	}) {
+		clean := normalizeStyleText(raw)
+		if clean == "" {
+			continue
+		}
+		for _, tag := range expandAvoidTag(clean) {
+			if tag == "" || seen[tag] {
+				continue
+			}
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+func expandAvoidTag(tag string) []string {
+	values := []string{tag}
+	switch tag {
+	case "tech death", "technical death":
+		values = append(values, "technical death metal")
+	case "tech death metal", "technical death metal":
+		values = append(values, "technical death")
+	case "avant garde metal":
+		values = append(values, "avant garde")
+	}
+	return compactWebStrings(values)
+}
+
+func normalizeStyleText(value string) string {
+	clean, err := normalizeOptional(value)
+	if err != nil {
+		return ""
+	}
+	clean = strings.ReplaceAll(clean, "avante", "avant")
+	clean = strings.ReplaceAll(clean, "tech death", "technical death")
+	return strings.Join(strings.Fields(clean), " ")
+}
+
+func filterAvoidedDiscoveryTags(tags []string, avoidTags []string) []string {
+	if len(tags) == 0 || len(avoidTags) == 0 {
+		return tags
+	}
+	filtered := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if styleMatchesAnyAvoidTag(tag, avoidTags) {
+			continue
+		}
+		filtered = append(filtered, tag)
+	}
+	return filtered
+}
+
+func filterAvoidedDiscoveryCandidates(
+	candidates []mcpserver.DiscoveryCandidate,
+	avoidTags []string,
+) []mcpserver.DiscoveryCandidate {
+	if len(candidates) == 0 || len(avoidTags) == 0 {
+		return candidates
+	}
+	filtered := make([]mcpserver.DiscoveryCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidateHasAvoidedTag(candidate.GenreTags, avoidTags) {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func filterAvoidedRecommendationCandidates(
+	candidates []database.RecommendationCandidateInput,
+	avoidTags []string,
+) []database.RecommendationCandidateInput {
+	if len(candidates) == 0 || len(avoidTags) == 0 {
+		return candidates
+	}
+	filtered := make([]database.RecommendationCandidateInput, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidateHasAvoidedTag(candidate.GenreTags, avoidTags) {
+			continue
+		}
+		candidate.Rank = len(filtered) + 1
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func candidateHasAvoidedTag(candidateTags []string, avoidTags []string) bool {
+	for _, tag := range candidateTags {
+		if styleMatchesAnyAvoidTag(tag, avoidTags) {
+			return true
+		}
+	}
+	return false
+}
+
+func styleMatchesAnyAvoidTag(tag string, avoidTags []string) bool {
+	for _, avoidTag := range avoidTags {
+		if styleMatchesAvoidTag(tag, avoidTag) {
+			return true
+		}
+	}
+	return false
+}
+
+func styleMatchesAvoidTag(tag string, avoidTag string) bool {
+	tag = normalizeStyleText(tag)
+	avoidTag = normalizeStyleText(avoidTag)
+	if tag == "" || avoidTag == "" {
+		return false
+	}
+	if tag == avoidTag {
+		return true
+	}
+	return containsPhrase(tag, avoidTag)
+}
+
+func containsPhrase(value string, phrase string) bool {
+	value = " " + strings.Join(strings.Fields(value), " ") + " "
+	phrase = " " + strings.Join(strings.Fields(phrase), " ") + " "
+	return strings.Contains(value, phrase)
 }
 
 func filterDiscoveryTags(tags []string, keep func(string) bool) []string {
@@ -1879,8 +2488,72 @@ func affinityArtistSet(artists []database.ArtistAffinity) map[string]bool {
 		if cleanArtist != "" {
 			artistSet[cleanArtist] = true
 		}
+		for _, component := range artistCreditComponents(artist.Artist) {
+			cleanComponent, err := normalizedArtistName(component)
+			if err == nil && cleanComponent != "" {
+				artistSet[cleanComponent] = true
+			}
+		}
 	}
 	return artistSet
+}
+
+func releaseRadarAffinityArtists(artists []database.ArtistAffinity) []database.ArtistAffinity {
+	filtered := make([]database.ArtistAffinity, 0, len(artists))
+	for _, artist := range artists {
+		if releaseRadarArtistEligible(artist) {
+			filtered = append(filtered, artist)
+		}
+	}
+	return filtered
+}
+
+func releaseRadarArtistEligible(artist database.ArtistAffinity) bool {
+	if artist.CurvedAffinityScore > 0 || artist.FavoriteTracksCount > 0 {
+		return true
+	}
+	return artist.AvgUserRating.Valid && artist.AvgUserRating.Float64 >= 4.0
+}
+
+func artistMatchesAffinitySet(artist string, cleanArtist string, artistSet map[string]bool) bool {
+	if artistSet[cleanArtist] {
+		return true
+	}
+	for _, component := range artistCreditComponents(artist) {
+		cleanComponent, err := normalizedArtistName(component)
+		if err == nil && artistSet[cleanComponent] {
+			return true
+		}
+	}
+	return false
+}
+
+func artistCreditComponents(artist string) []string {
+	replacer := strings.NewReplacer(
+		" feat. ", "|",
+		" ft. ", "|",
+		" featuring ", "|",
+		" with ", "|",
+		" x ", "|",
+		" X ", "|",
+		" / ", "|",
+		" & ", "|",
+		",", "|",
+		";", "|",
+	)
+	artist = replacer.Replace(strings.TrimSpace(artist))
+	parts := strings.Split(artist, "|")
+	components := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		components = append(components, part)
+	}
+	return components
 }
 
 func cleanReleaseTags(tags []string, limit int) []string {
@@ -1949,6 +2622,7 @@ func cloneNewReleases(releases []NewRelease) []NewRelease {
 }
 
 func fallbackDiscoveryDraft(
+	request RecommendationRequest,
 	candidates []mcpserver.DiscoveryCandidate,
 	plan modelDiscoveryPlan,
 	limit int,
@@ -1960,18 +2634,134 @@ func fallbackDiscoveryDraft(
 		Reply: "Here are verified albums from the MCP discovery search.",
 	}
 	for idx, candidate := range candidates {
-		if len(draft.Candidates) == limit {
-			break
-		}
-		note := "Verified by MCP discovery"
-		if len(plan.FallbackTags) > 0 {
-			note = "Returned by MCP discovery for " + strings.Join(plan.FallbackTags, ", ") + "."
-		} else if plan.TargetVibe != "" {
-			note = "Returned by MCP discovery for " + plan.TargetVibe + "."
-		}
+		note := fallbackDiscoveryNote(request, plan, candidate)
 		draft.Candidates = append(draft.Candidates, discoveryCandidateInput(candidate, idx+1, note))
 	}
+	draft.Candidates = applyRecommendationBatchDiversity(request, draft.Candidates)
+	if len(draft.Candidates) > limit {
+		draft.Candidates = draft.Candidates[:limit]
+		resetRecommendationCandidateRanks(draft.Candidates)
+	}
 	return draft
+}
+
+func fallbackDiscoveryNote(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidate mcpserver.DiscoveryCandidate,
+) string {
+	signals := comparisonSignalsForRequest(request, plan)
+	if !comparisonSignalsEmpty(signals) {
+		matchedTraits := supportedComparisonTraits(signals.ComparisonTraits, candidate.GenreTags)
+		if len(matchedTraits) > 0 {
+			return "Returned by MCP discovery with verified tags for " + strings.Join(firstStrings(matchedTraits, 2), ", ") + "."
+		}
+		matchedBridgeTraits := supportedComparisonTraits(signals.BridgeTraits, candidate.GenreTags)
+		if len(matchedBridgeTraits) > 0 {
+			return "Returned by MCP discovery through a related " + matchedBridgeTraits[0] + " bridge."
+		}
+		return "Returned by MCP discovery for the requested comparison."
+	}
+	if len(plan.FallbackTags) > 0 {
+		return "Returned by MCP discovery for " + strings.Join(plan.FallbackTags, ", ") + "."
+	}
+	if plan.TargetVibe != "" {
+		return "Returned by MCP discovery for " + plan.TargetVibe + "."
+	}
+	return "Verified by MCP discovery"
+}
+
+func applyRecommendationBatchDiversity(
+	request RecommendationRequest,
+	candidates []database.RecommendationCandidateInput,
+) []database.RecommendationCandidateInput {
+	return dedupeRecommendationCandidates(candidates, requestAllowsRepeatedArtists(request))
+}
+
+func requestAllowsRepeatedArtists(request RecommendationRequest) bool {
+	text := " " + strings.Join(strings.Fields(strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))), " ") + " "
+	return containsAny(text, []string{
+		" deep dive ",
+		" deep-dive ",
+		" catalog ",
+		" catalogue ",
+		" discography ",
+		" multiple albums ",
+		" several albums ",
+		" more albums ",
+		" multiple releases ",
+		" several releases ",
+		" more releases ",
+		" same artist ",
+		" same band ",
+		" one artist ",
+		" single artist ",
+		" albums by ",
+		" releases by ",
+		" another album by ",
+	})
+}
+
+func dedupeRecommendationCandidates(
+	candidates []database.RecommendationCandidateInput,
+	allowRepeatedArtists bool,
+) []database.RecommendationCandidateInput {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	seenArtists := make(map[string]bool, len(candidates))
+	seenAlbums := make(map[string]bool, len(candidates))
+	filtered := make([]database.RecommendationCandidateInput, 0, len(candidates))
+	for _, candidate := range candidates {
+		cleanArtist, cleanAlbum := recommendationCandidateKeys(candidate)
+		if cleanArtist == "" {
+			cleanArtist = strings.ToLower(strings.TrimSpace(candidate.Artist))
+		}
+		if cleanAlbum == "" {
+			cleanAlbum = strings.ToLower(strings.TrimSpace(candidate.Album))
+		}
+		albumKey := cleanArtist + "\x00" + cleanAlbum
+		if albumKey != "\x00" && seenAlbums[albumKey] {
+			continue
+		}
+		if !allowRepeatedArtists && cleanArtist != "" && seenArtists[cleanArtist] {
+			continue
+		}
+		candidate.Rank = len(filtered) + 1
+		filtered = append(filtered, candidate)
+		if cleanArtist != "" {
+			seenArtists[cleanArtist] = true
+		}
+		if albumKey != "\x00" {
+			seenAlbums[albumKey] = true
+		}
+	}
+	return filtered
+}
+
+func recommendationCandidateKeys(candidate database.RecommendationCandidateInput) (string, string) {
+	cleanArtist, cleanAlbum, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
+	if err != nil {
+		return normalizeStyleText(candidate.Artist), normalizeStyleText(candidate.Album)
+	}
+	return cleanArtist, cleanAlbum
+}
+
+func resetRecommendationCandidateRanks(candidates []database.RecommendationCandidateInput) {
+	for idx := range candidates {
+		candidates[idx].Rank = idx + 1
+	}
+}
+
+func firstStrings(values []string, limit int) []string {
+	if limit <= 0 || len(values) == 0 {
+		return nil
+	}
+	if len(values) < limit {
+		return values
+	}
+	return values[:limit]
 }
 
 func discoveryCandidateInput(
@@ -1990,6 +2780,221 @@ func discoveryCandidateInput(
 	}
 }
 
+func rankDiscoveryCandidatesForPrompt(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidates []mcpserver.DiscoveryCandidate,
+) []mcpserver.DiscoveryCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+
+	ranked := append([]mcpserver.DiscoveryCandidate(nil), candidates...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		leftScore := promptAlignmentScore(request, plan, ranked[i])
+		rightScore := promptAlignmentScore(request, plan, ranked[j])
+		return leftScore > rightScore
+	})
+	return ranked
+}
+
+func promptAlignmentScore(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidate mcpserver.DiscoveryCandidate,
+) int {
+	supported, unsupported := promptTraitCoverageForPlan(request, plan, candidate)
+	score := len(supported)*6 - len(unsupported)*4
+	score += comparisonAlignmentScore(comparisonSignalsForRequest(request, plan), candidate)
+
+	for _, tag := range plan.FallbackTags {
+		if candidateTagsContainAny(candidate.GenreTags, []string{tag}) {
+			score += 2
+		}
+	}
+
+	promptText := strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))
+	if promptRequestsVirtuosicPlaying(promptText) {
+		score += virtuosicMetalTagScore(candidate.GenreTags)
+	}
+	if promptRequestsVirtuosicPlaying(promptText) && styleMatchesAnyAvoidTag("technical death metal", requestAvoidTags(request)) {
+		if candidateTagsContainAny(candidate.GenreTags, []string{"technical death metal", "technical death", "deathcore", "brutal death metal"}) {
+			score -= 10
+		}
+		if candidateTagsContainAny(candidate.GenreTags, []string{"death metal"}) &&
+			!candidateTagsContainAny(candidate.GenreTags, []string{"melodic death metal", "neoclassical metal", "power metal", "symphonic metal"}) {
+			score -= 4
+		}
+	}
+	return score
+}
+
+func virtuosicMetalTagScore(tags []string) int {
+	score := 0
+	if candidateTagsContainAny(tags, []string{"neoclassical metal", "neoclassical"}) {
+		score += 10
+	}
+	if candidateTagsContainAny(tags, []string{"power metal"}) {
+		score += 7
+	}
+	if candidateTagsContainAny(tags, []string{"progressive metal"}) {
+		score += 5
+	}
+	if candidateTagsContainAny(tags, []string{"symphonic metal"}) {
+		score += 5
+	}
+	if candidateTagsContainAny(tags, []string{"speed metal"}) {
+		score += 4
+	}
+	if candidateTagsContainAny(tags, []string{"melodic metal"}) {
+		score += 3
+	}
+	if candidateTagsContainAny(tags, []string{"melodic death metal"}) {
+		if candidateTagsContainAny(tags, []string{"neoclassical metal", "power metal", "symphonic metal"}) {
+			score += 4
+		} else {
+			score += 1
+		}
+	}
+	if candidateTagsContainAny(tags, []string{"deathcore", "brutal death metal", "grindcore"}) {
+		score -= 6
+	}
+	return score
+}
+
+func candidateTagsContainAny(tags []string, terms []string) bool {
+	for _, tag := range tags {
+		for _, term := range terms {
+			if styleMatchesAvoidTag(tag, term) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type comparisonSignals struct {
+	ReferenceAnchors    []string
+	ComparisonTraits    []string
+	FalseFriendTraits   []string
+	BridgeTraits        []string
+	ComparisonModifiers []string
+}
+
+func comparisonSignalsForRequest(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+) comparisonSignals {
+	promptText := strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))
+	derived := promptDerivedComparisonPlan(promptText)
+	return comparisonSignals{
+		ReferenceAnchors:    mergeCompactWebStrings(plan.ReferenceAnchors, derived.ReferenceAnchors),
+		ComparisonTraits:    mergeCompactWebStrings(plan.ComparisonTraits, derived.ComparisonTraits),
+		FalseFriendTraits:   mergeCompactWebStrings(plan.FalseFriendTraits, derived.FalseFriendTraits),
+		BridgeTraits:        mergeCompactWebStrings(plan.BridgeTraits, derived.BridgeTraits),
+		ComparisonModifiers: mergeCompactWebStrings(plan.ComparisonModifiers, derived.ComparisonModifiers),
+	}
+}
+
+func comparisonSignalsEmpty(signals comparisonSignals) bool {
+	return len(signals.ReferenceAnchors) == 0 &&
+		len(signals.ComparisonTraits) == 0 &&
+		len(signals.FalseFriendTraits) == 0 &&
+		len(signals.BridgeTraits) == 0 &&
+		len(signals.ComparisonModifiers) == 0
+}
+
+func comparisonAlignmentScore(signals comparisonSignals, candidate mcpserver.DiscoveryCandidate) int {
+	if comparisonSignalsEmpty(signals) {
+		return 0
+	}
+
+	primaryMatches := supportedComparisonTraits(signals.ComparisonTraits, candidate.GenreTags)
+	bridgeMatches := supportedComparisonTraits(signals.BridgeTraits, candidate.GenreTags)
+	falseFriendMatches := supportedComparisonTraits(signals.FalseFriendTraits, candidate.GenreTags)
+
+	score := len(primaryMatches)*8 + len(bridgeMatches)*4 - len(falseFriendMatches)*7
+	if len(falseFriendMatches) > 0 && len(primaryMatches) == 0 && len(bridgeMatches) == 0 {
+		score -= 8
+	}
+	if len(primaryMatches) > 0 && len(bridgeMatches) > 0 {
+		score += 3
+	}
+	return score
+}
+
+func supportedComparisonTraits(traits []string, candidateTags []string) []string {
+	supported := make([]string, 0, len(traits))
+	for _, trait := range compactWebStrings(traits) {
+		if comparisonTraitSupportedByTags(trait, candidateTags) {
+			supported = append(supported, trait)
+		}
+	}
+	return supported
+}
+
+func comparisonTraitSupportedByTags(trait string, candidateTags []string) bool {
+	return candidateTagsContainAny(candidateTags, comparisonTraitTagTerms(trait))
+}
+
+func comparisonTraitTagTerms(trait string) []string {
+	trait = normalizeStyleText(trait)
+	switch {
+	case strings.Contains(trait, "generic heavy metal"):
+		return []string{"heavy metal", "traditional heavy metal"}
+	case strings.Contains(trait, "generic death metal"):
+		return []string{"death metal"}
+	case strings.Contains(trait, "technical death"):
+		return []string{"technical death", "technical death metal"}
+	case strings.Contains(trait, "brutal death"):
+		return []string{"brutal death metal"}
+	case strings.Contains(trait, "deathcore"):
+		return []string{"deathcore"}
+	case strings.Contains(trait, "grindcore"):
+		return []string{"grindcore"}
+	case strings.Contains(trait, "funk metal"):
+		return []string{"funk metal"}
+	case strings.Contains(trait, "rap metal"):
+		return []string{"rap metal"}
+	case strings.Contains(trait, "alternative metal"):
+		return []string{"alternative metal"}
+	case strings.Contains(trait, "funk rock"):
+		return []string{"funk rock"}
+	case strings.Contains(trait, "jazz funk") || strings.Contains(trait, "jazz-funk"):
+		return []string{"jazz-funk", "jazz funk"}
+	case strings.Contains(trait, "jazz fusion") || strings.Contains(trait, "fusion"):
+		return []string{"jazz fusion", "fusion", "jazz-funk"}
+	case strings.Contains(trait, "electronic") || strings.Contains(trait, "synth"):
+		return []string{"electronic", "electronica", "electropop", "synth-pop", "synth funk", "electro-funk"}
+	case strings.Contains(trait, "groove") || strings.Contains(trait, "staccato"):
+		return []string{"groove", "funk", "funk metal", "funk rock", "jazz-funk", "rap metal", "alternative metal", "dance-punk"}
+	case strings.Contains(trait, "rhythm") || strings.Contains(trait, "bass"):
+		return []string{"funk", "groove", "dub", "post-punk", "dance-punk", "jazz-funk", "jazz fusion", "electro-funk", "funk metal", "funk rock", "groove metal", "bass"}
+	case strings.Contains(trait, "added weight") || strings.Contains(trait, "heavy"):
+		return []string{"heavy", "heavy metal", "funk metal", "groove metal", "alternative metal", "sludge", "doom", "hardcore"}
+	case strings.Contains(trait, "progressive"):
+		return []string{"progressive metal", "progressive rock", "prog"}
+	case strings.Contains(trait, "melodic death"):
+		return []string{"melodic death metal"}
+	case strings.Contains(trait, "melodic"):
+		return []string{"melodic", "melodic metal", "power metal", "symphonic metal", "neoclassical metal"}
+	case strings.Contains(trait, "atmospheric"):
+		return []string{"atmospheric", "progressive rock", "post-rock", "art rock"}
+	case strings.Contains(trait, "dynamic"):
+		return []string{"progressive", "art rock", "post-metal"}
+	case strings.Contains(trait, "neoclassical"):
+		return []string{"neoclassical", "neoclassical metal", "power metal"}
+	case strings.Contains(trait, "symphonic"):
+		return []string{"symphonic", "symphonic metal"}
+	case strings.Contains(trait, "speed metal"):
+		return []string{"speed metal"}
+	case strings.Contains(trait, "death metal"):
+		return []string{"death metal"}
+	default:
+		return []string{trait}
+	}
+}
+
 type promptTraitRule struct {
 	name        string
 	promptTerms []string
@@ -1997,6 +3002,16 @@ type promptTraitRule struct {
 }
 
 var promptTraitRules = []promptTraitRule{
+	{
+		name:        "virtuosic/lead-playing",
+		promptTerms: []string{"virtuosic", "vituosic", "virtuoso", "shred", "shredding", "lead playing", "lead guitar", "neoclassical", "symphony x", "children of bodom"},
+		tagTerms:    []string{"neoclassical", "power metal", "progressive metal", "symphonic metal", "speed metal"},
+	},
+	{
+		name:        "melodic",
+		promptTerms: []string{"melodic", "melody", "symphony x", "children of bodom"},
+		tagTerms:    []string{"melodic", "power metal", "symphonic metal", "neoclassical metal"},
+	},
 	{
 		name:        "funk/groove",
 		promptTerms: []string{"funk", "funky", "groove", "groovy"},
@@ -2033,6 +3048,14 @@ func promptTraitCoverage(
 	request RecommendationRequest,
 	candidate mcpserver.DiscoveryCandidate,
 ) ([]string, []string) {
+	return promptTraitCoverageForPlan(request, modelDiscoveryPlan{}, candidate)
+}
+
+func promptTraitCoverageForPlan(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidate mcpserver.DiscoveryCandidate,
+) ([]string, []string) {
 	promptText := strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))
 	tagText := strings.ToLower(strings.Join(candidate.GenreTags, " "))
 
@@ -2048,6 +3071,20 @@ func promptTraitCoverage(
 			unsupported = append(unsupported, rule.name)
 		}
 	}
+	signals := comparisonSignalsForRequest(request, plan)
+	primaryMatches := supportedComparisonTraits(signals.ComparisonTraits, candidate.GenreTags)
+	if len(primaryMatches) > 0 {
+		for _, trait := range primaryMatches {
+			supported = append(supported, "comparison:"+trait)
+		}
+	} else if len(signals.ComparisonTraits) > 0 {
+		unsupported = append(unsupported, "comparison target traits")
+	}
+	for _, trait := range supportedComparisonTraits(signals.BridgeTraits, candidate.GenreTags) {
+		supported = append(supported, "bridge:"+trait)
+	}
+	supported = compactWebStrings(supported)
+	unsupported = compactWebStrings(unsupported)
 	return supported, unsupported
 }
 
@@ -2070,23 +3107,19 @@ func containsAny(value string, terms []string) bool {
 
 func filterExcludedCandidates(
 	candidates []database.RecommendationCandidateInput,
-	exclusions map[string]bool,
+	exclusions database.AlbumExclusionSet,
 ) []database.RecommendationCandidateInput {
-	if len(candidates) == 0 || len(exclusions) == 0 {
+	if len(candidates) == 0 || exclusions.Len() == 0 {
 		return candidates
 	}
 
 	filtered := make([]database.RecommendationCandidateInput, 0, len(candidates))
 	for _, candidate := range candidates {
-		cleanArtist, cleanTitle, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
+		excluded, err := exclusions.Contains(candidate.Artist, candidate.Album)
 		if err != nil {
 			continue
 		}
-		cleanTrack, err := normalizeOptional(candidate.StarterTrack)
-		if err != nil {
-			continue
-		}
-		if exclusions[cleanArtist] || exclusions[cleanTitle] || (cleanTrack != "" && exclusions[cleanTrack]) {
+		if excluded {
 			continue
 		}
 		candidate.Rank = len(filtered) + 1

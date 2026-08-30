@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
 const (
@@ -38,6 +40,59 @@ type similarArtist struct {
 // rather than an error, so one bad seed doesn't fail an entire lookup.
 type similarArtistSource interface {
 	SimilarArtists(ctx context.Context, artist string, limit int) ([]similarArtist, error)
+}
+
+// SimilarArtistSource is the exported name for similarArtistSource so callers in
+// other packages (e.g. the web recommender) can seed discovery with real similar
+// artists gathered from Last.fm.
+type SimilarArtistSource = similarArtistSource
+
+// SimilarArtistNames returns up to maxArtists real similar-artist names (from
+// the configured source, normally Last.fm) for the given seed artists, excluding
+// any name whose normalized form is present in exclude. It returns nil when the
+// source is unconfigured, the seed list is empty, or no new similar artists were
+// found, so callers can fall back to genre-tag-only discovery.
+func SimilarArtistNames(
+	ctx context.Context,
+	source SimilarArtistSource,
+	seeds []string,
+	exclude map[string]bool,
+	maxArtists int,
+) []string {
+	if source == nil || maxArtists <= 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, rawSeed := range seeds {
+		if len(out) >= maxArtists {
+			break
+		}
+		cleanSeed, err := utils.NormalizeSearchText(rawSeed)
+		if err != nil || cleanSeed == "" {
+			continue
+		}
+		similar, err := source.SimilarArtists(ctx, rawSeed, maxSimilarArtistsPerSeed)
+		if err != nil {
+			continue
+		}
+		for _, entry := range similar {
+			if len(out) >= maxArtists {
+				break
+			}
+			name := strings.TrimSpace(entry.Name)
+			cleanName, cleanErr := utils.NormalizeSearchText(name)
+			if cleanErr != nil || cleanName == "" || seen[cleanName] {
+				continue
+			}
+			if exclude != nil && exclude[cleanName] {
+				continue
+			}
+			seen[cleanName] = true
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 type lastFMSimilarClientConfig struct {
@@ -95,6 +150,13 @@ func defaultSimilarArtistSource() similarArtistSource {
 		APIKey:       apiKey,
 		RequestDelay: defaultLastFMRequestDelay,
 	})
+}
+
+// NewDefaultSimilarArtistSource returns the process-default similar-artist
+// source (Last.fm), or nil when LASTFM_API_KEY is unset. It is the exported,
+// cross-package entry point used to seed discovery with real similar artists.
+func NewDefaultSimilarArtistSource() SimilarArtistSource {
+	return defaultSimilarArtistSource()
 }
 
 type lastFMSimilarArtistsResponse struct {

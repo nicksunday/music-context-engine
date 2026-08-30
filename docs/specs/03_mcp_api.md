@@ -40,12 +40,13 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `target_vibe` (string, optional): A sonic, technical, or mood descriptor to guide discovery.
 
 ### Tool: `get_verified_discovery_candidates`
-- **Description:** Search live MusicBrainz metadata using canonical genre tags and exclude candidates already represented in the local library. Abstract vibes must be translated to semantic fallback tags before the external request.
+- **Description:** Search live MusicBrainz metadata, anchored on real similar-artist names and/or canonical genre tags, and exclude exact albums already rated or blocked through recommendation feedback. Known artists and track-level history are not global exclusions. Abstract vibes must be translated to semantic fallback tags before the external request.
 - **Input Arguments:**
   - `target_vibe` (string, optional): A raw vibe, canonical MusicBrainz genre tag, or comma-separated canonical tag list.
   - `fallback_tags` (array of strings, optional): Canonical MusicBrainz genre tags derived from an abstract phrase. For example, `"erratic rhythm section"` becomes `["math rock", "idm", "breakcore"]`.
+  - `seed_artists` (array of strings, optional): Real similar-artist names (e.g. from Last.fm `artist.getsimilar`) that anchor the search on specific, new-to-the-user discographies before the genre-tag breadth query.
   - `limit` (integer, optional): Maximum candidates to return (Default: 5; maximum: 50).
-- **Validation:** At least one of `target_vibe` or `fallback_tags` is required. When both are supplied, `fallback_tags` takes precedence.
+- **Validation:** At least one of `target_vibe`, `fallback_tags`, or `seed_artists` is required. When both tags and seeds are supplied, artist-seeded results are gathered first and tags act as a breadth/fallback source.
 - **Output:** A JSON object containing `instructions` (critical recommendation output contract), `effective_limit` (the validated limit after max-cap enforcement), and `candidates` (verified real-world recording metadata with album fields). Recommendation clients should present candidates as album recommendations by default and use `track_name` as the matched track/sample entry point.
 
 ### Tool: `log_album_rating`
@@ -56,7 +57,7 @@ The communication layer must execute strictly via standard input/output (`stdin`
   - `rating` (real, required): Personal score on the local 0.0 to 5.0 scale.
 
 ### Tool: `log_recommendation_feedback`
-- **Description:** Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Feedback rows are included in future discovery exclusions.
+- **Description:** Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Durable verdicts exclude the exact album from future discovery; `not_for_me_today` excludes the exact album only on the same local calendar day.
 - **Input Arguments:**
   - `artist` (string, required): The recommended album artist name.
   - `album` (string, required): The recommended album title.

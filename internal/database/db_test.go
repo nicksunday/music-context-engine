@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveDatabasePathFallsBackToDefaultPath(t *testing.T) {
@@ -135,9 +136,9 @@ func TestInitDBCreatesRecommendationFeedbackSchema(t *testing.T) {
 		INSERT INTO recommendation_batches (id, prompt, mood, notes)
 		VALUES ('batch-1', 'surprise me', 'open', 'test batch');
 		INSERT INTO recommendation_candidates (
-			id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank
+			id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url
 		) VALUES (
-			'candidate-1', 'batch-1', 'black midi', 'Hellfire', 'black midi', 'hellfire', 'Sugar/Tzu', 2022, '["avant-prog"]', 1
+			'candidate-1', 'batch-1', 'black midi', 'Hellfire', 'black midi', 'hellfire', 'Sugar/Tzu', 2022, '["avant-prog"]', 1, 'https://music.apple.com/us/album/hellfire/1628117476'
 		);
 		INSERT INTO recommendation_feedback (
 			id, batch_id, candidate_id, artist, album, clean_artist, clean_title, starter_track, verdict, mood, notes
@@ -154,6 +155,90 @@ func TestInitDBCreatesRecommendationFeedbackSchema(t *testing.T) {
 	}
 	if verdict != "great" {
 		t.Fatalf("verdict = %q, want great", verdict)
+	}
+
+	var streamingURL string
+	if err := db.Ctx.QueryRow("SELECT streaming_url FROM recommendation_candidates WHERE id = 'candidate-1'").Scan(&streamingURL); err != nil {
+		t.Fatalf("failed to query recommendation candidate streaming_url: %v", err)
+	}
+	if streamingURL != "https://music.apple.com/us/album/hellfire/1628117476" {
+		t.Fatalf("streaming_url = %q, want fixture value", streamingURL)
+	}
+}
+
+func TestInitDBAddsRecommendationStreamingURLColumnToExistingDB(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	dbPath := filepath.Join(t.TempDir(), "legacy-recommendations.db")
+
+	oldDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	_, err = oldDB.Exec(`
+		CREATE TABLE recommendation_batches (
+			id TEXT PRIMARY KEY,
+			prompt TEXT,
+			mood TEXT,
+			notes TEXT,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE recommendation_candidates (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+			artist TEXT NOT NULL,
+			album TEXT NOT NULL,
+			clean_artist TEXT NOT NULL,
+			clean_title TEXT NOT NULL,
+			starter_track TEXT,
+			release_year INTEGER,
+			genre_tags TEXT,
+			rank INTEGER,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		INSERT INTO recommendation_batches (id, prompt, mood, notes) VALUES ('batch-1', 'surprise me', 'open', 'test batch');
+		INSERT INTO recommendation_candidates (
+			id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank
+		) VALUES (
+			'candidate-1', 'batch-1', 'black midi', 'Hellfire', 'black midi', 'hellfire', 'Sugar/Tzu', 2022, '["avant-prog"]', 1
+		);
+	`)
+	if err != nil {
+		t.Fatalf("failed to create legacy recommendation schema: %v", err)
+	}
+	if err := oldDB.Close(); err != nil {
+		t.Fatalf("failed to close legacy db: %v", err)
+	}
+
+	db, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	exists, err := columnExists(db.Ctx, "recommendation_candidates", "streaming_url")
+	if err != nil {
+		t.Fatalf("columnExists(recommendation_candidates, streaming_url) error = %v", err)
+	}
+	if !exists {
+		t.Fatal("recommendation_candidates.streaming_url column was not added")
+	}
+
+	var artist string
+	if err := db.Ctx.QueryRow("SELECT artist FROM recommendation_candidates WHERE id = 'candidate-1'").Scan(&artist); err != nil {
+		t.Fatalf("failed to query migrated candidate: %v", err)
+	}
+	if artist != "black midi" {
+		t.Fatalf("migrated candidate artist = %q, want black midi", artist)
+	}
+
+	if _, err := db.Ctx.Exec(`
+		INSERT INTO recommendation_candidates (
+			id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url
+		) VALUES (
+			'candidate-2', 'batch-1', 'Jungle', 'Volcano', 'jungle', 'volcano', 'Candle Flame', 2023, '[]', 2, 'https://music.apple.com/us/album/volcano/1693279903'
+		)`); err != nil {
+		t.Fatalf("failed to insert candidate with streaming_url: %v", err)
 	}
 }
 
@@ -550,6 +635,73 @@ func TestGetExclusionListIncludesAllTracksAndAlbums(t *testing.T) {
 		if !exclusions[want] {
 			t.Errorf("GetExclusionList()[%q] = false, want true", want)
 		}
+	}
+}
+
+func TestGetDiscoveryAlbumExclusionsUsesAlbumLevelRatingAndFeedback(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "album-exclusions.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	now := time.Date(2026, 8, 22, 10, 30, 0, 0, time.Local)
+	today := now.UTC().Format("2006-01-02 15:04:05")
+	yesterday := now.AddDate(0, 0, -1).UTC().Format("2006-01-02 15:04:05")
+
+	_, err = db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, user_rating)
+		VALUES
+			('album-rated', 'Rated Album!!!', 'Known Artist', 'rated album', 'known artist', 4.0),
+			('album-unrated', 'Unrated Album', 'Known Artist', 'unrated album', 'known artist', NULL);
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, is_favorite)
+		VALUES
+			('track-known-artist', 'album-unrated', 'Known Track', 'Unrated Album', 'Known Artist', 'known track', 'known artist', 1),
+			('track-history-only', NULL, 'Liked Track', 'Track History Album', 'Track History Artist', 'liked track', 'track history artist', 1);
+		INSERT INTO recommendation_feedback (id, artist, album, clean_artist, clean_title, starter_track, verdict, created_at)
+		VALUES
+			('feedback-durable', 'Feedback Artist', 'Feedback Album', 'feedback artist', 'feedback album', 'Starter', 'good', ?),
+			('feedback-today', 'Today Artist', 'Today Album', 'today artist', 'today album', 'Today Track', 'not_for_me_today', ?),
+			('feedback-yesterday', 'Yesterday Artist', 'Yesterday Album', 'yesterday artist', 'yesterday album', 'Yesterday Track', 'not_for_me_today', ?);`,
+		today,
+		today,
+		yesterday,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert album exclusion fixtures: %v", err)
+	}
+
+	exclusions, err := getDiscoveryAlbumExclusions(context.Background(), db.Ctx, now)
+	if err != nil {
+		t.Fatalf("getDiscoveryAlbumExclusions() error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		artist string
+		album  string
+		want   bool
+	}{
+		{name: "numeric rating", artist: "Known Artist", album: "Rated Album!!!", want: true},
+		{name: "durable feedback", artist: "Feedback Artist", album: "Feedback Album", want: true},
+		{name: "same-day not today", artist: "Today Artist", album: "Today Album", want: true},
+		{name: "known artist unrated album", artist: "Known Artist", album: "Unrated Album", want: false},
+		{name: "track history only", artist: "Track History Artist", album: "Track History Album", want: false},
+		{name: "older not today", artist: "Yesterday Artist", album: "Yesterday Album", want: false},
+		{name: "standalone album title collision", artist: "Different Artist", album: "Rated Album!!!", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := exclusions.Contains(tt.artist, tt.album)
+			if err != nil {
+				t.Fatalf("Contains() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("Contains(%q, %q) = %v, want %v", tt.artist, tt.album, got, tt.want)
+			}
+		})
 	}
 }
 

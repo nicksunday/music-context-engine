@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/nicksunday/music-context-platform/internal/database"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -28,8 +30,8 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 		if got := request.URL.Query().Get("fmt"); got != "json" {
 			t.Errorf("fmt = %q, want json", got)
 		}
-		if got := request.URL.Query().Get("inc"); got != "artist-rels+release-groups+aliases+tags" {
-			t.Errorf("inc = %q, want artist-rels+release-groups+aliases+tags", got)
+		if got := request.URL.Query().Get("inc"); got != "release-groups+aliases+genres+tags" {
+			t.Errorf("inc = %q, want release-groups+aliases+genres+tags", got)
 		}
 		if got := request.URL.Query().Get("limit"); got != "20" {
 			t.Errorf("limit = %q, want 20", got)
@@ -124,16 +126,25 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 		Timeout:      time.Second,
 		RequestDelay: 0,
 	})
+	exclusions := database.NewAlbumExclusionSet()
+	for _, album := range []struct {
+		artist string
+		title  string
+	}{
+		{artist: "AUTECHRE!!!", title: "Gantz Graf"},
+		{artist: "Aphex Twin", title: "collapse ep"},
+		{artist: "clipping.", title: "CLPPNG"},
+	} {
+		if err := exclusions.Add(album.artist, album.title); err != nil {
+			t.Fatalf("failed to add exclusion: %v", err)
+		}
+	}
 	candidates, err := getVerifiedDiscoveryCandidates(
 		context.Background(),
 		source,
 		[]string{" Math Rock, IDM ", "breakcore", "idm"},
 		2,
-		map[string]bool{
-			"AUTECHRE!!!": true,
-			"collapse ep": true,
-			"STORY 2":     true,
-		},
+		exclusions,
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -166,7 +177,7 @@ func TestGetVerifiedDiscoveryCandidatesCapsResultsPerArtist(t *testing.T) {
 		}),
 		[]string{"funk metal"},
 		5,
-		nil,
+		database.NewAlbumExclusionSet(),
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -196,7 +207,7 @@ func TestGetVerifiedDiscoveryCandidatesDeduplicatesAlbums(t *testing.T) {
 		}),
 		[]string{"industrial"},
 		4,
-		nil,
+		database.NewAlbumExclusionSet(),
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -225,7 +236,7 @@ func TestGetVerifiedDiscoveryCandidatesCapsResultsPerNormalizedArtist(t *testing
 		}),
 		[]string{"post rock"},
 		4,
-		nil,
+		database.NewAlbumExclusionSet(),
 	)
 	if err != nil {
 		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -366,7 +377,7 @@ func TestParseMusicBrainzCandidatesAppendsRomanizedAliases(t *testing.T) {
 	}
 }
 
-func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAliases(t *testing.T) {
+func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAlbumAliases(t *testing.T) {
 	candidate := DiscoveryCandidate{
 		TrackName:           "斑 (Madara)",
 		Artist:              "Develop One's Faculties",
@@ -378,12 +389,14 @@ func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAliases(t *testing.T) {
 	}
 
 	for _, exclusion := range []string{
-		"斑",
-		"Madara",
 		"不恰好な街と僕と君",
 		"Bukakkou na Machi to Boku to Kimi",
 	} {
 		t.Run(exclusion, func(t *testing.T) {
+			exclusions := database.NewAlbumExclusionSet()
+			if err := exclusions.Add(candidate.Artist, exclusion); err != nil {
+				t.Fatalf("failed to add exclusion: %v", err)
+			}
 			candidates, err := getVerifiedDiscoveryCandidates(
 				context.Background(),
 				discoverySourceFunc(func(context.Context, []string, int) ([]DiscoveryCandidate, error) {
@@ -391,7 +404,7 @@ func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAliases(t *testing.T) {
 				}),
 				[]string{"math rock"},
 				1,
-				map[string]bool{exclusion: true},
+				exclusions,
 			)
 			if err != nil {
 				t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
@@ -400,6 +413,132 @@ func TestGetVerifiedDiscoveryCandidatesFiltersRomanizedAliases(t *testing.T) {
 				t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want title variant to be excluded", candidates)
 			}
 		})
+	}
+}
+
+// seedAwareDiscoveryFake records whether the seeded or tag-only search path was
+// used, letting tests assert the dispatch and seed plumbing.
+type seedAwareDiscoveryFake struct {
+	searchCalls int
+	seededCalls int
+	gotTags     []string
+	gotSeeds    []string
+}
+
+func (f *seedAwareDiscoveryFake) Search(_ context.Context, searchTags []string, _ int) ([]DiscoveryCandidate, error) {
+	f.searchCalls++
+	f.gotTags = append([]string(nil), searchTags...)
+	return []DiscoveryCandidate{
+		{TrackName: "TagTrack", Artist: "TagArtist", Album: "TagAlbum", Runtime: "3:00", ReleaseYear: 2020},
+	}, nil
+}
+
+func (f *seedAwareDiscoveryFake) SearchWithSeeds(_ context.Context, searchTags, seedArtists []string, _ int) ([]DiscoveryCandidate, error) {
+	f.seededCalls++
+	f.gotTags = append([]string(nil), searchTags...)
+	f.gotSeeds = append([]string(nil), seedArtists...)
+	return []DiscoveryCandidate{
+		{TrackName: "SeedTrack", Artist: "SeedArtist", Album: "SeedAlbum", Runtime: "3:01", ReleaseYear: 2021},
+	}, nil
+}
+
+func TestGetVerifiedDiscoveryCandidatesUsesSeedsWhenSourceSupportsThem(t *testing.T) {
+	// Without seed artists the dispatcher falls back to the tag-only search.
+	fake := &seedAwareDiscoveryFake{}
+	if _, err := getVerifiedDiscoveryCandidates(
+		context.Background(), fake, []string{"math rock"}, 5, database.NewAlbumExclusionSet(),
+	); err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidates() error = %v", err)
+	}
+	if fake.seededCalls != 0 || fake.searchCalls != 1 {
+		t.Fatalf("seededCalls = %d, searchCalls = %d; want tag-only search", fake.seededCalls, fake.searchCalls)
+	}
+
+	// With seed artists the seeded path is used, deduplicating and normalizing.
+	fake = &seedAwareDiscoveryFake{}
+	candidates, err := getVerifiedDiscoveryCandidatesSeeded(
+		context.Background(), fake, []string{"math rock"}, []string{"Don Caballero", "Don Caballero"}, 5, database.NewAlbumExclusionSet(),
+	)
+	if err != nil {
+		t.Fatalf("getVerifiedDiscoveryCandidatesSeeded() error = %v", err)
+	}
+	if fake.seededCalls != 1 || fake.searchCalls != 0 {
+		t.Fatalf("seededCalls = %d, searchCalls = %d; want seeded search", fake.seededCalls, fake.searchCalls)
+	}
+	if len(fake.gotSeeds) != 1 || fake.gotSeeds[0] != "Don Caballero" {
+		t.Fatalf("gotSeeds = %#v, want a single deduplicated seed", fake.gotSeeds)
+	}
+	if len(candidates) != 1 || candidates[0].TrackName != "SeedTrack" {
+		t.Fatalf("candidates = %#v, want the seeded candidate", candidates)
+	}
+}
+
+func TestMusicBrainzDiscoverySearchWithSeedsMergesArtistAndTagResults(t *testing.T) {
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/release-group/") {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"genres":[],"tags":[]}`))
+			return
+		}
+		if request.URL.Path != "/recording" {
+			t.Errorf("request path = %q, want /recording", request.URL.Path)
+		}
+		query := request.URL.Query().Get("query")
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, `artist:"Autechre"`):
+			_, _ = writer.Write([]byte(`{
+				"recordings": [{
+					"title": "Gantz Graf", "length": 238000, "first-release-date": "2002-08-05",
+					"artist-credit": [{"name": "Autechre"}],
+					"releases": [{
+						"title": "Gantz Graf", "status": "Official", "date": "2002-08-05",
+						"release-group": {"id": "rg-artist", "primary-type": "Album"}
+					}]
+				}]
+			}`))
+		case strings.Contains(query, `tag:"idm"`):
+			_, _ = writer.Write([]byte(`{
+				"recordings": [{
+					"title": "Albert", "length": 322000, "first-release-date": "2018-08-07",
+					"artist-credit": [{"name": "Aphex Twin"}],
+					"releases": [{
+						"title": "Collapse", "status": "Official", "date": "2018-09-14",
+						"release-group": {"id": "rg-tag", "primary-type": "Album"}
+					}]
+				}]
+			}`))
+		default:
+			_, _ = writer.Write([]byte(`{"recordings":[]}`))
+		}
+	}))
+	defer sourceServer.Close()
+
+	source := newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{
+		HTTPClient:   sourceServer.Client(),
+		BaseURL:      sourceServer.URL,
+		UserAgent:    "discovery-test/1.0",
+		Timeout:      time.Second,
+		RequestDelay: 0,
+	})
+
+	candidates, err := source.SearchWithSeeds(context.Background(), []string{"idm"}, []string{"Autechre"}, 10)
+	if err != nil {
+		t.Fatalf("SearchWithSeeds() error = %v", err)
+	}
+
+	artistTrack := false
+	tagTrack := false
+	for _, candidate := range candidates {
+		switch candidate.TrackName {
+		case "Gantz Graf":
+			artistTrack = true
+		case "Albert":
+			tagTrack = true
+		}
+	}
+	if !artistTrack || !tagTrack {
+		t.Fatalf("candidates = %#v; want both artist-anchored and tag results", candidates)
 	}
 }
 
@@ -418,6 +557,108 @@ func TestMusicBrainzTagNamesSortsDedupesAndLimits(t *testing.T) {
 	want := []string{"Math Rock", "breakcore", "idm"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("musicBrainzTagNames() = %#v, want %#v", got, want)
+	}
+}
+
+func TestMusicBrainzDiscoveryUsesReleaseGroupGenres(t *testing.T) {
+	requestCount := 0
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCount++
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/recording":
+			_, _ = writer.Write([]byte(`{
+				"recordings": [{
+					"title": "Omen",
+					"length": 152000,
+					"first-release-date": "2016-07-15",
+					"artist-credit": [{"name": "Savant"}],
+					"genres": [{"name": "melodic death metal", "count": 9}],
+					"releases": [{
+						"title": "Vybz",
+						"status": "Official",
+						"date": "2016-07-15",
+						"release-group": {"id": "release-group-electronic", "primary-type": "Album"}
+					}]
+				}]
+			}`))
+		case "/release-group/release-group-electronic":
+			if got := request.URL.Query().Get("inc"); got != "genres+tags" {
+				t.Errorf("release-group inc = %q, want genres+tags", got)
+			}
+			_, _ = writer.Write([]byte(`{
+				"genres": [{"name": "electronic", "count": 12}, {"name": "experimental", "count": 3}]
+			}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer sourceServer.Close()
+
+	source := newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{
+		HTTPClient:   sourceServer.Client(),
+		BaseURL:      sourceServer.URL,
+		UserAgent:    "discovery-test/1.0",
+		Timeout:      time.Second,
+		RequestDelay: 0,
+	})
+	candidates, err := source.Search(context.Background(), []string{"power metal"}, 20)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("MusicBrainz request count = %d, want recording plus release-group lookup", requestCount)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("Search() returned %#v, want the recording-level metal false positive removed", candidates)
+	}
+}
+
+func TestMusicBrainzDiscoveryPrefersReleaseGroupGenresInCandidate(t *testing.T) {
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/recording":
+			_, _ = writer.Write([]byte(`{
+				"recordings": [{
+					"title": "Lead Work",
+					"length": 240000,
+					"first-release-date": "2020-01-01",
+					"artist-credit": [{"name": "Example Band"}],
+					"genres": [{"name": "melodic death metal", "count": 9}],
+					"releases": [{
+						"title": "Example Album",
+						"status": "Official",
+						"date": "2020-01-01",
+						"release-group": {"id": "release-group-power", "primary-type": "Album"}
+					}]
+				}]
+			}`))
+		case "/release-group/release-group-power":
+			_, _ = writer.Write([]byte(`{
+				"genres": [{"name": "power metal", "count": 12}]
+			}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer sourceServer.Close()
+
+	source := newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{
+		HTTPClient:   sourceServer.Client(),
+		BaseURL:      sourceServer.URL,
+		Timeout:      time.Second,
+		RequestDelay: 0,
+	})
+	candidates, err := source.Search(context.Background(), []string{"power metal"}, 20)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("len(Search()) = %d, want 1", len(candidates))
+	}
+	if got, want := candidates[0].GenreTags, []string{"power metal"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("GenreTags = %#v, want album-level genres %#v", got, want)
 	}
 }
 

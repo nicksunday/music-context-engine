@@ -3,13 +3,19 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nicksunday/music-context-platform/internal/database"
@@ -20,9 +26,17 @@ import (
 )
 
 const (
-	profileArtistLimit = 10
-	profileGenreLimit  = 5
-	databaseFlagUsage  = "SQLite database file path (overrides MUSIC_VAULT_DB_PATH; defaults to data/music_vault.db)"
+	profileArtistLimit      = 10
+	profileGenreLimit       = 5
+	defaultWebDaemonLogPath = "data/music-vault-web.log"
+	databaseFlagUsage       = "SQLite database file path (overrides MUSIC_VAULT_DB_PATH; defaults to data/music_vault.db)"
+)
+
+var (
+	findListeningPIDsForPort = findListeningPIDsWithLsof
+	signalProcessByPID       = signalProcessWithTerm
+	tcpListenAvailable       = canListenTCP
+	restartSleep             = time.Sleep
 )
 
 func main() {
@@ -363,13 +377,19 @@ func runWeb(args []string) {
 	var ollamaURL string
 	var model string
 	var ollamaTimeout time.Duration
+	var restart bool
+	var daemon bool
+	var daemonLogPath string
 	registerDatabaseFlag(flags, &dbPath)
 	flags.StringVar(&addr, "addr", "127.0.0.1:8787", "HTTP listen address")
 	flags.StringVar(&ollamaURL, "ollama-url", defaultOllamaURL(), "Ollama base URL")
 	flags.StringVar(&model, "model", defaultWebModel(), "Ollama model name")
 	flags.DurationVar(&ollamaTimeout, "ollama-timeout", 3*time.Minute, "maximum time to wait for an Ollama recommendation response")
+	flags.BoolVar(&restart, "restart", false, "stop any existing listener on --addr before starting")
+	flags.BoolVar(&daemon, "daemon", false, "start the web server in the background and return immediately")
+	flags.StringVar(&daemonLogPath, "daemon-log", defaultWebDaemonLogPath, "log file used when --daemon is set")
 	flags.Usage = func() {
-		fmt.Fprintf(flags.Output(), "Usage: music-vault web [--db path] [--addr host:port] [--ollama-url url] [--model name] [--ollama-timeout duration]\n")
+		fmt.Fprintf(flags.Output(), "Usage: music-vault web [--db path] [--addr host:port] [--restart] [--daemon] [--daemon-log path] [--ollama-url url] [--model name] [--ollama-timeout duration]\n")
 	}
 	if err := flags.Parse(args); err != nil {
 		log.Fatalf("failed to parse web args: %v", err)
@@ -377,6 +397,28 @@ func runWeb(args []string) {
 	if len(flags.Args()) > 0 {
 		flags.Usage()
 		os.Exit(2)
+	}
+	if restart {
+		if err := restartWebListener(addr, 15*time.Second); err != nil {
+			log.Fatalf("failed to restart web server: %v", err)
+		}
+	}
+	if daemon {
+		available, err := tcpListenAvailable(addr)
+		if err != nil {
+			log.Fatalf("failed to check web listen address: %v", err)
+		}
+		if !available {
+			log.Fatalf("web listen address %s is already in use; pass --restart to stop the existing listener first", addr)
+		}
+
+		childArgs := buildWebDaemonArgs(dbPath, addr, ollamaURL, model, ollamaTimeout, false)
+		pid, err := startWebDaemon(childArgs, daemonLogPath)
+		if err != nil {
+			log.Fatalf("failed to start web daemon: %v", err)
+		}
+		log.Printf("music-vault web daemon started with pid %d at http://%s (log: %s)", pid, addr, daemonLogPath)
+		return
 	}
 
 	db, err := openDatabase(dbPath)
@@ -386,16 +428,244 @@ func runWeb(args []string) {
 	defer db.Ctx.Close()
 
 	handler := webserver.NewServer(db.Ctx, webserver.Options{
-		Recommender:  webserver.NewMCPGroundedOllamaRecommender(db.Ctx, ollamaURL, model, ollamaTimeout),
+		Recommender: webserver.NewMCPGroundedOllamaRecommender(db.Ctx, ollamaURL, model, ollamaTimeout).
+			WithSimilarArtists(mcpserver.NewDefaultSimilarArtistSource()),
 		ReleaseRadar: webserver.NewMusicBrainzReleaseRadar(),
+		LinkResolver: webserver.NewAppleMusicLinker(),
 		Model:        model,
 		OllamaURL:    ollamaURL,
 		Timeout:      ollamaTimeout,
 	})
 
+	server := &http.Server{Addr: addr, Handler: handler}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("web server listen error: %v", err)
+	}
+	shutdownSignals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	log.Printf("music-vault web listening on http://%s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	if err := serveHTTPServer(server, listener, shutdownSignals.Done()); err != nil {
 		log.Fatalf("web server error: %v", err)
+	}
+}
+
+func buildWebDaemonArgs(
+	dbPath string,
+	addr string,
+	ollamaURL string,
+	model string,
+	ollamaTimeout time.Duration,
+	restart bool,
+) []string {
+	args := []string{
+		"web",
+		"--addr", addr,
+		"--ollama-url", ollamaURL,
+		"--model", model,
+		"--ollama-timeout", ollamaTimeout.String(),
+	}
+	if strings.TrimSpace(dbPath) != "" {
+		args = append(args, "--db", dbPath)
+	}
+	if restart {
+		args = append(args, "--restart")
+	}
+	return args
+}
+
+func startWebDaemon(args []string, logPath string) (int, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("find current executable: %w", err)
+	}
+	logFile, err := openDaemonLog(logPath)
+	if err != nil {
+		return 0, err
+	}
+	defer logFile.Close()
+
+	command := exec.Command(executable, args...)
+	command.Stdout = logFile
+	command.Stderr = logFile
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if workingDirectory, err := os.Getwd(); err == nil {
+		command.Dir = workingDirectory
+	}
+	if err := command.Start(); err != nil {
+		return 0, fmt.Errorf("start daemon process: %w", err)
+	}
+
+	pid := command.Process.Pid
+	if err := command.Process.Release(); err != nil {
+		return pid, fmt.Errorf("release daemon process: %w", err)
+	}
+	return pid, nil
+}
+
+func openDaemonLog(logPath string) (*os.File, error) {
+	logPath = strings.TrimSpace(logPath)
+	if logPath == "" {
+		logPath = defaultWebDaemonLogPath
+	}
+	if directory := filepath.Dir(logPath); directory != "." {
+		if err := os.MkdirAll(directory, 0755); err != nil {
+			return nil, fmt.Errorf("create daemon log directory %q: %w", directory, err)
+		}
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open daemon log %q: %w", logPath, err)
+	}
+	return logFile, nil
+}
+
+func restartWebListener(addr string, timeout time.Duration) error {
+	port, err := tcpListenPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse web listen address %q: %w", addr, err)
+	}
+
+	pids, err := findListeningPIDsForPort(port)
+	if err != nil {
+		return err
+	}
+	pids = uniquePIDs(pids)
+	if len(pids) == 0 {
+		return nil
+	}
+
+	signaled := make([]int, 0, len(pids))
+	self := os.Getpid()
+	for _, pid := range pids {
+		if pid == self {
+			continue
+		}
+		if err := signalProcessByPID(pid); err != nil {
+			return fmt.Errorf("stop listener pid %d: %w", pid, err)
+		}
+		signaled = append(signaled, pid)
+	}
+	if len(signaled) == 0 {
+		return nil
+	}
+	log.Printf("stopped existing listener(s) on %s: %s", addr, formatPIDs(signaled))
+
+	deadline := time.Now().Add(timeout)
+	for {
+		available, err := tcpListenAvailable(addr)
+		if err != nil {
+			return fmt.Errorf("check web listen address %q: %w", addr, err)
+		}
+		if available {
+			return nil
+		}
+		if timeout <= 0 || time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %s to stop after signaling pid(s): %s", addr, formatPIDs(signaled))
+		}
+		restartSleep(100 * time.Millisecond)
+	}
+}
+
+func tcpListenPort(addr string) (string, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(port) == "" {
+		return "", fmt.Errorf("missing port")
+	}
+	return port, nil
+}
+
+func findListeningPIDsWithLsof(port string) ([]int, error) {
+	output, err := exec.Command("lsof", "-nP", "-tiTCP:"+port, "-sTCP:LISTEN").Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(output) == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find listener on tcp port %s with lsof: %w", port, err)
+	}
+
+	lines := strings.Fields(string(output))
+	pids := make([]int, 0, len(lines))
+	for _, line := range lines {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil {
+			return nil, fmt.Errorf("parse lsof pid %q: %w", line, err)
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
+}
+
+func signalProcessWithTerm(pid int) error {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return process.Signal(syscall.SIGTERM)
+}
+
+func canListenTCP(addr string) (bool, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err == nil {
+		if closeErr := listener.Close(); closeErr != nil {
+			return false, closeErr
+		}
+		return true, nil
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return false, nil
+	}
+	return false, err
+}
+
+func uniquePIDs(pids []int) []int {
+	seen := make(map[int]bool, len(pids))
+	unique := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		if pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		unique = append(unique, pid)
+	}
+	return unique
+}
+
+func formatPIDs(pids []int) string {
+	values := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		values = append(values, strconv.Itoa(pid))
+	}
+	return strings.Join(values, ", ")
+}
+
+func serveHTTPServer(server *http.Server, listener net.Listener, shutdown <-chan struct{}) error {
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-shutdown:
+		graceContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(graceContext); err != nil {
+			return fmt.Errorf("graceful shutdown: %w", err)
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
 	}
 }
 

@@ -146,12 +146,18 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 
 	s.AddTool(
 		mcpsdk.NewTool(getVerifiedCandidatesToolName,
-			mcpsdk.WithDescription("Search live MusicBrainz recording metadata by a raw canonical vibe or semantic fallback tags, then exclude artists, albums, and tracks already present in the local library. Results are recording-backed but should normally be presented as album recommendations, using track_name as the starter track to sample. For abstract, non-canonical phrases, translate the phrase into canonical MusicBrainz genre tags before calling this tool; for example, map \"erratic rhythm section\" to fallback_tags [\"math rock\", \"idm\", \"breakcore\"]. Provide target_vibe or fallback_tags. "+recommendationToolInstructions),
+			mcpsdk.WithDescription("Search live MusicBrainz recording metadata by a raw canonical vibe or semantic fallback tags, then reconcile matched recordings against release-group genres before returning album candidates. Prefer the returned album-level genre_tags over recording-level tags. Candidates whose album genres contradict the search are discarded; recording-level tags are only a fallback when album genres are unavailable. Then exclude exact artist+album pairs already rated as albums or blocked by recommendation feedback. Known artists and track-level history are not global exclusions. Results are recording-backed but should normally be presented as album recommendations, using track_name as the starter track to sample. For abstract, non-canonical phrases, translate the phrase into canonical MusicBrainz genre tags before calling this tool; for example, map \"erratic rhythm section\" to fallback_tags [\"math rock\", \"idm\", \"breakcore\"]. Provide target_vibe or fallback_tags. "+recommendationToolInstructions),
 			mcpsdk.WithString("target_vibe",
 				mcpsdk.Description("Optional raw vibe or canonical MusicBrainz genre tag. A comma-separated canonical tag list is also accepted. Use fallback_tags instead when the original phrase is abstract or unlikely to be a MusicBrainz tag."),
 			),
 			mcpsdk.WithArray("fallback_tags",
 				mcpsdk.Description("Optional semantic fallback as canonical MusicBrainz genre tags. When provided, these tags take precedence over target_vibe and are queried together. Example: [\"math rock\", \"idm\", \"breakcore\"]."),
+				mcpsdk.MinItems(1),
+				mcpsdk.UniqueItems(true),
+				mcpsdk.WithStringItems(mcpsdk.MinLength(1)),
+			),
+			mcpsdk.WithArray("seed_artists",
+				mcpsdk.Description("Optional real similar-artist names (e.g. from Last.fm artist.getsimilar) to anchor the discovery search. Artist-anchored results ground the request in compositional adjacency rather than guessed genre tags; the semantic tags are still queried as a breadth source. Example: [\"Battles\", \"Don Caballero\"]."),
 				mcpsdk.MinItems(1),
 				mcpsdk.UniqueItems(true),
 				mcpsdk.WithStringItems(mcpsdk.MinLength(1)),
@@ -186,7 +192,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 
 	s.AddTool(
 		mcpsdk.NewTool(logRecommendationFeedbackName,
-			mcpsdk.WithDescription("Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Use this for batch reactions such as disliked, not_for_me_today, ok, good, great, or already_know; feedback entries are added to future discovery exclusions."),
+			mcpsdk.WithDescription("Persist album-first recommendation feedback without converting it into a formal 0-5 album rating. Durable verdicts exclude only the exact album from future discovery; not_for_me_today is a same-day exact-album cooldown."),
 			mcpsdk.WithString("artist",
 				mcpsdk.Required(),
 				mcpsdk.Description("The recommended album artist name."),
@@ -400,6 +406,10 @@ func getVerifiedDiscoveryCandidatesHandler(db *sql.DB, discovery discoverySource
 		if validationErr != nil {
 			return validationErr, nil
 		}
+		seedArtists, validationErr := optionalStringSliceArgument(request, "seed_artists")
+		if validationErr != nil {
+			return validationErr, nil
+		}
 		limit, validationErr := optionalIntegerArgument(request, "limit", defaultDiscoveryCandidateLimit)
 		if validationErr != nil {
 			return validationErr, nil
@@ -410,8 +420,8 @@ func getVerifiedDiscoveryCandidatesHandler(db *sql.DB, discovery discoverySource
 		if len(searchTags) == 0 && strings.TrimSpace(targetVibe) != "" {
 			searchTags = []string{targetVibe}
 		}
-		if len(searchTags) == 0 {
-			return mcpsdk.NewToolResultError("Please provide a non-empty target_vibe or fallback_tags argument."), nil
+		if len(searchTags) == 0 && len(compactStrings(seedArtists)) == 0 {
+			return mcpsdk.NewToolResultError("Please provide a non-empty target_vibe, fallback_tags, or seed_artists argument."), nil
 		}
 		if limit <= 0 {
 			return mcpsdk.NewToolResultError("The limit argument must be a positive integer."), nil
@@ -420,6 +430,7 @@ func getVerifiedDiscoveryCandidatesHandler(db *sql.DB, discovery discoverySource
 		result, err := getVerifiedDiscoveryCandidatesFromSource(ctx, &database.DB{Ctx: db}, discovery, VerifiedDiscoveryQuery{
 			TargetVibe:   targetVibe,
 			FallbackTags: searchTags,
+			SeedArtists:  compactStrings(seedArtists),
 			Limit:        limit,
 		})
 		if err != nil {
@@ -1554,7 +1565,7 @@ func formatRecommendationFeedbackMarkdown(result database.RecommendationFeedback
 		fmt.Fprintf(&builder, "- Notes: %s\n", result.Notes)
 	}
 	fmt.Fprintf(&builder, "- recommendation_feedback rows inserted: %d\n", result.RowsInserted)
-	builder.WriteString("- Future discovery candidate batches will treat this artist/album/track as known.")
+	builder.WriteString("- Future discovery candidate batches will treat this exact artist/album as known; the starter track is context only.")
 
 	return strings.TrimRight(builder.String(), "\n")
 }

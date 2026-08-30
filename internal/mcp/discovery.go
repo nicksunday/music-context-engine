@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/nicksunday/music-context-platform/internal/database"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -22,12 +23,26 @@ const (
 	defaultDiscoveryCandidateLimit = 5
 	maxDiscoveryCandidateLimit     = 50
 	maxMusicBrainzSearchLimit      = 100
-	defaultDiscoveryTimeout        = 10 * time.Second
-	defaultDiscoveryRequestDelay   = time.Second
-	defaultMusicBrainzBaseURL      = "https://musicbrainz.org/ws/2"
-	defaultDiscoveryUserAgent      = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
-	maxDiscoveryResponseBytes      = 4 << 20
-	maxCandidateGenreTags          = 6
+	// defaultDiscoveryTimeout bounds each individual MusicBrainz HTTP call.
+	// Discovery prompts are frequently expanded into many OR'd genre tags that
+	// map to a single large album search, and MusicBrainz can take well over ten
+	// seconds to fully expand those responses. The timeout still fails fast per
+	// requests so a hung call is never left running.
+	defaultDiscoveryTimeout      = 30 * time.Second
+	defaultDiscoveryRequestDelay = time.Second
+	defaultMusicBrainzBaseURL    = "https://musicbrainz.org/ws/2"
+	defaultDiscoveryUserAgent    = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
+	maxDiscoveryResponseBytes    = 4 << 20
+	maxCandidateGenreTags        = 6
+	// maxDiscoverySeedArtists bounds how many real similar-artist names are used
+	// to anchor a discovery search. Each seed is a separate MusicBrainz query
+	// (rate-limited), so the cap keeps per-request latency reasonable while still
+	// giving the search strong artist grounding.
+	maxDiscoverySeedArtists = 4
+	// maxDiscoveryReconcileCandidates caps the merged artist+tag recording pool
+	// fed to release-group genre reconciliation, bounding the number of
+	// rate-limited release-group lookups for a single discovery request.
+	maxDiscoveryReconcileCandidates = 48
 )
 
 // DiscoveryCandidate is metadata returned by the external discovery source
@@ -42,11 +57,13 @@ type DiscoveryCandidate struct {
 
 	trackExclusionNames []string
 	albumExclusionNames []string
+	releaseGroupID      string
 }
 
 type VerifiedDiscoveryQuery struct {
 	TargetVibe   string
 	FallbackTags []string
+	SeedArtists  []string
 	Limit        int
 }
 
@@ -58,6 +75,14 @@ type VerifiedDiscoveryResult struct {
 
 type discoverySource interface {
 	Search(context.Context, []string, int) ([]DiscoveryCandidate, error)
+}
+
+// artistSeededDiscoverySource is optionally implemented by discovery sources
+// that can anchor results on a set of (typically real, similar) artist names in
+// addition to genre tags. Anchoring on artist names grounds abstract prompts in
+// real compositional adjacency rather than only guessed genre tags.
+type artistSeededDiscoverySource interface {
+	SearchWithSeeds(context.Context, []string, []string, int) ([]DiscoveryCandidate, error)
 }
 
 type musicBrainzDiscoveryConfig struct {
@@ -90,11 +115,12 @@ type musicBrainzRecording struct {
 	Aliases          []musicBrainzAlias        `json:"aliases"`
 	ArtistCredit     []musicBrainzArtistCredit `json:"artist-credit"`
 	Releases         []musicBrainzRelease      `json:"releases"`
+	Genres           []musicBrainzTag          `json:"genres"`
 	Tags             []musicBrainzTag          `json:"tags"`
 }
 
-// musicBrainzTag is a community folksonomy tag on a recording. Count is the
-// number of users who applied it, which we use as a relevance proxy.
+// musicBrainzTag is a community folksonomy tag on a MusicBrainz entity. Count
+// is the number of users who applied it, which we use as a relevance proxy.
 type musicBrainzTag struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
@@ -130,6 +156,11 @@ type musicBrainzReleaseGroup struct {
 	Title       string             `json:"title"`
 	PrimaryType string             `json:"primary-type"`
 	Aliases     []musicBrainzAlias `json:"aliases"`
+}
+
+type musicBrainzReleaseGroupLookupResponse struct {
+	Genres []musicBrainzTag `json:"genres"`
+	Tags   []musicBrainzTag `json:"tags"`
 }
 
 type musicBrainzReleaseMedia struct {
@@ -182,7 +213,7 @@ func GetVerifiedDiscoveryCandidates(
 }
 
 type exclusionsDatabase interface {
-	GetExclusionListContext(context.Context) (map[string]bool, error)
+	GetDiscoveryAlbumExclusionsContext(context.Context) (database.AlbumExclusionSet, error)
 }
 
 func getVerifiedDiscoveryCandidatesFromSource(
@@ -196,20 +227,20 @@ func getVerifiedDiscoveryCandidatesFromSource(
 	if len(searchTags) == 0 && strings.TrimSpace(query.TargetVibe) != "" {
 		searchTags = []string{query.TargetVibe}
 	}
-	if len(searchTags) == 0 {
-		return VerifiedDiscoveryResult{}, fmt.Errorf("provide a non-empty target_vibe or fallback_tags")
+	if len(searchTags) == 0 && len(compactStrings(query.SeedArtists)) == 0 {
+		return VerifiedDiscoveryResult{}, fmt.Errorf("provide a non-empty target_vibe, fallback_tags, or seed_artists")
 	}
 	if query.Limit <= 0 {
 		return VerifiedDiscoveryResult{}, fmt.Errorf("candidate limit must be positive")
 	}
 	limit := clampDiscoveryCandidateLimit(query.Limit)
 
-	exclusions, err := db.GetExclusionListContext(ctx)
+	exclusions, err := db.GetDiscoveryAlbumExclusionsContext(ctx)
 	if err != nil {
 		return VerifiedDiscoveryResult{}, fmt.Errorf("build discovery exclusion list: %w", err)
 	}
 
-	candidates, err := getVerifiedDiscoveryCandidates(ctx, source, searchTags, limit, exclusions)
+	candidates, err := getVerifiedDiscoveryCandidatesSeeded(ctx, source, searchTags, compactStrings(query.SeedArtists), limit, exclusions)
 	if err != nil {
 		return VerifiedDiscoveryResult{}, err
 	}
@@ -226,7 +257,18 @@ func getVerifiedDiscoveryCandidates(
 	source discoverySource,
 	searchTags []string,
 	limit int,
-	exclusions map[string]bool,
+	exclusions database.AlbumExclusionSet,
+) ([]DiscoveryCandidate, error) {
+	return getVerifiedDiscoveryCandidatesSeeded(ctx, source, searchTags, nil, limit, exclusions)
+}
+
+func getVerifiedDiscoveryCandidatesSeeded(
+	ctx context.Context,
+	source discoverySource,
+	searchTags []string,
+	seedArtists []string,
+	limit int,
+	exclusions database.AlbumExclusionSet,
 ) ([]DiscoveryCandidate, error) {
 	if source == nil {
 		return nil, fmt.Errorf("discovery source is required")
@@ -242,18 +284,19 @@ func getVerifiedDiscoveryCandidates(
 	if err != nil {
 		return nil, err
 	}
-	if len(cleanTags) == 0 {
-		return nil, fmt.Errorf("at least one discovery tag must normalize to a non-empty value")
-	}
+	cleanSeeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
 
-	exclusions, err = normalizeExclusionSet(exclusions)
-	if err != nil {
-		return nil, err
+	var liveCandidates []DiscoveryCandidate
+	if seeded, ok := source.(artistSeededDiscoverySource); ok && len(cleanSeeds) > 0 {
+		liveCandidates, err = seeded.SearchWithSeeds(ctx, cleanTags, cleanSeeds, discoverySearchLimit(limit))
+	} else {
+		liveCandidates, err = source.Search(ctx, cleanTags, discoverySearchLimit(limit))
 	}
-
-	liveCandidates, err := source.Search(ctx, cleanTags, discoverySearchLimit(limit))
 	if err != nil {
 		return nil, fmt.Errorf("search external discovery source: %w", err)
+	}
+	if len(cleanTags) == 0 && len(cleanSeeds) == 0 {
+		return nil, fmt.Errorf("at least one discovery tag or seed artist must be provided")
 	}
 
 	candidates := make([]DiscoveryCandidate, 0, limit)
@@ -281,15 +324,7 @@ func getVerifiedDiscoveryCandidates(
 		if err != nil {
 			return nil, fmt.Errorf("normalize candidate track %q: %w", candidate.TrackName, err)
 		}
-		cleanTrackNames, err := normalizeDiscoveryValues(candidate.trackExclusionNames)
-		if err != nil {
-			return nil, fmt.Errorf("normalize candidate track names for %q: %w", candidate.TrackName, err)
-		}
-		if exclusions[cleanArtist] ||
-			exclusions[cleanAlbum] ||
-			containsExcludedValue(exclusions, cleanAlbumNames) ||
-			exclusions[cleanTrack] ||
-			containsExcludedValue(exclusions, cleanTrackNames) {
+		if containsExcludedAlbum(exclusions, cleanArtist, cleanAlbum, cleanAlbumNames) {
 			continue
 		}
 
@@ -369,6 +404,132 @@ func (client *musicBrainzDiscoveryClient) Search(
 	searchTags []string,
 	limit int,
 ) ([]DiscoveryCandidate, error) {
+	cleanTags, err := normalizeDiscoveryTags(searchTags)
+	if err != nil {
+		return nil, err
+	}
+	if len(cleanTags) == 0 {
+		return nil, fmt.Errorf("at least one MusicBrainz tag is required")
+	}
+
+	recordings, err := client.searchTagRecordings(ctx, cleanTags, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(recordings) == 0 {
+		return nil, nil
+	}
+	candidates := parseMusicBrainzCandidates(recordings)
+	return client.reconcileAlbumGenres(ctx, candidates, cleanTags), nil
+}
+
+// SearchWithSeeds anchors discovery on real similar-artist names in addition to
+// genre tags. Artist-seeded results ground abstract prompts in compositional
+// adjacency rather than only guessed tags; the genre-tag search is retained as a
+// breadth/semantic-fallback source. Individual seed lookups are best-effort so a
+// single unknown artist cannot sink the whole discovery.
+func (client *musicBrainzDiscoveryClient) SearchWithSeeds(
+	ctx context.Context,
+	searchTags []string,
+	seedArtists []string,
+	limit int,
+) ([]DiscoveryCandidate, error) {
+	if client == nil || client.httpClient == nil {
+		return nil, fmt.Errorf("MusicBrainz discovery client is not initialized")
+	}
+
+	seeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
+	if len(seeds) == 0 {
+		return client.Search(ctx, searchTags, limit)
+	}
+
+	cleanTags, _ := normalizeDiscoveryTags(searchTags)
+
+	seen := make(map[string]bool)
+	var recordings []musicBrainzRecording
+	addRecording := func(rec musicBrainzRecording) {
+		if len(recordings) >= maxDiscoveryReconcileCandidates {
+			return
+		}
+		key := musicBrainzRecordingKey(rec)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		recordings = append(recordings, rec)
+	}
+
+	for _, artist := range seeds {
+		recs, err := client.searchArtistRecordings(ctx, artist, limit)
+		if err != nil {
+			// Best-effort per seed: a misspelled or unknown similar artist
+			// shouldn't discard results from the remaining seeds.
+			continue
+		}
+		for _, rec := range recs {
+			addRecording(rec)
+		}
+		if len(recordings) >= maxDiscoveryReconcileCandidates {
+			break
+		}
+	}
+
+	if len(cleanTags) > 0 && len(recordings) < maxDiscoveryReconcileCandidates {
+		tagRecs, err := client.searchTagRecordings(ctx, cleanTags, limit)
+		if err == nil {
+			for _, rec := range tagRecs {
+				addRecording(rec)
+			}
+		}
+	}
+
+	if len(recordings) == 0 {
+		return nil, nil
+	}
+	candidates := parseMusicBrainzCandidates(recordings)
+	// Release-group genre reconciliation only discards candidates when tags are
+	// actually being searched. Artist-anchored results without tags should be
+	// preserved as-is rather than dropped for an empty genre match.
+	if len(cleanTags) == 0 {
+		return candidates, nil
+	}
+	return client.reconcileAlbumGenres(ctx, candidates, cleanTags), nil
+}
+
+func (client *musicBrainzDiscoveryClient) searchTagRecordings(
+	ctx context.Context,
+	cleanTags []string,
+	limit int,
+) ([]musicBrainzRecording, error) {
+	cleanTags, err := normalizeDiscoveryTags(cleanTags)
+	if err != nil {
+		return nil, err
+	}
+	if len(cleanTags) == 0 {
+		return nil, nil
+	}
+	return client.doSearch(ctx, musicBrainzTagQuery(cleanTags), limit)
+}
+
+func (client *musicBrainzDiscoveryClient) searchArtistRecordings(
+	ctx context.Context,
+	artist string,
+	limit int,
+) ([]musicBrainzRecording, error) {
+	artist = strings.TrimSpace(artist)
+	if artist == "" {
+		return nil, nil
+	}
+	return client.doSearch(ctx, musicBrainzArtistQuery(artist), limit)
+}
+
+// doSearch performs a single rate-limited MusicBrainz recording search for the
+// given Lucene query and returns the raw recordings.
+func (client *musicBrainzDiscoveryClient) doSearch(
+	ctx context.Context,
+	query string,
+	limit int,
+) ([]musicBrainzRecording, error) {
 	if client == nil || client.httpClient == nil {
 		return nil, fmt.Errorf("MusicBrainz discovery client is not initialized")
 	}
@@ -383,15 +544,7 @@ func (client *musicBrainzDiscoveryClient) Search(
 		return nil, err
 	}
 
-	cleanTags, err := normalizeDiscoveryTags(searchTags)
-	if err != nil {
-		return nil, err
-	}
-	if len(cleanTags) == 0 {
-		return nil, fmt.Errorf("at least one MusicBrainz tag is required")
-	}
-
-	endpoint, err := client.searchEndpoint(cleanTags, limit)
+	endpoint, err := client.recordingSearchEndpoint(query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -424,35 +577,80 @@ func (client *musicBrainzDiscoveryClient) Search(
 		return nil, fmt.Errorf("decode MusicBrainz response: %w", err)
 	}
 
-	return parseMusicBrainzCandidates(searchResponse.Recordings), nil
+	return searchResponse.Recordings, nil
 }
 
-func (client *musicBrainzDiscoveryClient) searchEndpoint(searchTags []string, limit int) (string, error) {
+func (client *musicBrainzDiscoveryClient) recordingSearchEndpoint(query string, limit int) (string, error) {
 	endpoint, err := url.Parse(client.baseURL + "/recording")
 	if err != nil {
 		return "", fmt.Errorf("parse MusicBrainz base URL: %w", err)
 	}
 
-	tagClauses := make([]string, 0, len(searchTags))
-	for _, tag := range searchTags {
+	params := endpoint.Query()
+	params.Set("fmt", "json")
+	// "artist-rels" is deliberately omitted: the search response parser only
+	// consumes release-group/alias/genre/tag data, never recording-level artist
+	// relationships. Asking MusicBrainz to expand unused relationships for every
+	// returned recording only inflates latency on the already-heavy OR search.
+	params.Set("inc", "release-groups+aliases+genres+tags")
+	params.Set("limit", strconv.Itoa(min(limit, maxMusicBrainzSearchLimit)))
+	params.Set("query", query)
+	endpoint.RawQuery = params.Encode()
+
+	return endpoint.String(), nil
+}
+
+// musicBrainzTagQuery builds the Lucene query over community genre tags,
+// constrained to official albums.
+func musicBrainzTagQuery(cleanTags []string) string {
+	tagClauses := make([]string, 0, len(cleanTags))
+	for _, tag := range cleanTags {
 		tagClauses = append(tagClauses, fmt.Sprintf(`tag:"%s"`, tag))
 	}
 	tagQuery := strings.Join(tagClauses, " OR ")
 	if len(tagClauses) > 1 {
 		tagQuery = "(" + tagQuery + ")"
 	}
+	return tagQuery + " AND primarytype:album AND status:official"
+}
 
-	query := endpoint.Query()
-	query.Set("fmt", "json")
-	query.Set("inc", "artist-rels+release-groups+aliases+tags")
-	query.Set("limit", strconv.Itoa(min(limit, maxMusicBrainzSearchLimit)))
-	query.Set(
-		"query",
-		tagQuery+" AND primarytype:album AND status:official",
-	)
-	endpoint.RawQuery = query.Encode()
+// musicBrainzArtistQuery anchors on a specific artist so discovery can pull
+// real similar-artist discographies rather than only tag-matched recordings.
+func musicBrainzArtistQuery(artist string) string {
+	return fmt.Sprintf(`artist:"%s" AND primarytype:album AND status:official`, artist)
+}
 
-	return endpoint.String(), nil
+// musicBrainzRecordingKey deduplicates recordings across multiple seed/tag
+// queries by normalized title and artist credit.
+func musicBrainzRecordingKey(rec musicBrainzRecording) string {
+	title := strings.ToLower(strings.TrimSpace(rec.Title))
+	artist := strings.ToLower(strings.TrimSpace(musicBrainzArtistName(rec.ArtistCredit)))
+	if title == "" || artist == "" {
+		return ""
+	}
+	return title + "\x00" + artist
+}
+
+// compactDiscoverySeeds trims, deduplicates, and caps the artist names used to
+// anchor a discovery search, preserving the original display spelling.
+func compactDiscoverySeeds(seeds []string, maxSeeds int) []string {
+	if maxSeeds <= 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(seeds))
+	var out []string
+	for _, raw := range seeds {
+		if len(out) >= maxSeeds {
+			break
+		}
+		clean, err := utils.NormalizeSearchText(raw)
+		if err != nil || clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		out = append(out, strings.TrimSpace(raw))
+	}
+	return out
 }
 
 func normalizeDiscoveryTags(values []string) ([]string, error) {
@@ -533,12 +731,13 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 			alternateAlbumTitles,
 		)
 		candidate := DiscoveryCandidate{
-			TrackName:   trackName,
-			Artist:      musicBrainzArtistName(recording.ArtistCredit),
-			Album:       album,
-			Runtime:     runtimeFromMilliseconds(recording.Length),
-			ReleaseYear: releaseYear,
-			GenreTags:   musicBrainzTagNames(recording.Tags, maxCandidateGenreTags),
+			TrackName:      trackName,
+			Artist:         musicBrainzArtistName(recording.ArtistCredit),
+			Album:          album,
+			Runtime:        runtimeFromMilliseconds(recording.Length),
+			ReleaseYear:    releaseYear,
+			GenreTags:      musicBrainzGenreTagNames(recording.Genres, recording.Tags, maxCandidateGenreTags),
+			releaseGroupID: release.Group.ID,
 		}
 		if trackAlias != "" {
 			candidate.trackExclusionNames = []string{recording.Title, trackAlias}
@@ -553,6 +752,137 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+// reconcileAlbumGenres replaces recording-level genres with the genres of the
+// matched release group when available. Recording tags can be stale or belong
+// to a bad user classification, while recommendations are made at album level.
+// A release group whose genres contradict the search is discarded so a single
+// mis-tagged recording cannot smuggle an unrelated album into discovery.
+func (client *musicBrainzDiscoveryClient) reconcileAlbumGenres(
+	ctx context.Context,
+	candidates []DiscoveryCandidate,
+	searchTags []string,
+) []DiscoveryCandidate {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	groupGenres := make(map[string][]string)
+	for _, candidate := range candidates {
+		groupID := strings.TrimSpace(candidate.releaseGroupID)
+		if groupID == "" {
+			continue
+		}
+		if _, seen := groupGenres[groupID]; seen {
+			continue
+		}
+		genres, err := client.lookupReleaseGroupGenres(ctx, groupID)
+		if err != nil {
+			continue
+		}
+		groupGenres[groupID] = genres
+	}
+
+	reconciled := make([]DiscoveryCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		groupID := strings.TrimSpace(candidate.releaseGroupID)
+		if genres, ok := groupGenres[groupID]; ok && len(genres) > 0 {
+			if !discoveryGenresMatchSearch(genres, searchTags) {
+				continue
+			}
+			candidate.GenreTags = genres
+		}
+		candidate.releaseGroupID = ""
+		reconciled = append(reconciled, candidate)
+	}
+	return reconciled
+}
+
+func (client *musicBrainzDiscoveryClient) lookupReleaseGroupGenres(
+	ctx context.Context,
+	releaseGroupID string,
+) ([]string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
+
+	if err := client.waitForRateLimit(requestCtx); err != nil {
+		return nil, err
+	}
+
+	endpoint, err := url.Parse(client.baseURL + "/release-group/" + url.PathEscape(releaseGroupID))
+	if err != nil {
+		return nil, fmt.Errorf("parse MusicBrainz release-group URL: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("fmt", "json")
+	query.Set("inc", "genres+tags")
+	endpoint.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create MusicBrainz release-group request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", client.userAgent)
+
+	response, err := client.httpClient.Do(request)
+	client.lastCall = time.Now()
+	if err != nil {
+		return nil, fmt.Errorf("query MusicBrainz release group: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return nil, fmt.Errorf(
+			"MusicBrainz release group returned HTTP %d: %s",
+			response.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
+	}
+
+	var lookup musicBrainzReleaseGroupLookupResponse
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maxDiscoveryResponseBytes))
+	if err := decoder.Decode(&lookup); err != nil {
+		return nil, fmt.Errorf("decode MusicBrainz release group response: %w", err)
+	}
+	return musicBrainzGenreTagNames(lookup.Genres, lookup.Tags, maxCandidateGenreTags), nil
+}
+
+func discoveryGenresMatchSearch(genres []string, searchTags []string) bool {
+	for _, genre := range genres {
+		for _, searchTag := range searchTags {
+			if discoveryGenreMatchesSearchTag(genre, searchTag) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func discoveryGenreMatchesSearchTag(genre string, searchTag string) bool {
+	genre = strings.ToLower(strings.TrimSpace(genre))
+	searchTag = strings.ToLower(strings.TrimSpace(searchTag))
+	if genre == "" || searchTag == "" {
+		return false
+	}
+	genreTerms := strings.Fields(genre)
+	for _, term := range strings.Fields(searchTag) {
+		if !containsString(genreTerms, term) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // musicBrainzTagNames returns up to limit deduplicated tag names from tags,
@@ -584,6 +914,13 @@ func musicBrainzTagNames(tags []musicBrainzTag, limit int) []string {
 		}
 	}
 	return names
+}
+
+func musicBrainzGenreTagNames(genres []musicBrainzTag, tags []musicBrainzTag, limit int) []string {
+	if len(genres) > 0 {
+		return musicBrainzTagNames(genres, limit)
+	}
+	return musicBrainzTagNames(tags, limit)
 }
 
 func musicBrainzDisplayTitle(
@@ -803,30 +1140,21 @@ func normalizeDiscoveryValues(values []string) ([]string, error) {
 	return normalized, nil
 }
 
-func containsExcludedValue(exclusions map[string]bool, values []string) bool {
-	for _, value := range values {
-		if exclusions[value] {
+func containsExcludedAlbum(
+	exclusions database.AlbumExclusionSet,
+	cleanArtist string,
+	cleanAlbum string,
+	alternateCleanAlbums []string,
+) bool {
+	if exclusions.ContainsNormalized(cleanArtist, cleanAlbum) {
+		return true
+	}
+	for _, value := range alternateCleanAlbums {
+		if exclusions.ContainsNormalized(cleanArtist, value) {
 			return true
 		}
 	}
 	return false
-}
-
-func normalizeExclusionSet(exclusions map[string]bool) (map[string]bool, error) {
-	normalized := make(map[string]bool, len(exclusions))
-	for value, excluded := range exclusions {
-		if !excluded {
-			continue
-		}
-		cleanValue, err := utils.NormalizeSearchText(value)
-		if err != nil {
-			return nil, fmt.Errorf("normalize exclusion value %q: %w", value, err)
-		}
-		if cleanValue != "" {
-			normalized[cleanValue] = true
-		}
-	}
-	return normalized, nil
 }
 
 func validateDiscoveryCandidate(candidate DiscoveryCandidate) error {

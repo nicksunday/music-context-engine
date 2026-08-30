@@ -56,9 +56,10 @@ Once raw data is ingested, the library state is extended via asynchronous metada
 ### Proactive Discovery & LLM Anti-Hallucination
 
 Rather than relying on LLMs to blind-guess music recommendations and validating them reactively, the platform implements a proactive filtering design over the Model Context Protocol:
-* **Pre-Exclusion Filtering:** The server builds an in-memory database exclusion map of your entire track, album, and artist history using Unicode string normalization rules.
-* **MusicBrainz Integration:** External discovery requests leverage live MusicBrainz metadata queries wrapped in a padded fetch buffer (`limit * 4`) to prevent result starvation during data stripping. Matched community genre tags are returned alongside each candidate (`genre_tags`) so the LLM can ground its reasoning in what actually matched, rather than inventing sourcing.
+* **Pre-Exclusion Filtering:** The server builds an in-memory database exclusion map of exact albums with ratings or applicable recommendation feedback using Unicode string normalization rules. Known artists and track-level listening history do not globally exclude an album.
+* **MusicBrainz Integration:** External discovery requests leverage live MusicBrainz metadata queries wrapped in a padded fetch buffer (`limit * 4`) to prevent result starvation during data stripping. Album/release-group genres are preferred over recording-level tags, and candidates whose album genres contradict the search are discarded. The resulting community genre tags are returned alongside each candidate (`genre_tags`) so the LLM can ground its reasoning in what actually matched, rather than inventing sourcing.
 * **Real Artist Adjacency:** If a `LASTFM_API_KEY` is present, `get_taste_adjacencies` also queries Last.fm's `artist.getsimilar` for your top-affinity artists and surfaces similar artists that are **not** already in your local library, so "adjacent" reflects real listening/tagging data instead of the LLM's own guess at what's similar. Without a key, this section is omitted rather than faked.
+* **Artist-Seeded Discovery:** The same real similar-artist data is now wired directly into the candidate search (`seed_artists`). Discovery queries artist-anchored discographies for those similar artists first, then tops up with the semantic genre-tag search, so abstract prompts are grounded in compositional adjacency rather than only guessed tags. Both the MCP tool and the web UI (`music-vault web`) do this automatically when `LASTFM_API_KEY` is set.
 * **Monotony & Anti-Anchoring Guardrails:** The protocol layer enforces a strict limit of 2 tracks per artist to ensure discovery variety, while forcing the LLM to prioritize your active "target vibe" over past library anchors.
 
 ## Technical Stack & Layout
@@ -73,4 +74,22 @@ Run the web UI:
 
 ```sh
 ./bin/music-vault web --addr 127.0.0.1:8787 --model qwen3:latest --ollama-timeout 3m
+```
+
+Restart an existing local listener before starting the web UI:
+
+```sh
+./bin/music-vault web --restart --addr 127.0.0.1:8787 --model qwen3:latest --ollama-timeout 3m
+```
+
+Run it in the background:
+
+```sh
+./bin/music-vault web --daemon --addr 127.0.0.1:8787 --model qwen3:latest --ollama-timeout 3m
+```
+
+Restart the current listener and leave the new server running in the background:
+
+```sh
+./bin/music-vault web --restart --daemon --addr 127.0.0.1:8787 --model qwen3:latest --ollama-timeout 3m
 ```

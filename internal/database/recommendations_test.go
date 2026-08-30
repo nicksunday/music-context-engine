@@ -27,6 +27,7 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 				StarterTrack: "In 20XX",
 				ReleaseYear:  2019,
 				GenreTags:    []string{"Experimental Hip Hop", "experimental hip hop", "Jazz Rap"},
+				StreamingURL: "  https://music.apple.com/us/album/dos-city/1450632733  ",
 			},
 		},
 	})
@@ -49,6 +50,10 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	if len(candidate.GenreTags) != 2 || candidate.GenreTags[0] != "experimental hip hop" || candidate.GenreTags[1] != "jazz rap" {
 		t.Fatalf("candidate.GenreTags = %#v, want deduplicated lowercase tags", candidate.GenreTags)
 	}
+	const wantStreamingURL = "https://music.apple.com/us/album/dos-city/1450632733"
+	if candidate.StreamingURL != wantStreamingURL {
+		t.Fatalf("candidate.StreamingURL = %q, want %q", candidate.StreamingURL, wantStreamingURL)
+	}
 
 	var count int
 	if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM recommendation_candidates WHERE batch_id = ?", batch.ID).Scan(&count); err != nil {
@@ -56,6 +61,14 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("persisted candidate count = %d, want 1", count)
+	}
+
+	var persistedStreamingURL string
+	if err := db.Ctx.QueryRow("SELECT streaming_url FROM recommendation_candidates WHERE batch_id = ?", batch.ID).Scan(&persistedStreamingURL); err != nil {
+		t.Fatalf("failed to query persisted streaming_url: %v", err)
+	}
+	if persistedStreamingURL != wantStreamingURL {
+		t.Fatalf("persisted streaming_url = %q, want %q", persistedStreamingURL, wantStreamingURL)
 	}
 }
 
@@ -91,5 +104,104 @@ func TestLogRecommendationFeedbackCanonicalizesVerdict(t *testing.T) {
 	}
 	if len(recent) != 1 || recent[0].Album != "Alien Metal" || recent[0].Verdict != "great" {
 		t.Fatalf("recent feedback = %#v, want Alien Metal great", recent)
+	}
+}
+
+func TestFetchLatestRecommendationBatchEmptyWhenNoBatches(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "empty-recommendations.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	batch, err := FetchLatestRecommendationBatch(context.Background(), db.Ctx)
+	if err != nil {
+		t.Fatalf("FetchLatestRecommendationBatch() error = %v", err)
+	}
+	if batch.ID != "" || len(batch.Candidates) != 0 {
+		t.Fatalf("FetchLatestRecommendationBatch() = %#v, want empty batch", batch)
+	}
+}
+
+func TestFetchAndListRecommendationBatches(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "history-recommendations.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	first, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "dense jazz",
+		Mood:   "focused",
+		Candidates: []RecommendationCandidateInput{
+			{Artist: "Bohren & der Club of Gore", Album: "Sunset Mission", StarterTrack: "Midnight Walker", StreamingURL: "https://music.apple.com/us/album/sunset-mission/1"},
+			{Artist: "Second Artist", Album: "Second Album", StarterTrack: "Second Track"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateRecommendationBatch(first) error = %v", err)
+	}
+	if len(first.Candidates) != 2 {
+		t.Fatalf("first batch candidates = %d, want 2", len(first.Candidates))
+	}
+
+	second, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "weird hip hop",
+		Mood:   "dense",
+		Candidates: []RecommendationCandidateInput{
+			{Artist: "Jungle", Album: "Volcano", StarterTrack: "Candle Flame", StreamingURL: "https://music.apple.com/us/album/volcano/2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateRecommendationBatch(second) error = %v", err)
+	}
+	if len(second.Candidates) != 1 {
+		t.Fatalf("second batch candidates = %d, want 1", len(second.Candidates))
+	}
+
+	latest, err := FetchLatestRecommendationBatch(context.Background(), db.Ctx)
+	if err != nil {
+		t.Fatalf("FetchLatestRecommendationBatch() error = %v", err)
+	}
+	if latest.ID != second.ID {
+		t.Fatalf("latest batch id = %q, want %q", latest.ID, second.ID)
+	}
+	if len(latest.Candidates) != 1 || latest.Candidates[0].Album != "Volcano" {
+		t.Fatalf("latest candidates = %#v, want Volcano", latest.Candidates)
+	}
+	if latest.Candidates[0].StreamingURL != "https://music.apple.com/us/album/volcano/2" {
+		t.Fatalf("latest candidate streaming_url = %q, want volcano url", latest.Candidates[0].StreamingURL)
+	}
+
+	byID, err := FetchRecommendationBatchByID(context.Background(), db.Ctx, first.ID)
+	if err != nil {
+		t.Fatalf("FetchRecommendationBatchByID() error = %v", err)
+	}
+	if len(byID.Candidates) != 2 {
+		t.Fatalf("first batch by id = %#v, want 2 candidates", byID.Candidates)
+	}
+	if byID.Candidates[0].StreamingURL != "https://music.apple.com/us/album/sunset-mission/1" {
+		t.Fatalf("first candidate streaming_url = %q, want restored url", byID.Candidates[0].StreamingURL)
+	}
+
+	sessions, err := ListRecommendationBatches(context.Background(), db.Ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecommendationBatches() error = %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("session count = %d, want 2", len(sessions))
+	}
+	if sessions[0].ID != second.ID || sessions[0].CandidateCount != 1 {
+		t.Fatalf("sessions[0] = %#v, want newest batch with 1 candidate", sessions[0])
+	}
+	if sessions[1].ID != first.ID || sessions[1].CandidateCount != 2 {
+		t.Fatalf("sessions[1] = %#v, want older batch with 2 candidates", sessions[1])
+	}
+	if sessions[0].Prompt != "weird hip hop" || sessions[1].Prompt != "dense jazz" {
+		t.Fatalf("session prompts out of order: %#v", sessions)
 	}
 }
