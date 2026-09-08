@@ -432,9 +432,14 @@ func runWeb(args []string) {
 			WithSimilarArtists(mcpserver.NewDefaultSimilarArtistSource()),
 		ReleaseRadar: webserver.NewMusicBrainzReleaseRadar(),
 		LinkResolver: webserver.NewAppleMusicLinker(),
-		Model:        model,
-		OllamaURL:    ollamaURL,
-		Timeout:      ollamaTimeout,
+		SongLinkResolver: webserver.FallbackSongLinkResolver{
+			AppleMusic: webserver.NewAppleMusicLinker(),
+			YouTube:    webserver.YouTubeSongLinker{},
+		},
+		AppleMusicDeveloperToken: os.Getenv("APPLE_MUSIC_DEVELOPER_TOKEN"),
+		Model:                    model,
+		OllamaURL:                ollamaURL,
+		Timeout:                  ollamaTimeout,
 	})
 
 	server := &http.Server{Addr: addr, Handler: handler}

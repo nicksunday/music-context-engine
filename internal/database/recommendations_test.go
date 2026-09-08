@@ -72,6 +72,47 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	}
 }
 
+func TestRecommendationBatchPersistsSongAndProviderFields(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+
+	db, err := InitDB(filepath.Join(t.TempDir(), "song-recommendations.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	defer db.Ctx.Close()
+
+	created, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "individual songs with intricate rhythm",
+		Candidates: []RecommendationCandidateInput{{
+			Artist:            "Jungle",
+			Album:             "Volcano",
+			Song:              "Candle Flame",
+			StreamingURL:      "https://music.apple.com/us/song/candle-flame/1",
+			StreamingProvider: "apple_music",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRecommendationBatch() error = %v", err)
+	}
+	if got := created.Candidates[0].Song; got != "Candle Flame" {
+		t.Fatalf("created candidate song = %q, want Candle Flame", got)
+	}
+	if got := created.Candidates[0].StreamingProvider; got != "apple_music" {
+		t.Fatalf("created candidate provider = %q, want apple_music", got)
+	}
+
+	loaded, err := FetchRecommendationBatchByID(context.Background(), db.Ctx, created.ID)
+	if err != nil {
+		t.Fatalf("FetchRecommendationBatchByID() error = %v", err)
+	}
+	if got := loaded.Candidates[0].Song; got != "Candle Flame" {
+		t.Fatalf("loaded candidate song = %q, want Candle Flame", got)
+	}
+	if got := loaded.Candidates[0].StreamingProvider; got != "apple_music" {
+		t.Fatalf("loaded candidate provider = %q, want apple_music", got)
+	}
+}
+
 func TestLogRecommendationFeedbackCanonicalizesVerdict(t *testing.T) {
 	unsetMusicVaultDBPathEnv(t)
 
@@ -203,5 +244,51 @@ func TestFetchAndListRecommendationBatches(t *testing.T) {
 	}
 	if sessions[0].Prompt != "weird hip hop" || sessions[1].Prompt != "dense jazz" {
 		t.Fatalf("session prompts out of order: %#v", sessions)
+	}
+}
+
+func TestRecommendationBatchesAreIsolatedByMode(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+	db, err := InitDB(filepath.Join(t.TempDir(), "mode-recommendations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Ctx.Close()
+
+	album, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "album prompt", Mode: "album", Candidates: []RecommendationCandidateInput{{Artist: "Album Artist", Album: "Album"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	song, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "song prompt", Mode: "song", Candidates: []RecommendationCandidateInput{{Artist: "Song Artist", Album: "Album", Song: "Song"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	latestSong, err := FetchLatestRecommendationBatchForMode(context.Background(), db.Ctx, "song")
+	if err != nil || latestSong.ID != song.ID {
+		t.Fatalf("latest song = %#v, err = %v", latestSong, err)
+	}
+	latestAlbum, err := FetchLatestRecommendationBatchForMode(context.Background(), db.Ctx, "album")
+	if err != nil || latestAlbum.ID != album.ID {
+		t.Fatalf("latest album = %#v, err = %v", latestAlbum, err)
+	}
+
+	songSessions, err := ListRecommendationBatchesForMode(context.Background(), db.Ctx, 10, "song")
+	if err != nil || len(songSessions) != 1 || songSessions[0].Mode != "song" {
+		t.Fatalf("song sessions = %#v, err = %v", songSessions, err)
+	}
+	legacy, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "legacy prompt", Candidates: []RecommendationCandidateInput{{Artist: "Legacy Artist", Album: "Legacy Album"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyAlbum, err := FetchLatestRecommendationBatchForMode(context.Background(), db.Ctx, "album")
+	if err != nil || legacyAlbum.ID != legacy.ID {
+		t.Fatalf("legacy album = %#v, err = %v", legacyAlbum, err)
 	}
 }

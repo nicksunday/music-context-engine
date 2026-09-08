@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +30,8 @@ const (
 	defaultFeedbackLimit           = 25
 	defaultBatchLimit              = 6
 	defaultSessionListLimit        = 25
-	maxBatchLimit                  = 10
+	maxAlbumBatchLimit             = 10
+	maxSongBatchLimit              = 20
 	defaultOllamaTimeout           = 3 * time.Minute
 	defaultVerifyTimeout           = 10 * time.Second
 	defaultVerifyDelay             = time.Second
@@ -55,23 +57,29 @@ var errReleaseRadarRefreshInProgress = errors.New("release radar refresh is in p
 var staticFiles embed.FS
 
 type Options struct {
-	Recommender  Recommender
-	Verifier     CandidateVerifier
-	ReleaseRadar ReleaseRadarProvider
-	LinkResolver StreamingLinkResolver
-	Model        string
-	OllamaURL    string
-	Timeout      time.Duration
+	Recommender              Recommender
+	Verifier                 CandidateVerifier
+	ReleaseRadar             ReleaseRadarProvider
+	LinkResolver             StreamingLinkResolver
+	SongLinkResolver         SongLinkResolver
+	Model                    string
+	OllamaURL                string
+	Timeout                  time.Duration
+	AppleMusic               AppleMusicPlaylistProvider
+	AppleMusicDeveloperToken string
 }
 
 type Server struct {
-	db           *sql.DB
-	recommender  Recommender
-	verifier     CandidateVerifier
-	releaseRadar ReleaseRadarProvider
-	linkResolver StreamingLinkResolver
-	model        string
-	ollamaURL    string
+	db                       *sql.DB
+	recommender              Recommender
+	verifier                 CandidateVerifier
+	releaseRadar             ReleaseRadarProvider
+	linkResolver             StreamingLinkResolver
+	songLinkResolver         SongLinkResolver
+	appleMusic               AppleMusicPlaylistProvider
+	appleMusicDeveloperToken string
+	model                    string
+	ollamaURL                string
 }
 
 type Recommender interface {
@@ -90,6 +98,176 @@ type StreamingLinkResolver interface {
 	Resolve(context.Context, database.RecommendationCandidateInput) (string, error)
 }
 
+type SongLink struct {
+	URL      string `json:"streaming_url,omitempty"`
+	Provider string `json:"streaming_provider,omitempty"`
+	AppURL   string `json:"streaming_app_url,omitempty"`
+	TrackID  string `json:"-"`
+}
+
+type AppleMusicPlaylistProvider interface {
+	ResolveTrack(context.Context, database.RecommendationCandidateInput) (AppleMusicTrack, bool, error)
+	CreatePlaylist(context.Context, string, []AppleMusicTrack) (AppleMusicPlaylistResult, error)
+}
+
+type AppleMusicTrack struct {
+	CandidateID string
+	Artist      string
+	Song        string
+	URL         string
+	ID          string
+}
+
+type AppleMusicPlaylistResult struct {
+	URL       string `json:"url,omitempty"`
+	AppURL    string `json:"app_url,omitempty"`
+	Reference string `json:"reference,omitempty"`
+	Added     int    `json:"added"`
+}
+
+type AppleMusicAPIPlaylistProvider struct {
+	baseURL        string
+	developerToken string
+	userToken      string
+	storefront     string
+	client         *http.Client
+}
+
+func NewAppleMusicPlaylistProvider() *AppleMusicAPIPlaylistProvider {
+	return &AppleMusicAPIPlaylistProvider{
+		baseURL:        "https://api.music.apple.com/v1",
+		developerToken: strings.TrimSpace(os.Getenv("APPLE_MUSIC_DEVELOPER_TOKEN")),
+		userToken:      strings.TrimSpace(os.Getenv("APPLE_MUSIC_USER_TOKEN")),
+		storefront:     strings.TrimSpace(os.Getenv("APPLE_MUSIC_STOREFRONT")),
+		client:         &http.Client{Timeout: defaultLinkerTimeout},
+	}
+}
+
+func (provider *AppleMusicAPIPlaylistProvider) authorized() bool {
+	return provider != nil && provider.client != nil && provider.developerToken != "" && provider.userToken != ""
+}
+
+func (provider *AppleMusicAPIPlaylistProvider) ResolveTrack(ctx context.Context, candidate database.RecommendationCandidateInput) (AppleMusicTrack, bool, error) {
+	if !provider.authorized() {
+		return AppleMusicTrack{}, false, errors.New("Apple Music authorization is not configured")
+	}
+	song := strings.TrimSpace(candidate.Song)
+	if song == "" {
+		song = strings.TrimSpace(candidate.StarterTrack)
+	}
+	if strings.TrimSpace(candidate.Artist) == "" || song == "" {
+		return AppleMusicTrack{}, false, nil
+	}
+	lookup := NewAppleMusicLinker()
+	link, err := lookup.ResolveSong(ctx, candidate)
+	if err != nil || link.TrackID == "" {
+		return AppleMusicTrack{}, false, err
+	}
+	return AppleMusicTrack{Artist: candidate.Artist, Song: song, URL: link.URL, ID: link.TrackID}, true, nil
+}
+
+func (provider *AppleMusicAPIPlaylistProvider) CreatePlaylist(ctx context.Context, name string, tracks []AppleMusicTrack) (AppleMusicPlaylistResult, error) {
+	if !provider.authorized() {
+		return AppleMusicPlaylistResult{}, errors.New("Apple Music authorization is not configured")
+	}
+	if len(tracks) == 0 {
+		return AppleMusicPlaylistResult{}, errors.New("no Apple Music tracks supplied")
+	}
+	storefront := provider.storefront
+	if storefront == "" {
+		storefront = "us"
+	}
+	endpoint := strings.TrimRight(provider.baseURL, "/") + "/users/me/library/playlists"
+	payload := struct {
+		Attributes struct {
+			Name string `json:"name"`
+		} `json:"attributes"`
+	}{}
+	payload.Attributes.Name = strings.TrimSpace(name)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return AppleMusicPlaylistResult{}, err
+	}
+	playlist, err := provider.doJSON(ctx, http.MethodPost, endpoint, body)
+	if err != nil {
+		return AppleMusicPlaylistResult{}, err
+	}
+	var created struct {
+		Data []struct {
+			ID         string `json:"id"`
+			Attributes struct {
+				URL string `json:"url"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(playlist, &created); err != nil || len(created.Data) == 0 || created.Data[0].ID == "" {
+		return AppleMusicPlaylistResult{}, errors.New("Apple Music returned no playlist reference")
+	}
+	id := created.Data[0].ID
+	items := make([]map[string]string, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, map[string]string{"id": track.ID, "type": "songs"})
+	}
+	relationshipBody, _ := json.Marshal(map[string]any{"data": items})
+	addURL := strings.TrimRight(provider.baseURL, "/") + "/users/me/library/playlists/" + url.PathEscape(id) + "/tracks"
+	if _, err := provider.doJSON(ctx, http.MethodPost, addURL, relationshipBody); err != nil {
+		return AppleMusicPlaylistResult{Reference: id, URL: strings.TrimSpace(created.Data[0].Attributes.URL), Added: 0}, err
+	}
+	webURL := strings.TrimSpace(created.Data[0].Attributes.URL)
+	if webURL == "" {
+		webURL = "https://music.apple.com/" + storefront + "/playlist/" + url.PathEscape(id)
+	}
+	return AppleMusicPlaylistResult{Reference: id, URL: webURL, AppURL: AppleMusicAppURL(webURL), Added: len(tracks)}, nil
+}
+
+func (provider *AppleMusicAPIPlaylistProvider) doJSON(ctx context.Context, method, endpoint string, body []byte) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+provider.developerToken)
+	request.Header.Set("Music-User-Token", provider.userToken)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("Apple Music returned %s", response.Status)
+	}
+	return responseBody, nil
+}
+
+type PlaylistRequest struct {
+	BatchID string `json:"batch_id"`
+	Name    string `json:"name,omitempty"`
+}
+
+type PlaylistSkipped struct {
+	CandidateID string `json:"candidate_id"`
+	Artist      string `json:"artist"`
+	Song        string `json:"song,omitempty"`
+	Reason      string `json:"reason"`
+}
+
+type PlaylistResponse struct {
+	Playlist AppleMusicPlaylistResult `json:"playlist,omitempty"`
+	Added    int                      `json:"added"`
+	Skipped  []PlaylistSkipped        `json:"skipped,omitempty"`
+	Partial  bool                     `json:"partial"`
+}
+
+type AppleMusicConfigResponse struct {
+	Enabled        bool   `json:"enabled"`
+	DeveloperToken string `json:"developer_token,omitempty"`
+}
+
+type SongLinkResolver interface {
+	ResolveSong(context.Context, database.RecommendationCandidateInput) (SongLink, error)
+}
+
 type ReleaseRadarProvider interface {
 	NewReleases(context.Context, []database.ArtistAffinity, time.Time, time.Time, int) ([]NewRelease, error)
 }
@@ -99,6 +277,7 @@ type DiscoveryRequest struct {
 	FallbackTags []string
 	SeedArtists  []string
 	Limit        int
+	Mode         string
 }
 
 type RecommendationRequest struct {
@@ -106,11 +285,23 @@ type RecommendationRequest struct {
 	Mood    string `json:"mood,omitempty"`
 	Avoid   string `json:"avoid,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
+	Mode    string `json:"mode,omitempty"`
 }
 
 type RecommendationDraft struct {
 	Reply      string                                  `json:"reply"`
 	Candidates []database.RecommendationCandidateInput `json:"candidates"`
+}
+
+func songRecommendationMode(request RecommendationRequest) bool {
+	return strings.EqualFold(strings.TrimSpace(request.Mode), "song") || strings.EqualFold(strings.TrimSpace(request.Mode), "songs")
+}
+
+func recommendationMode(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "song") || strings.EqualFold(strings.TrimSpace(value), "songs") {
+		return "song"
+	}
+	return "album"
 }
 
 type ProfileContext struct {
@@ -157,13 +348,16 @@ type NewRelease struct {
 
 func NewServer(db *sql.DB, options Options) http.Handler {
 	server := &Server{
-		db:           db,
-		recommender:  options.Recommender,
-		verifier:     options.Verifier,
-		releaseRadar: options.ReleaseRadar,
-		linkResolver: options.LinkResolver,
-		model:        strings.TrimSpace(options.Model),
-		ollamaURL:    normalizeBaseURL(options.OllamaURL),
+		db:                       db,
+		recommender:              options.Recommender,
+		verifier:                 options.Verifier,
+		releaseRadar:             options.ReleaseRadar,
+		linkResolver:             options.LinkResolver,
+		songLinkResolver:         options.SongLinkResolver,
+		appleMusic:               options.AppleMusic,
+		appleMusicDeveloperToken: strings.TrimSpace(options.AppleMusicDeveloperToken),
+		model:                    strings.TrimSpace(options.Model),
+		ollamaURL:                normalizeBaseURL(options.OllamaURL),
 	}
 
 	mux := http.NewServeMux()
@@ -174,8 +368,17 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	mux.HandleFunc("GET /api/batches", server.handleBatches)
 	mux.HandleFunc("POST /api/recommendations", server.handleRecommendations)
 	mux.HandleFunc("POST /api/feedback", server.handleFeedback)
+	mux.HandleFunc("POST /api/playlists/apple-music", server.handleAppleMusicPlaylist)
+	mux.HandleFunc("GET /api/apple-music/config", server.handleAppleMusicConfig)
 	mux.Handle("/", staticHandler())
 	return mux
+}
+
+func (server *Server) handleAppleMusicConfig(writer http.ResponseWriter, _ *http.Request) {
+	writeJSON(writer, http.StatusOK, AppleMusicConfigResponse{
+		Enabled:        strings.TrimSpace(server.appleMusicDeveloperToken) != "",
+		DeveloperToken: strings.TrimSpace(server.appleMusicDeveloperToken),
+	})
 }
 
 func NewOllamaRecommender(baseURL, model string) *OllamaRecommender {
@@ -225,7 +428,7 @@ func staticHandler() http.Handler {
 	}
 	fileServer := http.FileServer(http.FS(staticRoot))
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/" {
+		if request.URL.Path == "/" || strings.HasPrefix(request.URL.Path, "/recommendations") {
 			http.ServeFileFS(writer, request, staticRoot, "index.html")
 			return
 		}
@@ -292,7 +495,12 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	input.Message = strings.TrimSpace(input.Message)
 	input.Mood = strings.TrimSpace(input.Mood)
 	input.Avoid = strings.TrimSpace(input.Avoid)
-	input.Limit = clampBatchLimit(input.Limit)
+	if songRecommendationMode(input) {
+		input.Mode = "song"
+	} else {
+		input.Mode = "album"
+	}
+	input.Limit = clampBatchLimit(input.Mode, input.Limit)
 	if input.Message == "" {
 		writeJSONError(writer, http.StatusBadRequest, "Please provide a recommendation prompt.")
 		return
@@ -316,11 +524,18 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		return
 	}
 	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "The recommendation model returned no album candidates.")
+		writeJSONError(writer, http.StatusBadGateway, recommendationCandidateEmptyMessage(input))
 		return
 	}
 	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
 	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
+	if songRecommendationMode(input) {
+		for idx := range draft.Candidates {
+			if strings.TrimSpace(draft.Candidates[idx].Song) == "" {
+				draft.Candidates[idx].Song = strings.TrimSpace(draft.Candidates[idx].StarterTrack)
+			}
+		}
+	}
 	if len(draft.Candidates) == 0 {
 		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
 		return
@@ -345,12 +560,17 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		draft.Candidates = draft.Candidates[:input.Limit]
 		resetRecommendationCandidateRanks(draft.Candidates)
 	}
-	draft.Candidates = server.resolveCandidateLinks(request.Context(), draft.Candidates)
+	if songRecommendationMode(input) {
+		draft.Candidates = server.resolveSongLinks(request.Context(), draft.Candidates)
+	} else {
+		draft.Candidates = server.resolveCandidateLinks(request.Context(), draft.Candidates)
+	}
 
 	batch, err := database.CreateRecommendationBatch(request.Context(), server.db, database.RecommendationBatchInput{
 		Prompt:     input.Message,
 		Mood:       input.Mood,
 		Notes:      draft.Reply,
+		Mode:       input.Mode,
 		Candidates: draft.Candidates,
 	})
 	if err != nil {
@@ -362,6 +582,13 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		Reply: strings.TrimSpace(draft.Reply),
 		Batch: batch,
 	})
+}
+
+func recommendationCandidateEmptyMessage(request RecommendationRequest) string {
+	if songRecommendationMode(request) {
+		return "The recommendation model returned no song candidates."
+	}
+	return "The recommendation model returned no album candidates."
 }
 
 func (server *Server) handleFeedback(writer http.ResponseWriter, request *http.Request) {
@@ -391,8 +618,72 @@ func (server *Server) handleFeedback(writer http.ResponseWriter, request *http.R
 	writeJSON(writer, http.StatusOK, result)
 }
 
+func (server *Server) handleAppleMusicPlaylist(writer http.ResponseWriter, request *http.Request) {
+	if server.appleMusic == nil {
+		writeJSONError(writer, http.StatusServiceUnavailable, "Apple Music playlist authorization is not configured. Set the local Apple Music credentials first.")
+		return
+	}
+	var input PlaylistRequest
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "Request body must be a JSON object.")
+		return
+	}
+	batch, err := database.FetchRecommendationBatchByID(request.Context(), server.db, input.BatchID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSONError(writer, http.StatusNotFound, "Recommendation batch not found.")
+		return
+	}
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load the recommendation batch.")
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(batch.Mode), "song") {
+		writeJSONError(writer, http.StatusBadRequest, "Apple Music playlists are available only for Individual Song batches.")
+		return
+	}
+	if len(batch.Candidates) == 0 {
+		writeJSONError(writer, http.StatusBadRequest, "This recommendation batch has no songs to add.")
+		return
+	}
+
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		name = "Music Vault — " + strings.TrimSpace(batch.Prompt)
+	}
+	tracks := make([]AppleMusicTrack, 0, len(batch.Candidates))
+	skipped := make([]PlaylistSkipped, 0)
+	seen := make(map[string]bool)
+	for _, candidate := range batch.Candidates {
+		track, ok, resolveErr := server.appleMusic.ResolveTrack(request.Context(), database.RecommendationCandidateInput{
+			Artist: candidate.Artist, Album: candidate.Album, Song: candidate.Song, StarterTrack: candidate.StarterTrack,
+		})
+		if resolveErr != nil || !ok || strings.TrimSpace(track.ID) == "" {
+			skipped = append(skipped, PlaylistSkipped{CandidateID: candidate.ID, Artist: candidate.Artist, Song: candidate.Song, Reason: "Could not resolve an Apple Music track"})
+			continue
+		}
+		if seen[track.ID] {
+			skipped = append(skipped, PlaylistSkipped{CandidateID: candidate.ID, Artist: candidate.Artist, Song: candidate.Song, Reason: "Duplicate Apple Music track"})
+			continue
+		}
+		seen[track.ID] = true
+		track.CandidateID = candidate.ID
+		tracks = append(tracks, track)
+	}
+	if len(tracks) == 0 {
+		writeJSONError(writer, http.StatusBadRequest, "No recommendation songs could be resolved to Apple Music tracks; no playlist was created.")
+		return
+	}
+	playlist, err := server.appleMusic.CreatePlaylist(request.Context(), name, tracks)
+	if err != nil {
+		writeJSONError(writer, http.StatusBadGateway, "Apple Music playlist creation failed: "+err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, PlaylistResponse{Playlist: playlist, Added: playlist.Added, Skipped: skipped, Partial: len(skipped) > 0})
+}
+
 func (server *Server) handleLatestBatch(writer http.ResponseWriter, request *http.Request) {
-	batch, err := database.FetchLatestRecommendationBatch(request.Context(), server.db)
+	mode := recommendationMode(request.URL.Query().Get("mode"))
+	batch, err := database.FetchLatestRecommendationBatchForMode(request.Context(), server.db, mode)
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load the latest recommendation batch.")
 		return
@@ -420,11 +711,17 @@ func (server *Server) handleBatchByID(writer http.ResponseWriter, request *http.
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load the recommendation batch.")
 		return
 	}
+	requestedMode := strings.TrimSpace(request.URL.Query().Get("mode"))
+	if requestedMode != "" && recommendationMode(batch.Mode) != recommendationMode(requestedMode) {
+		writeJSONError(writer, http.StatusNotFound, "Recommendation batch not found for this mode.")
+		return
+	}
 	writeJSON(writer, http.StatusOK, BatchResponse{Batch: &batch})
 }
 
 func (server *Server) handleBatches(writer http.ResponseWriter, request *http.Request) {
-	batches, err := database.ListRecommendationBatches(request.Context(), server.db, defaultSessionListLimit)
+	mode := recommendationMode(request.URL.Query().Get("mode"))
+	batches, err := database.ListRecommendationBatchesForMode(request.Context(), server.db, defaultSessionListLimit, mode)
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load past recommendation sessions.")
 		return
@@ -496,6 +793,31 @@ func (server *Server) resolveCandidateLinks(
 			continue
 		}
 		candidate.StreamingURL = strings.TrimSpace(streamingURL)
+		resolved = append(resolved, candidate)
+	}
+	return resolved
+}
+
+func (server *Server) resolveSongLinks(
+	ctx context.Context,
+	candidates []database.RecommendationCandidateInput,
+) []database.RecommendationCandidateInput {
+	if server.songLinkResolver == nil {
+		return candidates
+	}
+	resolved := make([]database.RecommendationCandidateInput, 0, len(candidates))
+	for _, candidate := range candidates {
+		link, err := server.songLinkResolver.ResolveSong(ctx, candidate)
+		if err != nil {
+			resolved = append(resolved, candidate)
+			continue
+		}
+		candidate.StreamingURL = strings.TrimSpace(link.URL)
+		candidate.StreamingProvider = strings.TrimSpace(link.Provider)
+		candidate.StreamingAppURL = strings.TrimSpace(link.AppURL)
+		if candidate.StreamingURL == "" {
+			candidate.StreamingProvider = ""
+		}
 		resolved = append(resolved, candidate)
 	}
 	return resolved
@@ -657,9 +979,12 @@ type iTunesSearchResponse struct {
 }
 
 type iTunesSearchResult struct {
+	TrackID           int64  `json:"trackId"`
 	ArtistName        string `json:"artistName"`
+	TrackName         string `json:"trackName"`
 	CollectionName    string `json:"collectionName"`
 	PrimaryGenreName  string `json:"primaryGenreName"`
+	TrackViewURL      string `json:"trackViewUrl"`
 	CollectionViewURL string `json:"collectionViewUrl"`
 }
 
@@ -678,6 +1003,17 @@ func NewAppleMusicLinker() *AppleMusicLinker {
 		client:       &http.Client{Timeout: defaultLinkerTimeout},
 		requestDelay: defaultVerifyDelay,
 	}
+}
+
+// AppleMusicAppURL returns the legacy Music app deep-link form while keeping
+// the canonical HTTPS URL as the durable/browser-compatible destination.
+func AppleMusicAppURL(webURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(webURL))
+	if err != nil || !strings.EqualFold(parsed.Host, "music.apple.com") {
+		return ""
+	}
+	parsed.Scheme = "itmss"
+	return parsed.String()
 }
 
 func (linker *AppleMusicLinker) Resolve(ctx context.Context, candidate database.RecommendationCandidateInput) (string, error) {
@@ -740,6 +1076,104 @@ func (linker *AppleMusicLinker) Resolve(ctx context.Context, candidate database.
 		return strings.TrimSpace(result.CollectionViewURL), nil
 	}
 	return "", nil
+}
+
+func (linker *AppleMusicLinker) ResolveSong(ctx context.Context, candidate database.RecommendationCandidateInput) (SongLink, error) {
+	if linker == nil || linker.client == nil {
+		return SongLink{}, nil
+	}
+	targetSong := strings.TrimSpace(candidate.Song)
+	if targetSong == "" {
+		targetSong = strings.TrimSpace(candidate.StarterTrack)
+	}
+	targetArtist, _, err := database.NormalizeAlbumLookup(candidate.Artist, "placeholder")
+	if err != nil || targetArtist == "" || targetSong == "" {
+		return SongLink{}, err
+	}
+	endpoint, err := url.Parse(linker.baseURL)
+	if err != nil {
+		return SongLink{}, err
+	}
+	query := endpoint.Query()
+	query.Set("term", strings.Join([]string{candidate.Artist, targetSong}, " "))
+	query.Set("media", "music")
+	query.Set("entity", "song")
+	query.Set("limit", "10")
+	endpoint.RawQuery = query.Encode()
+	if err := linker.waitForRateLimit(ctx); err != nil {
+		return SongLink{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return SongLink{}, err
+	}
+	request.Header.Set("User-Agent", webUserAgent)
+	response, err := linker.client.Do(request)
+	if err != nil {
+		return SongLink{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return SongLink{}, fmt.Errorf("iTunes returned %s", response.Status)
+	}
+	var payload iTunesSearchResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload); err != nil {
+		return SongLink{}, err
+	}
+	_, cleanSong, err := database.NormalizeAlbumLookup("placeholder", targetSong)
+	if err != nil {
+		return SongLink{}, err
+	}
+	for _, result := range payload.Results {
+		resultArtist, _, err := database.NormalizeAlbumLookup(result.ArtistName, "placeholder")
+		if err != nil {
+			return SongLink{}, err
+		}
+		_, resultSong, err := database.NormalizeAlbumLookup("placeholder", result.TrackName)
+		if err != nil {
+			return SongLink{}, err
+		}
+		if resultArtist == targetArtist && resultSong == cleanSong && strings.TrimSpace(result.TrackViewURL) != "" {
+			webURL := strings.TrimSpace(result.TrackViewURL)
+			return SongLink{URL: webURL, AppURL: AppleMusicAppURL(webURL), TrackID: strconv.FormatInt(result.TrackID, 10), Provider: "apple_music"}, nil
+		}
+	}
+	return SongLink{}, nil
+}
+
+type YouTubeSongLinker struct{}
+
+func (YouTubeSongLinker) ResolveSong(_ context.Context, candidate database.RecommendationCandidateInput) (SongLink, error) {
+	song := strings.TrimSpace(candidate.Song)
+	if song == "" {
+		song = strings.TrimSpace(candidate.StarterTrack)
+	}
+	artist := strings.TrimSpace(candidate.Artist)
+	if artist == "" || song == "" {
+		return SongLink{}, nil
+	}
+	return SongLink{URL: "https://www.youtube.com/results?search_query=" + url.QueryEscape(artist+" "+song), Provider: "youtube"}, nil
+}
+
+type FallbackSongLinkResolver struct {
+	AppleMusic SongLinkResolver
+	YouTube    SongLinkResolver
+}
+
+func (resolver FallbackSongLinkResolver) ResolveSong(ctx context.Context, candidate database.RecommendationCandidateInput) (SongLink, error) {
+	if resolver.AppleMusic != nil {
+		link, err := resolver.AppleMusic.ResolveSong(ctx, candidate)
+		if err == nil && strings.TrimSpace(link.URL) != "" {
+			return link, nil
+		}
+	}
+	if resolver.YouTube != nil {
+		link, err := resolver.YouTube.ResolveSong(ctx, candidate)
+		if err == nil {
+			return link, nil
+		}
+	}
+	return SongLink{}, nil
 }
 
 func (linker *AppleMusicLinker) waitForRateLimit(ctx context.Context) error {
@@ -1578,10 +2012,11 @@ func (provider *MCPDiscoveryProvider) Discover(
 	}
 
 	result, err := mcpserver.GetVerifiedDiscoveryCandidates(ctx, &database.DB{Ctx: provider.db}, mcpserver.VerifiedDiscoveryQuery{
-		TargetVibe:   request.TargetVibe,
-		FallbackTags: request.FallbackTags,
-		SeedArtists:  request.SeedArtists,
-		Limit:        request.Limit,
+		TargetVibe:                   request.TargetVibe,
+		FallbackTags:                 request.FallbackTags,
+		SeedArtists:                  request.SeedArtists,
+		Limit:                        request.Limit,
+		SkipAlbumGenreReconciliation: strings.EqualFold(strings.TrimSpace(request.Mode), "song"),
 	})
 	if err != nil {
 		return nil, err
@@ -1613,7 +2048,8 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 		TargetVibe:   plan.TargetVibe,
 		FallbackTags: compactWebStrings(plan.FallbackTags),
 		SeedArtists:  recommender.similarSeedArtists(ctx, profile.Artists),
-		Limit:        discoveryCandidateFetchLimit(request.Limit),
+		Limit:        discoveryCandidateFetchLimit(request.Mode, request.Limit),
+		Mode:         request.Mode,
 	})
 	if err != nil {
 		return RecommendationDraft{}, fmt.Errorf("MCP verified discovery failed: %w", err)
@@ -1695,7 +2131,7 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 	plan modelDiscoveryPlan,
 	candidates []mcpserver.DiscoveryCandidate,
 ) (RecommendationDraft, error) {
-	limit := clampBatchLimit(request.Limit)
+	limit := clampBatchLimit(request.Mode, request.Limit)
 	content, err := recommender.ollama.chat(
 		ctx,
 		discoverySelectionSystemPrompt(),
@@ -1718,11 +2154,15 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 			continue
 		}
 		seen[idx] = true
-		draft.Candidates = append(draft.Candidates, discoveryCandidateInput(
+		candidateInput := discoveryCandidateInput(
 			candidates[idx],
 			len(draft.Candidates)+1,
 			selected.Note,
-		))
+		)
+		if songRecommendationMode(request) {
+			candidateInput.Song = candidates[idx].TrackName
+		}
+		draft.Candidates = append(draft.Candidates, candidateInput)
 	}
 	draft.Candidates = applyRecommendationBatchDiversity(request, draft.Candidates)
 	if len(draft.Candidates) > limit {
@@ -1780,7 +2220,7 @@ Return only JSON with this exact shape:
 Rules:
 - candidate_index must be one of the numbered candidates provided by the user message.
 - Do not create, rename, or substitute artists, albums, or tracks.
-- Recommend albums; the listed track is the verified MCP matched track that brought the album into the candidate set.
+	- Recommend albums by default; when the request asks for songs, recommend the listed verified track as the song candidate while retaining its album as context.
 - Present the listed track as a matched entry point, not necessarily the album's best opener or most representative song.
 - Use vibe_summary, required_traits, and flexible_traits as the main intent. Treat MusicBrainz tags as evidence, not the full meaning of the prompt.
 - Prefer high-impact matches to the user's current prompt over generic taste-anchor similarity.
@@ -1799,12 +2239,12 @@ Rules:
 }
 
 func recommendationSystemPrompt() string {
-	return `You generate album-first music recommendations for a local personal library.
+	return `You generate music recommendations for a local personal library.
 Return only JSON with this exact shape:
-{"reply":"short plain-language summary","candidates":[{"artist":"Artist","album":"Album","starter_track":"Track to sample","release_year":2024,"genre_tags":["tag"],"note":"one concise reason"}]}
+{"reply":"short plain-language summary","candidates":[{"artist":"Artist","album":"Album","song":"Song when song mode is requested","starter_track":"Track to sample","release_year":2024,"genre_tags":["tag"],"note":"one concise reason"}]}
 
 Rules:
-- Recommend albums, not playlists and not individual single-only tracks.
+- Recommend albums by default. If the user requests individual songs, recommend verified song candidates and keep the album as context.
 - Include 4 to 6 candidates unless the user asks for fewer.
 - Prefer dense, personality-forward, technically interesting music.
 - For hip-hop, default to English unless the non-English record is production-forward enough to overcome the lyric barrier.
@@ -2007,18 +2447,22 @@ func writeJSONError(writer http.ResponseWriter, status int, message string) {
 	writeJSON(writer, status, map[string]string{"error": message})
 }
 
-func clampBatchLimit(limit int) int {
+func clampBatchLimit(mode string, limit int) int {
 	if limit <= 0 {
 		return defaultBatchLimit
 	}
-	if limit > maxBatchLimit {
-		return maxBatchLimit
+	maxLimit := maxAlbumBatchLimit
+	if strings.EqualFold(strings.TrimSpace(mode), "song") || strings.EqualFold(strings.TrimSpace(mode), "songs") {
+		maxLimit = maxSongBatchLimit
+	}
+	if limit > maxLimit {
+		return maxLimit
 	}
 	return limit
 }
 
-func discoveryCandidateFetchLimit(limit int) int {
-	limit = clampBatchLimit(limit) * 3
+func discoveryCandidateFetchLimit(mode string, limit int) int {
+	limit = clampBatchLimit(mode, limit) * 3
 	if limit < 12 {
 		return 12
 	}
@@ -2635,7 +3079,11 @@ func fallbackDiscoveryDraft(
 	}
 	for idx, candidate := range candidates {
 		note := fallbackDiscoveryNote(request, plan, candidate)
-		draft.Candidates = append(draft.Candidates, discoveryCandidateInput(candidate, idx+1, note))
+		candidateInput := discoveryCandidateInput(candidate, idx+1, note)
+		if songRecommendationMode(request) {
+			candidateInput.Song = candidate.TrackName
+		}
+		draft.Candidates = append(draft.Candidates, candidateInput)
 	}
 	draft.Candidates = applyRecommendationBatchDiversity(request, draft.Candidates)
 	if len(draft.Candidates) > limit {
@@ -2721,7 +3169,11 @@ func dedupeRecommendationCandidates(
 		if cleanAlbum == "" {
 			cleanAlbum = strings.ToLower(strings.TrimSpace(candidate.Album))
 		}
-		albumKey := cleanArtist + "\x00" + cleanAlbum
+		identity := cleanAlbum
+		if strings.TrimSpace(candidate.Song) != "" {
+			_, identity, _ = database.NormalizeAlbumLookup("placeholder", candidate.Song)
+		}
+		albumKey := cleanArtist + "\x00" + identity
 		if albumKey != "\x00" && seenAlbums[albumKey] {
 			continue
 		}
@@ -2769,7 +3221,7 @@ func discoveryCandidateInput(
 	rank int,
 	note string,
 ) database.RecommendationCandidateInput {
-	return database.RecommendationCandidateInput{
+	input := database.RecommendationCandidateInput{
 		Artist:       candidate.Artist,
 		Album:        candidate.Album,
 		StarterTrack: candidate.TrackName,
@@ -2778,6 +3230,7 @@ func discoveryCandidateInput(
 		Rank:         rank,
 		Note:         strings.TrimSpace(note),
 	}
+	return input
 }
 
 func rankDiscoveryCandidatesForPrompt(

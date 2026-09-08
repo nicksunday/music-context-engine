@@ -13,35 +13,42 @@ import (
 )
 
 type RecommendationCandidateInput struct {
-	Artist       string   `json:"artist"`
-	Album        string   `json:"album"`
-	StarterTrack string   `json:"starter_track,omitempty"`
-	ReleaseYear  int      `json:"release_year,omitempty"`
-	GenreTags    []string `json:"genre_tags,omitempty"`
-	Rank         int      `json:"rank,omitempty"`
-	Note         string   `json:"note,omitempty"`
-	StreamingURL string   `json:"streaming_url,omitempty"`
+	Artist            string   `json:"artist"`
+	Album             string   `json:"album"`
+	Song              string   `json:"song,omitempty"`
+	StarterTrack      string   `json:"starter_track,omitempty"`
+	ReleaseYear       int      `json:"release_year,omitempty"`
+	GenreTags         []string `json:"genre_tags,omitempty"`
+	Rank              int      `json:"rank,omitempty"`
+	Note              string   `json:"note,omitempty"`
+	StreamingURL      string   `json:"streaming_url,omitempty"`
+	StreamingProvider string   `json:"streaming_provider,omitempty"`
+	StreamingAppURL   string   `json:"streaming_app_url,omitempty"`
 }
 
 type RecommendationCandidate struct {
-	ID           string   `json:"id"`
-	BatchID      string   `json:"batch_id"`
-	Artist       string   `json:"artist"`
-	Album        string   `json:"album"`
-	CleanArtist  string   `json:"clean_artist"`
-	CleanTitle   string   `json:"clean_title"`
-	StarterTrack string   `json:"starter_track,omitempty"`
-	ReleaseYear  int      `json:"release_year,omitempty"`
-	GenreTags    []string `json:"genre_tags,omitempty"`
-	Rank         int      `json:"rank,omitempty"`
-	Note         string   `json:"note,omitempty"`
-	StreamingURL string   `json:"streaming_url,omitempty"`
+	ID                string   `json:"id"`
+	BatchID           string   `json:"batch_id"`
+	Artist            string   `json:"artist"`
+	Album             string   `json:"album"`
+	Song              string   `json:"song,omitempty"`
+	CleanArtist       string   `json:"clean_artist"`
+	CleanTitle        string   `json:"clean_title"`
+	StarterTrack      string   `json:"starter_track,omitempty"`
+	ReleaseYear       int      `json:"release_year,omitempty"`
+	GenreTags         []string `json:"genre_tags,omitempty"`
+	Rank              int      `json:"rank,omitempty"`
+	Note              string   `json:"note,omitempty"`
+	StreamingURL      string   `json:"streaming_url,omitempty"`
+	StreamingProvider string   `json:"streaming_provider,omitempty"`
+	StreamingAppURL   string   `json:"streaming_app_url,omitempty"`
 }
 
 type RecommendationBatchInput struct {
 	Prompt     string                         `json:"prompt"`
 	Mood       string                         `json:"mood,omitempty"`
 	Notes      string                         `json:"notes,omitempty"`
+	Mode       string                         `json:"mode,omitempty"`
 	Candidates []RecommendationCandidateInput `json:"candidates"`
 }
 
@@ -50,6 +57,7 @@ type RecommendationBatch struct {
 	Prompt     string                    `json:"prompt"`
 	Mood       string                    `json:"mood,omitempty"`
 	Notes      string                    `json:"notes,omitempty"`
+	Mode       string                    `json:"mode,omitempty"`
 	Candidates []RecommendationCandidate `json:"candidates"`
 }
 
@@ -57,6 +65,7 @@ type RecommendationBatchSummary struct {
 	ID             string `json:"id"`
 	Prompt         string `json:"prompt"`
 	Mood           string `json:"mood,omitempty"`
+	Mode           string `json:"mode,omitempty"`
 	CreatedAt      string `json:"created_at"`
 	CandidateCount int    `json:"candidate_count"`
 	Reply          string `json:"reply,omitempty"`
@@ -103,6 +112,7 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 		Prompt: prompt,
 		Mood:   strings.TrimSpace(input.Mood),
 		Notes:  strings.TrimSpace(input.Notes),
+		Mode:   normalizedRecommendationMode(input.Mode),
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
@@ -112,12 +122,13 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO recommendation_batches (id, prompt, mood, notes)
-		VALUES (?, ?, ?, ?)`,
+		INSERT INTO recommendation_batches (id, prompt, mood, notes, mode)
+		VALUES (?, ?, ?, ?, ?)`,
 		batch.ID,
 		nullableTrimmedString(batch.Prompt),
 		nullableTrimmedString(batch.Mood),
 		nullableTrimmedString(batch.Notes),
+		nullableTrimmedString(batch.Mode),
 	); err != nil {
 		return RecommendationBatch{}, err
 	}
@@ -138,12 +149,13 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO recommendation_candidates (
-				id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, batch_id, artist, album, song, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url, streaming_provider, streaming_app_url
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.ID,
 			candidate.BatchID,
 			candidate.Artist,
 			candidate.Album,
+			candidate.Song,
 			candidate.CleanArtist,
 			candidate.CleanTitle,
 			nullableTrimmedString(candidate.StarterTrack),
@@ -151,6 +163,8 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 			string(rawGenres),
 			candidate.Rank,
 			nullableTrimmedString(candidate.StreamingURL),
+			nullableTrimmedString(candidate.StreamingProvider),
+			nullableTrimmedString(candidate.StreamingAppURL),
 		); err != nil {
 			return RecommendationBatch{}, err
 		}
@@ -279,15 +293,21 @@ func FetchRecentRecommendationFeedback(ctx context.Context, db *sql.DB, limit in
 }
 
 func FetchLatestRecommendationBatch(ctx context.Context, db *sql.DB) (RecommendationBatch, error) {
+	return FetchLatestRecommendationBatchForMode(ctx, db, "album")
+}
+
+func FetchLatestRecommendationBatchForMode(ctx context.Context, db *sql.DB, mode string) (RecommendationBatch, error) {
 	if db == nil {
 		return RecommendationBatch{}, fmt.Errorf("database is not initialized")
 	}
 
 	var id string
+	mode = normalizedRecommendationMode(mode)
 	err := db.QueryRowContext(ctx, `
 		SELECT id FROM recommendation_batches
+		WHERE COALESCE(NULLIF(mode, ''), 'album') = ?
 		ORDER BY created_at DESC, rowid DESC
-		LIMIT 1`).Scan(&id)
+		LIMIT 1`, mode).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RecommendationBatch{}, nil
 	}
@@ -308,16 +328,17 @@ func FetchRecommendationBatchByID(ctx context.Context, db *sql.DB, id string) (R
 	}
 
 	var batch RecommendationBatch
-	var prompt, mood, notes, createdAt sql.NullString
+	var prompt, mood, notes, mode, createdAt sql.NullString
 	err := db.QueryRowContext(ctx, `
-		SELECT id, prompt, mood, notes, created_at FROM recommendation_batches WHERE id = ?`, id,
-	).Scan(&batch.ID, &prompt, &mood, &notes, &createdAt)
+		SELECT id, prompt, mood, notes, mode, created_at FROM recommendation_batches WHERE id = ?`, id,
+	).Scan(&batch.ID, &prompt, &mood, &notes, &mode, &createdAt)
 	if err != nil {
 		return RecommendationBatch{}, err
 	}
 	batch.Prompt = nullStringText(prompt)
 	batch.Mood = nullStringText(mood)
 	batch.Notes = nullStringText(notes)
+	batch.Mode = nullStringText(mode)
 
 	candidates, err := fetchRecommendationCandidates(ctx, db, id)
 	if err != nil {
@@ -328,20 +349,26 @@ func FetchRecommendationBatchByID(ctx context.Context, db *sql.DB, id string) (R
 }
 
 func ListRecommendationBatches(ctx context.Context, db *sql.DB, limit int) ([]RecommendationBatchSummary, error) {
+	return ListRecommendationBatchesForMode(ctx, db, limit, "album")
+}
+
+func ListRecommendationBatchesForMode(ctx context.Context, db *sql.DB, limit int, mode string) ([]RecommendationBatchSummary, error) {
 	if db == nil {
 		return nil, fmt.Errorf("database is not initialized")
 	}
 	if limit <= 0 {
 		limit = 20
 	}
+	mode = normalizedRecommendationMode(mode)
 
 	rows, err := db.QueryContext(ctx, `
-		SELECT b.id, b.prompt, b.mood, b.notes, b.created_at, (
+		SELECT b.id, b.prompt, b.mood, b.notes, b.mode, b.created_at, (
 			SELECT COUNT(*) FROM recommendation_candidates c WHERE c.batch_id = b.id
 		)
 		FROM recommendation_batches b
+		WHERE COALESCE(NULLIF(b.mode, ''), 'album') = ?
 		ORDER BY b.created_at DESC, b.rowid DESC
-		LIMIT ?`, limit)
+		LIMIT ?`, mode, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -350,12 +377,13 @@ func ListRecommendationBatches(ctx context.Context, db *sql.DB, limit int) ([]Re
 	var summaries []RecommendationBatchSummary
 	for rows.Next() {
 		var summary RecommendationBatchSummary
-		var prompt, mood, notes, createdAt sql.NullString
+		var prompt, mood, notes, modeValue, createdAt sql.NullString
 		if err := rows.Scan(
 			&summary.ID,
 			&prompt,
 			&mood,
 			&notes,
+			&modeValue,
 			&createdAt,
 			&summary.CandidateCount,
 		); err != nil {
@@ -363,6 +391,7 @@ func ListRecommendationBatches(ctx context.Context, db *sql.DB, limit int) ([]Re
 		}
 		summary.Prompt = nullStringText(prompt)
 		summary.Mood = nullStringText(mood)
+		summary.Mode = normalizedRecommendationMode(nullStringText(modeValue))
 		summary.CreatedAt = nullStringText(createdAt)
 		summary.Reply = nullStringText(notes)
 		summaries = append(summaries, summary)
@@ -374,9 +403,16 @@ func ListRecommendationBatches(ctx context.Context, db *sql.DB, limit int) ([]Re
 	return summaries, nil
 }
 
+func normalizedRecommendationMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "song") || strings.EqualFold(strings.TrimSpace(mode), "songs") {
+		return "song"
+	}
+	return "album"
+}
+
 func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID string) ([]RecommendationCandidate, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, batch_id, artist, album, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url
+		SELECT id, batch_id, artist, album, song, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url, streaming_provider, streaming_app_url
 		FROM recommendation_candidates
 		WHERE batch_id = ?
 		ORDER BY rank ASC, rowid ASC`, batchID)
@@ -388,13 +424,14 @@ func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID stri
 	var candidates []RecommendationCandidate
 	for rows.Next() {
 		var candidate RecommendationCandidate
-		var starterTrack, genreTags, streamingURL sql.NullString
+		var song, starterTrack, genreTags, streamingURL, streamingProvider, streamingAppURL sql.NullString
 		var releaseYear sql.NullInt64
 		if err := rows.Scan(
 			&candidate.ID,
 			&candidate.BatchID,
 			&candidate.Artist,
 			&candidate.Album,
+			&song,
 			&candidate.CleanArtist,
 			&candidate.CleanTitle,
 			&starterTrack,
@@ -402,11 +439,16 @@ func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID stri
 			&genreTags,
 			&candidate.Rank,
 			&streamingURL,
+			&streamingProvider,
+			&streamingAppURL,
 		); err != nil {
 			return nil, err
 		}
 		candidate.StarterTrack = nullStringText(starterTrack)
 		candidate.StreamingURL = nullStringText(streamingURL)
+		candidate.Song = nullStringText(song)
+		candidate.StreamingProvider = nullStringText(streamingProvider)
+		candidate.StreamingAppURL = nullStringText(streamingAppURL)
 		if releaseYear.Valid {
 			candidate.ReleaseYear = int(releaseYear.Int64)
 		}
@@ -473,18 +515,21 @@ func normalizeRecommendationCandidate(batchID string, fallbackRank int, input Re
 	}
 
 	return RecommendationCandidate{
-		ID:           uuid.NewString(),
-		BatchID:      batchID,
-		Artist:       strings.TrimSpace(input.Artist),
-		Album:        strings.TrimSpace(input.Album),
-		CleanArtist:  cleanArtist,
-		CleanTitle:   cleanTitle,
-		StarterTrack: strings.TrimSpace(input.StarterTrack),
-		ReleaseYear:  input.ReleaseYear,
-		GenreTags:    compactGenreTags(input.GenreTags),
-		Rank:         rank,
-		Note:         strings.TrimSpace(input.Note),
-		StreamingURL: strings.TrimSpace(input.StreamingURL),
+		ID:                uuid.NewString(),
+		BatchID:           batchID,
+		Artist:            strings.TrimSpace(input.Artist),
+		Album:             strings.TrimSpace(input.Album),
+		Song:              strings.TrimSpace(input.Song),
+		CleanArtist:       cleanArtist,
+		CleanTitle:        cleanTitle,
+		StarterTrack:      strings.TrimSpace(input.StarterTrack),
+		ReleaseYear:       input.ReleaseYear,
+		GenreTags:         compactGenreTags(input.GenreTags),
+		Rank:              rank,
+		Note:              strings.TrimSpace(input.Note),
+		StreamingURL:      strings.TrimSpace(input.StreamingURL),
+		StreamingProvider: strings.TrimSpace(input.StreamingProvider),
+		StreamingAppURL:   strings.TrimSpace(input.StreamingAppURL),
 	}, nil
 }
 

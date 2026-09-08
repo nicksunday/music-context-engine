@@ -6,10 +6,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +22,14 @@ import (
 )
 
 type fakeRecommender struct {
-	draft RecommendationDraft
+	draft          RecommendationDraft
+	requestCapture *RecommendationRequest
 }
 
-func (fake fakeRecommender) Recommend(context.Context, RecommendationRequest, ProfileContext) (RecommendationDraft, error) {
+func (fake fakeRecommender) Recommend(_ context.Context, request RecommendationRequest, _ ProfileContext) (RecommendationDraft, error) {
+	if fake.requestCapture != nil {
+		*fake.requestCapture = request
+	}
 	return fake.draft, nil
 }
 
@@ -33,6 +40,190 @@ type fakeVerifier struct {
 type fakeLinkResolver struct {
 	urls map[string]string
 	errs map[string]error
+}
+
+type fakeSongLinkResolver struct {
+	link SongLink
+}
+
+type fakeAppleMusicPlaylistProvider struct {
+	tracks []AppleMusicTrack
+	result AppleMusicPlaylistResult
+	err    error
+}
+
+func (fake *fakeAppleMusicPlaylistProvider) ResolveTrack(_ context.Context, candidate database.RecommendationCandidateInput) (AppleMusicTrack, bool, error) {
+	if strings.TrimSpace(candidate.Song) == "missing" {
+		return AppleMusicTrack{}, false, nil
+	}
+	return AppleMusicTrack{Artist: candidate.Artist, Song: candidate.Song, ID: candidate.Song, URL: "https://music.apple.com/us/song/" + url.PathEscape(candidate.Song)}, true, nil
+}
+
+func (fake *fakeAppleMusicPlaylistProvider) CreatePlaylist(_ context.Context, _ string, tracks []AppleMusicTrack) (AppleMusicPlaylistResult, error) {
+	fake.tracks = append([]AppleMusicTrack(nil), tracks...)
+	if fake.err != nil {
+		return AppleMusicPlaylistResult{}, fake.err
+	}
+	return fake.result, nil
+}
+
+func (fake fakeSongLinkResolver) ResolveSong(context.Context, database.RecommendationCandidateInput) (SongLink, error) {
+	return fake.link, nil
+}
+
+func TestAppleMusicAppURLConvertsCanonicalDestination(t *testing.T) {
+	got := AppleMusicAppURL("https://music.apple.com/us/song/example/123")
+	if got != "itmss://music.apple.com/us/song/example/123" {
+		t.Fatalf("AppleMusicAppURL() = %q", got)
+	}
+	if got := AppleMusicAppURL("https://example.com/song/123"); got != "" {
+		t.Fatalf("AppleMusicAppURL(non-Apple Music URL) = %q, want empty", got)
+	}
+}
+
+func TestAppleMusicConfigEndpointFailsClosedWithoutDeveloperToken(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/apple-music/config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	var payload AppleMusicConfigResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Enabled || payload.DeveloperToken != "" {
+		t.Fatalf("payload = %#v, want disabled config without token", payload)
+	}
+}
+
+func TestAppleMusicConfigEndpointReturnsDeveloperTokenOnlyWhenConfigured(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{AppleMusicDeveloperToken: "test-developer-token"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/apple-music/config", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	var payload AppleMusicConfigResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Enabled || payload.DeveloperToken != "test-developer-token" {
+		t.Fatalf("payload = %#v, want configured token", payload)
+	}
+}
+
+func TestModeScopedBatchEndpointsDoNotCrossRecommendationTypes(t *testing.T) {
+	db := openWebTestDB(t)
+	album, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{
+		Prompt: "albums", Mode: "album", Candidates: []database.RecommendationCandidateInput{{Artist: "Album Artist", Album: "Album"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{
+		Prompt: "songs", Mode: "song", Candidates: []database.RecommendationCandidateInput{{Artist: "Song Artist", Album: "Album", Song: "Song"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(db.Ctx, Options{})
+	record := httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, "/api/batch/latest?mode=album", nil))
+	if record.Code != http.StatusOK {
+		t.Fatalf("latest status = %d", record.Code)
+	}
+	var latest BatchResponse
+	if err := json.NewDecoder(record.Body).Decode(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if latest.Batch == nil || latest.Batch.ID != album.ID {
+		t.Fatalf("latest album batch = %#v", latest.Batch)
+	}
+
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, "/api/batches?mode=song", nil))
+	if record.Code != http.StatusOK {
+		t.Fatalf("sessions status = %d", record.Code)
+	}
+	var sessions BatchesResponse
+	if err := json.NewDecoder(record.Body).Decode(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions.Batches) != 1 || sessions.Batches[0].Mode != "song" {
+		t.Fatalf("song sessions = %#v", sessions.Batches)
+	}
+}
+
+func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{})
+	for _, path := range []string{"/recommendations", "/recommendations/songs", "/recommendations/albums"} {
+		record := httptest.NewRecorder()
+		handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, path, nil))
+		if record.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", path, record.Code)
+		}
+		body := record.Body.String()
+		for _, expected := range []string{"Song Recommendations", "Album Recommendations", "/recommendations/songs", "/recommendations/albums"} {
+			if !strings.Contains(body, expected) {
+				t.Fatalf("GET %s body does not contain %q", path, expected)
+			}
+		}
+	}
+}
+
+func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
+	for name, expected := range map[string][]string{
+		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode="},
+		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice"},
+	} {
+		content, err := fs.ReadFile(staticFiles, name)
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", name, err)
+		}
+		for _, expectedValue := range expected {
+			if !strings.Contains(string(content), expectedValue) {
+				t.Fatalf("embedded %s does not contain %q", name, expectedValue)
+			}
+		}
+	}
+}
+
+func TestAppleMusicPlaylistEndpointResolvesAndDeduplicatesTracks(t *testing.T) {
+	db := openWebTestDB(t)
+	batch, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{
+		Prompt: "individual songs", Mode: "song", Candidates: []database.RecommendationCandidateInput{
+			{Artist: "Artist 1", Album: "Album 1", Song: "song-1"},
+			{Artist: "Artist 2", Album: "Album 2", Song: "missing"},
+			{Artist: "Artist 1", Album: "Album 1", Song: "song-1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &fakeAppleMusicPlaylistProvider{result: AppleMusicPlaylistResult{URL: "https://music.apple.com/us/playlist/test/1", Added: 1}}
+	handler := NewServer(db.Ctx, Options{AppleMusic: provider})
+	record := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/playlists/apple-music", bytes.NewBufferString(`{"batch_id":"`+batch.ID+`"}`))
+	handler.ServeHTTP(record, request)
+	if record.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", record.Code, record.Body.String())
+	}
+	if len(provider.tracks) != 1 || provider.tracks[0].Song != "song-1" {
+		t.Fatalf("provider tracks = %#v, want one ordered track", provider.tracks)
+	}
+	var response PlaylistResponse
+	if err := json.NewDecoder(record.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Partial || len(response.Skipped) != 2 {
+		t.Fatalf("response = %#v, want partial response with missing and duplicate skips", response)
+	}
 }
 
 func (fake fakeLinkResolver) Resolve(
@@ -64,6 +255,75 @@ type fakeReleaseRadar struct {
 	since       time.Time
 	until       time.Time
 	limit       int
+}
+
+func TestClampBatchLimitUsesModeSpecificMaximums(t *testing.T) {
+	tests := []struct {
+		name  string
+		mode  string
+		input int
+		want  int
+	}{
+		{name: "song accepts values above old maximum", mode: "song", input: 15, want: 15},
+		{name: "song caps at song maximum", mode: "song", input: 25, want: maxSongBatchLimit},
+		{name: "album retains album maximum", mode: "album", input: 25, want: maxAlbumBatchLimit},
+		{name: "empty mode is album", mode: "", input: 25, want: maxAlbumBatchLimit},
+		{name: "non-positive uses default", mode: "song", input: 0, want: defaultBatchLimit},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampBatchLimit(tt.mode, tt.input); got != tt.want {
+				t.Fatalf("clampBatchLimit(%q, %d) = %d, want %d", tt.mode, tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiscoveryCandidateFetchLimitUsesModeSpecificMaximums(t *testing.T) {
+	if got, want := discoveryCandidateFetchLimit("song", 15), 45; got != want {
+		t.Fatalf("song discovery fetch limit = %d, want %d", got, want)
+	}
+	if got, want := discoveryCandidateFetchLimit("album", 15), 30; got != want {
+		t.Fatalf("album discovery fetch limit = %d, want %d", got, want)
+	}
+}
+
+func TestRecommendationEndpointAcceptsSongLimitAboveTen(t *testing.T) {
+	db := openWebTestDB(t)
+	var captured RecommendationRequest
+	candidates := make([]database.RecommendationCandidateInput, 15)
+	for idx := range candidates {
+		candidates[idx] = database.RecommendationCandidateInput{
+			Artist:       "Artist " + strconv.Itoa(idx),
+			Album:        "Album " + strconv.Itoa(idx),
+			StarterTrack: "Track " + strconv.Itoa(idx),
+			Song:         "Track " + strconv.Itoa(idx),
+		}
+	}
+	handler := NewServer(db.Ctx, Options{
+		Recommender: fakeRecommender{
+			draft:          RecommendationDraft{Reply: "Try these songs.", Candidates: candidates},
+			requestCapture: &captured,
+		},
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"message":"give me many individual songs","mode":"song","limit":15}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+	}
+	if captured.Mode != "song" || captured.Limit != 15 {
+		t.Fatalf("captured request = %#v, want song mode with limit 15", captured)
+	}
+	var payload RecommendationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Batch.Candidates) != 15 {
+		t.Fatalf("candidate count = %d, want 15", len(payload.Batch.Candidates))
+	}
 }
 
 func (fake *fakeDiscoveryProvider) Discover(
@@ -1363,6 +1623,38 @@ func TestRecommendationEndpointResolvesAndPersistsStreamingURLs(t *testing.T) {
 	}
 }
 
+func TestRecommendationEndpointSupportsSongMode(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{
+		Recommender: fakeRecommender{draft: RecommendationDraft{
+			Reply: "Try these songs.",
+			Candidates: []database.RecommendationCandidateInput{{
+				Artist: "Jungle", Album: "Volcano", StarterTrack: "Candle Flame",
+			}},
+		}},
+		SongLinkResolver: fakeSongLinkResolver{link: SongLink{
+			URL: "https://www.youtube.com/results?search_query=Jungle+Candle+Flame", Provider: "youtube",
+		}},
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"message":"give me individual songs","mode":"song","limit":1}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", response.Code, response.Body.String())
+	}
+	var payload RecommendationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Batch.Mode != "song" || payload.Batch.Candidates[0].Song != "Candle Flame" {
+		t.Fatalf("song batch = %#v, want song mode and Candle Flame", payload.Batch)
+	}
+	if payload.Batch.Candidates[0].StreamingProvider != "youtube" {
+		t.Fatalf("provider = %q, want youtube", payload.Batch.Candidates[0].StreamingProvider)
+	}
+}
+
 func TestRecommendationEndpointDegradesWhenLinkLookupFails(t *testing.T) {
 	db := openWebTestDB(t)
 	handler := NewServer(db.Ctx, Options{
@@ -1505,6 +1797,48 @@ func TestAppleMusicLinkerDegradesOnLookupFailures(t *testing.T) {
 	unconfigured := &AppleMusicLinker{}
 	if got, err := unconfigured.Resolve(context.Background(), database.RecommendationCandidateInput{Artist: "Jungle", Album: "Volcano"}); err != nil || got != "" {
 		t.Fatalf("Resolve() with no client = %q, %v; want empty, nil", got, err)
+	}
+}
+
+func TestAppleMusicLinkerResolvesMatchingSong(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Query().Get("entity") != "song" {
+			t.Fatalf("entity query = %q, want song", request.URL.Query().Get("entity"))
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"results":[
+			{"artistName":"Jungle","trackName":"Other Song","trackViewUrl":"https://music.apple.com/us/song/other/1"},
+			{"artistName":"Jungle","trackName":"Candle Flame","trackViewUrl":"https://music.apple.com/us/song/candle-flame/2"}
+		]}`))
+	}))
+	defer upstream.Close()
+
+	linker := &AppleMusicLinker{baseURL: upstream.URL + "/search", client: upstream.Client()}
+	link, err := linker.ResolveSong(context.Background(), database.RecommendationCandidateInput{
+		Artist: "Jungle",
+		Song:   "Candle Flame",
+	})
+	if err != nil {
+		t.Fatalf("ResolveSong() error = %v", err)
+	}
+	if link.URL != "https://music.apple.com/us/song/candle-flame/2" || link.Provider != "apple_music" {
+		t.Fatalf("ResolveSong() = %#v, want matching Apple Music link", link)
+	}
+}
+
+func TestFallbackSongLinkResolverUsesYouTubeWhenAppleMusicMisses(t *testing.T) {
+	link, err := (FallbackSongLinkResolver{
+		AppleMusic: &AppleMusicLinker{},
+		YouTube:    YouTubeSongLinker{},
+	}).ResolveSong(context.Background(), database.RecommendationCandidateInput{
+		Artist: "Unknown Artist",
+		Song:   "Rare Song",
+	})
+	if err != nil {
+		t.Fatalf("ResolveSong() error = %v", err)
+	}
+	if link.Provider != "youtube" || !strings.Contains(link.URL, "youtube.com/results?search_query=") {
+		t.Fatalf("ResolveSong() = %#v, want YouTube fallback", link)
 	}
 }
 

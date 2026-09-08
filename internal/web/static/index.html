@@ -27,7 +27,7 @@
       </details>
 
       <details class="panel" open>
-        <summary>Previous Sessions</summary>
+        <summary id="sessionHeading">Album Sessions</summary>
         <div id="sessionList" class="stack compact"></div>
       </details>
     </aside>
@@ -35,11 +35,22 @@
     <section class="workspace">
       <header class="toolbar">
         <div>
-          <h2>Recommendation Engine</h2>
-          <p>MCP-verified album batches with feedback written to the local database.</p>
+          <h2 id="pageTitle">Recommendation Engine</h2>
+          <p id="pageDescription">Choose a recommendation workflow or generate a verified batch.</p>
         </div>
         <button id="refreshContext" class="button secondary" type="button">Refresh</button>
       </header>
+
+      <nav class="recommendation-nav" aria-label="Recommendation navigation">
+        <a href="/recommendations" data-mode="entry">Recommendation Engine</a>
+        <a href="/recommendations/songs" data-mode="song">Song Recommendations</a>
+        <a href="/recommendations/albums" data-mode="album">Album Recommendations</a>
+      </nav>
+
+      <section id="modeChooser" class="mode-chooser" hidden>
+        <a class="mode-choice" href="/recommendations/songs"><strong>Discover Songs</strong><span>Compact track recommendations with quick feedback.</span></a>
+        <a class="mode-choice" href="/recommendations/albums"><strong>Explore Albums</strong><span>Rich album cards with album-level context and feedback.</span></a>
+      </section>
 
       <form id="promptForm" class="composer">
         <div class="field-grid">

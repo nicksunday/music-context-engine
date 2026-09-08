@@ -171,7 +171,7 @@ func registerTools(s *server.MCPServer, db *sql.DB, discovery discoverySource, s
 
 	s.AddTool(
 		mcpsdk.NewTool(logAlbumRatingToolName,
-			mcpsdk.WithDescription("Persist a local album rating directly to albums.user_rating using Specification 07 clean key normalization; insert a UUID-backed album row if absent."),
+			mcpsdk.WithDescription("Persist a local album rating directly to albums.user_rating using the string-normalization clean-key rule; insert a UUID-backed album row if absent."),
 			mcpsdk.WithString("artist",
 				mcpsdk.Required(),
 				mcpsdk.Description("The album artist name. The server normalizes by lowercasing, converting & to and, and stripping punctuation."),

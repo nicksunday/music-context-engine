@@ -64,6 +64,8 @@ Rather than relying on LLMs to blind-guess music recommendations and validating 
 
 ## Technical Stack & Layout
 
+Song recommendations remain link-based: they expose direct Apple Music or YouTube destinations and do not require browser authorization or playlist creation.
+
 * **Language:** Go 1.25.5
 * **Database:** Embedded SQLite (`data/music_vault.db`) via `mattn/go-sqlite3` with strict Unicode normalization for clean search indexing.
 * **Protocol Interface:** `mark3labs/mcp-go` exposing local context tools via `stdin`/`stdout`. This includes semantic discovery routing (`get_verified_discovery_candidates`), structural taste mapping (`get_taste_adjacencies`), and local metadata/recommendation logging (`log_album_rating`, `log_recommendation_feedback`).

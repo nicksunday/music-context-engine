@@ -2,6 +2,12 @@ const state = {
   context: null,
   currentBatch: null,
   sessions: [],
+  mode: (() => {
+    const path = window.location.pathname.replace(/\/+$/, "") || "/";
+    if (path === "/recommendations/songs") return "song";
+    if (path === "/recommendations/albums") return "album";
+    return "entry";
+  })(),
 };
 
 const verdictLabels = {
@@ -28,6 +34,10 @@ const elements = {
   statusLine: document.querySelector("#statusLine"),
   message: document.querySelector("#message"),
   mood: document.querySelector("#mood"),
+  pageTitle: document.querySelector("#pageTitle"),
+  pageDescription: document.querySelector("#pageDescription"),
+  sessionHeading: document.querySelector("#sessionHeading"),
+  modeChooser: document.querySelector("#modeChooser"),
 };
 
 async function api(path, options = {}) {
@@ -50,6 +60,23 @@ async function loadContext() {
   setStatus("");
 }
 
+function openAppleMusic(url, appURL) {
+  if (!url) return;
+  const isMacDesktop = /Macintosh|Mac OS X/i.test(navigator.userAgent) && !/Mobile|iPhone|iPad/i.test(navigator.userAgent);
+  if (!isMacDesktop || !appURL) {
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  const fallback = window.setTimeout(() => window.open(url, "_blank", "noopener"), 900);
+  const cancelFallback = () => window.clearTimeout(fallback);
+  window.addEventListener("blur", cancelFallback, { once: true });
+  const frame = document.createElement("iframe");
+  frame.hidden = true;
+  frame.src = appURL;
+  document.body.append(frame);
+  window.setTimeout(() => frame.remove(), 1500);
+}
+
 async function loadRail() {
   renderRows(elements.releaseList, [], () => ({}), "Loading releases");
   const rail = await api("/api/rail");
@@ -57,12 +84,17 @@ async function loadRail() {
 }
 
 async function loadLatestBatch() {
-  const response = await api("/api/batch/latest");
+  if (state.mode === "entry") return setCurrentBatch(null);
+  const response = await api(`/api/batch/latest?mode=${encodeURIComponent(state.mode)}`);
   setCurrentBatch(response.batch);
 }
 
 async function loadSessions() {
-  const response = await api("/api/batches");
+  if (state.mode === "entry") {
+    state.sessions = [];
+    return renderSessions([]);
+  }
+  const response = await api(`/api/batches?mode=${encodeURIComponent(state.mode)}`);
   state.sessions = response.batches || [];
   renderSessions(state.sessions);
 }
@@ -70,7 +102,7 @@ async function loadSessions() {
 async function loadSession(session) {
   setStatus("Loading session");
   try {
-    const response = await api(`/api/batch?id=${encodeURIComponent(session.id)}`);
+    const response = await api(`/api/batch?id=${encodeURIComponent(session.id)}&mode=${encodeURIComponent(state.mode)}`);
     setCurrentBatch(response.batch);
   } catch (error) {
     // Partial recovery (D3): restore the prompt client-side and surface an
@@ -129,7 +161,7 @@ function renderSessions(sessions) {
     const prompt = document.createElement("strong");
     prompt.textContent = session.prompt || "Untitled prompt";
     const meta = document.createElement("span");
-    meta.textContent = [formatSessionDate(session.created_at), `${session.candidate_count || 0} albums`].join(" · ");
+    meta.textContent = [formatSessionDate(session.created_at), `${session.candidate_count || 0} ${session.mode === "song" ? "songs" : "albums"}`].join(" · ");
     const reply = document.createElement("span");
     reply.className = "session-reply";
     reply.textContent = session.reply || "";
@@ -233,6 +265,7 @@ async function submitPrompt(event) {
     mood: String(form.get("mood") || "").trim(),
     avoid: String(form.get("avoid") || "").trim(),
     limit: Number(form.get("limit") || 6),
+    mode: state.mode === "song" ? "song" : "album",
   };
   if (!request.message) return;
 
@@ -259,28 +292,44 @@ async function submitPrompt(event) {
 
 function renderBatch(batch) {
   elements.candidateList.replaceChildren();
+  elements.candidateList.classList.toggle("song-list", batch?.mode === "song");
   if (!batch || !batch.candidates || batch.candidates.length === 0) {
     elements.batchMeta.textContent = "No current batch";
     elements.candidateList.append(emptyNode("No current batch"));
     return;
   }
   const count = batch.candidates.length;
-  elements.batchMeta.textContent = `${count} album${count === 1 ? "" : "s"} from the latest verified discovery run`;
+  const isSongBatch = batch.mode === "song";
+  elements.batchMeta.textContent = `${count} ${isSongBatch ? "song" : "album"}${count === 1 ? "" : "s"} from the latest verified discovery run`;
   for (const candidate of batch.candidates) {
+    if (isSongBatch) {
+      renderSongCandidate(candidate);
+      continue;
+    }
     const card = document.createElement("article");
     card.className = "candidate";
     card.dataset.candidateId = candidate.id;
 
     const title = document.createElement("h3");
     if (candidate.streaming_url) {
-      const link = document.createElement("a");
-      link.href = candidate.streaming_url;
-      link.target = "_blank";
-      link.rel = "noopener";
-      link.textContent = candidate.album;
-      title.append(link);
+      if (isSongBatch) {
+        const appLink = document.createElement("button");
+        appLink.type = "button";
+        appLink.className = "app-link";
+        appLink.textContent = candidate.song || candidate.starter_track || "Open in Apple Music";
+        appLink.title = "Open in Apple Music";
+        appLink.addEventListener("click", () => openAppleMusic(candidate.streaming_url, candidate.streaming_app_url));
+        title.append(appLink);
+      } else {
+        const link = document.createElement("a");
+        link.href = candidate.streaming_url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = candidate.album;
+        title.append(link);
+      }
     } else {
-      title.textContent = candidate.album;
+      title.textContent = isSongBatch ? (candidate.song || candidate.starter_track || "Untitled song") : candidate.album;
     }
     const artist = document.createElement("div");
     artist.className = "meta";
@@ -290,7 +339,7 @@ function renderBatch(batch) {
     const starterLabel = document.createElement("span");
     starterLabel.textContent = "Matched track";
     const starterValue = document.createElement("strong");
-    starterValue.textContent = candidate.starter_track || "No matched track";
+    starterValue.textContent = isSongBatch ? (candidate.album || "No album context") : (candidate.starter_track || "No matched track");
     starter.append(starterLabel, starterValue);
     const note = document.createElement("div");
     note.className = "note";
@@ -321,6 +370,50 @@ function renderBatch(batch) {
     card.append(buttons);
     elements.candidateList.append(card);
   }
+}
+
+function renderSongCandidate(candidate) {
+  const row = document.createElement("article");
+  row.className = "song-row";
+  row.dataset.candidateId = candidate.id;
+  const identity = document.createElement("div");
+  identity.className = "song-identity";
+  const title = document.createElement("h3");
+  title.textContent = candidate.song || candidate.starter_track || "Untitled song";
+  const artist = document.createElement("div");
+  artist.className = "meta";
+  artist.textContent = [candidate.artist, candidate.album].filter(Boolean).join(" · ");
+  identity.append(title, artist);
+  const actions = document.createElement("div");
+  actions.className = "song-actions";
+  if (candidate.streaming_url) {
+    const link = document.createElement("a");
+    link.href = candidate.streaming_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Open song";
+    actions.append(link);
+  }
+  for (const [verdict, label] of [["good", "Liked"], ["disliked", "Disliked"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button secondary song-feedback";
+    button.textContent = label;
+    button.addEventListener("click", () => logCandidateFeedback(candidate, verdict, button));
+    actions.append(button);
+  }
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "button secondary song-feedback";
+  dismiss.textContent = "Not Today";
+  dismiss.addEventListener("click", () => {
+    row.remove();
+    state.currentBatch.candidates = state.currentBatch.candidates.filter(item => item.id !== candidate.id);
+    setStatus("Removed for now");
+  });
+  actions.append(dismiss);
+  row.append(identity, actions);
+  elements.candidateList.append(row);
 }
 
 async function logCandidateFeedback(candidate, verdict, button) {
@@ -393,6 +486,23 @@ function formatSessionDate(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function configureMode() {
+  const labels = {
+    entry: ["Recommendation Engine", "Choose a recommendation workflow or generate a verified batch."],
+    song: ["Song Recommendations", "Discover individual tracks in a compact list with quick feedback."],
+    album: ["Album Recommendations", "Explore verified albums with richer context and album-level feedback."],
+  };
+  const [title, description] = labels[state.mode];
+  elements.pageTitle.textContent = title;
+  elements.pageDescription.textContent = description;
+  elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : "Album Sessions";
+  elements.modeChooser.hidden = state.mode !== "entry";
+  document.querySelectorAll(".recommendation-nav a").forEach(link => {
+    link.classList.toggle("active", link.dataset.mode === state.mode);
+  });
+  elements.promptForm.hidden = state.mode === "entry";
+}
+
 async function refreshAll() {
   await Promise.all([loadContext(), loadRail(), loadLatestBatch(), loadSessions()]);
 }
@@ -401,6 +511,7 @@ elements.promptForm.addEventListener("submit", submitPrompt);
 elements.quickFeedback.addEventListener("submit", submitQuickFeedback);
 elements.refreshContext.addEventListener("click", () => refreshAll().catch((error) => appendMessage("error", error.message)));
 
+configureMode();
 renderBatch(null);
 renderSessions([]);
 refreshAll().catch((error) => appendMessage("error", error.message));

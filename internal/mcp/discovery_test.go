@@ -662,6 +662,40 @@ func TestMusicBrainzDiscoveryPrefersReleaseGroupGenresInCandidate(t *testing.T) 
 	}
 }
 
+func TestMusicBrainzDiscoverySearchSongsSkipsReleaseGroupLookup(t *testing.T) {
+	var requestCount int
+	sourceServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestCount++
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path != "/recording" {
+			t.Fatalf("request path = %q, want /recording", request.URL.Path)
+		}
+		_, _ = writer.Write([]byte(`{"recordings":[{
+			"title":"Song Result","length":180000,"first-release-date":"2020-01-01",
+			"artist-credit":[{"name":"Example Artist"}],
+			"releases":[{"title":"Example Album","status":"Official","date":"2020-01-01",
+			"release-group":{"id":"release-group-song","primary-type":"Album"}}]
+		}]}`))
+	}))
+	defer sourceServer.Close()
+
+	source := newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{
+		HTTPClient: sourceServer.Client(),
+		BaseURL:    sourceServer.URL,
+		Timeout:    time.Second,
+	})
+	candidates, err := source.SearchSongs(context.Background(), []string{"power metal"}, nil, 5)
+	if err != nil {
+		t.Fatalf("SearchSongs() error = %v", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("MusicBrainz request count = %d, want recording search only", requestCount)
+	}
+	if len(candidates) != 1 || candidates[0].TrackName != "Song Result" {
+		t.Fatalf("SearchSongs() = %#v, want one verified song candidate", candidates)
+	}
+}
+
 func TestMusicBrainzDiscoveryClientAppliesTimeoutContext(t *testing.T) {
 	deadlineRemaining := make(chan time.Duration, 1)
 	httpClient := &http.Client{

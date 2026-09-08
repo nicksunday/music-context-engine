@@ -4,6 +4,34 @@ Defines how the current recommendation batch links recommended albums out to a s
 
 ## Requirements
 
+### Requirement: Resolve recommended songs with provider-aware links
+
+In addition to album candidates, the streaming-link capability SHALL resolve song candidates using the verified artist and song title. Apple Music song results SHALL be accepted only when artist and title match the candidate under the project's normalization rules. A fallback destination MAY be supplied by YouTube when Apple Music has no accepted match, and the response SHALL identify the provider for every non-empty URL.
+
+#### Scenario: Matching Apple Music song is accepted
+- **WHEN** Apple Music returns a song whose artist and title match the verified candidate
+- **THEN** the candidate receives that song's Apple Music URL and identifies Apple Music as its provider
+
+#### Scenario: YouTube fallback is assigned
+- **WHEN** Apple Music has no accepted match and a verified artist/title pair is available
+- **THEN** the candidate receives a YouTube destination identified as YouTube
+
+#### Scenario: No provider destination is available
+- **WHEN** neither provider yields a destination
+- **THEN** the candidate remains valid without a URL or provider value
+
+### Requirement: Render song destinations without regressing album links
+
+The web recommendation surface MUST render a song title as a clickable link when a destination URL is present, opening it in a new browser tab with the existing safe external-link attributes. It MUST render song text without a link when no destination exists, and MUST preserve the existing album-title link behavior.
+
+#### Scenario: Song title links to its destination
+- **WHEN** a song candidate contains a streaming URL
+- **THEN** the song title opens that URL in a new browser tab
+
+#### Scenario: Existing album link remains available
+- **WHEN** an album candidate contains an Apple Music URL
+- **THEN** the album title remains a link to the album page
+
 ### Requirement: Resolve recommended albums to Apple Music album URLs
 When a recommendation batch is generated, each candidate album SHALL be looked up against the streaming link service using the candidate's artist and album title. For Apple Music, the lookup targets the iTunes Search API (`entity=album`) for the artist and album concatenated as the search term. A result is accepted only when the returned artist and album match the candidate under the project's string-normalization rules (artist exact, album title equivalent). Candidates with no accepted match MUST NOT carry a streaming URL.
 

@@ -65,6 +65,10 @@ type VerifiedDiscoveryQuery struct {
 	FallbackTags []string
 	SeedArtists  []string
 	Limit        int
+	// SkipAlbumGenreReconciliation avoids release-group lookups when the caller
+	// only needs recording-level song candidates. Album discovery keeps the
+	// default false value so its album-level genre safeguards are unchanged.
+	SkipAlbumGenreReconciliation bool
 }
 
 type VerifiedDiscoveryResult struct {
@@ -83,6 +87,10 @@ type discoverySource interface {
 // real compositional adjacency rather than only guessed genre tags.
 type artistSeededDiscoverySource interface {
 	SearchWithSeeds(context.Context, []string, []string, int) ([]DiscoveryCandidate, error)
+}
+
+type songDiscoverySource interface {
+	SearchSongs(context.Context, []string, []string, int) ([]DiscoveryCandidate, error)
 }
 
 type musicBrainzDiscoveryConfig struct {
@@ -240,7 +248,7 @@ func getVerifiedDiscoveryCandidatesFromSource(
 		return VerifiedDiscoveryResult{}, fmt.Errorf("build discovery exclusion list: %w", err)
 	}
 
-	candidates, err := getVerifiedDiscoveryCandidatesSeeded(ctx, source, searchTags, compactStrings(query.SeedArtists), limit, exclusions)
+	candidates, err := getVerifiedDiscoveryCandidatesSeededWithOptions(ctx, source, searchTags, compactStrings(query.SeedArtists), limit, exclusions, query.SkipAlbumGenreReconciliation)
 	if err != nil {
 		return VerifiedDiscoveryResult{}, err
 	}
@@ -259,7 +267,7 @@ func getVerifiedDiscoveryCandidates(
 	limit int,
 	exclusions database.AlbumExclusionSet,
 ) ([]DiscoveryCandidate, error) {
-	return getVerifiedDiscoveryCandidatesSeeded(ctx, source, searchTags, nil, limit, exclusions)
+	return getVerifiedDiscoveryCandidatesSeededWithOptions(ctx, source, searchTags, nil, limit, exclusions, false)
 }
 
 func getVerifiedDiscoveryCandidatesSeeded(
@@ -269,6 +277,18 @@ func getVerifiedDiscoveryCandidatesSeeded(
 	seedArtists []string,
 	limit int,
 	exclusions database.AlbumExclusionSet,
+) ([]DiscoveryCandidate, error) {
+	return getVerifiedDiscoveryCandidatesSeededWithOptions(ctx, source, searchTags, seedArtists, limit, exclusions, false)
+}
+
+func getVerifiedDiscoveryCandidatesSeededWithOptions(
+	ctx context.Context,
+	source discoverySource,
+	searchTags []string,
+	seedArtists []string,
+	limit int,
+	exclusions database.AlbumExclusionSet,
+	skipAlbumGenreReconciliation bool,
 ) ([]DiscoveryCandidate, error) {
 	if source == nil {
 		return nil, fmt.Errorf("discovery source is required")
@@ -287,7 +307,13 @@ func getVerifiedDiscoveryCandidatesSeeded(
 	cleanSeeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
 
 	var liveCandidates []DiscoveryCandidate
-	if seeded, ok := source.(artistSeededDiscoverySource); ok && len(cleanSeeds) > 0 {
+	if skipAlbumGenreReconciliation {
+		if songSource, ok := source.(songDiscoverySource); ok {
+			liveCandidates, err = songSource.SearchSongs(ctx, cleanTags, cleanSeeds, discoverySearchLimit(limit))
+		} else {
+			liveCandidates, err = source.Search(ctx, cleanTags, discoverySearchLimit(limit))
+		}
+	} else if seeded, ok := source.(artistSeededDiscoverySource); ok && len(cleanSeeds) > 0 {
 		liveCandidates, err = seeded.SearchWithSeeds(ctx, cleanTags, cleanSeeds, discoverySearchLimit(limit))
 	} else {
 		liveCandidates, err = source.Search(ctx, cleanTags, discoverySearchLimit(limit))
@@ -423,6 +449,29 @@ func (client *musicBrainzDiscoveryClient) Search(
 	return client.reconcileAlbumGenres(ctx, candidates, cleanTags), nil
 }
 
+// SearchSongs performs the same bounded recording searches as seeded album
+// discovery but deliberately skips release-group genre reconciliation. The
+// recording search already returns verified title/artist/release metadata, and
+// song mode does not need album-level genre validation. Avoiding one lookup per
+// distinct release group substantially reduces MusicBrainz load for song
+// batches.
+func (client *musicBrainzDiscoveryClient) SearchSongs(
+	ctx context.Context,
+	searchTags []string,
+	seedArtists []string,
+	limit int,
+) ([]DiscoveryCandidate, error) {
+	cleanTags, err := normalizeDiscoveryTags(searchTags)
+	if err != nil {
+		return nil, err
+	}
+	recordings, err := client.searchSeededRecordings(ctx, cleanTags, seedArtists, limit)
+	if err != nil {
+		return nil, err
+	}
+	return parseMusicBrainzCandidates(recordings), nil
+}
+
 // SearchWithSeeds anchors discovery on real similar-artist names in addition to
 // genre tags. Artist-seeded results ground abstract prompts in compositional
 // adjacency rather than only guessed tags; the genre-tag search is retained as a
@@ -438,13 +487,31 @@ func (client *musicBrainzDiscoveryClient) SearchWithSeeds(
 		return nil, fmt.Errorf("MusicBrainz discovery client is not initialized")
 	}
 
+	cleanTags, _ := normalizeDiscoveryTags(searchTags)
+	recordings, err := client.searchSeededRecordings(ctx, cleanTags, seedArtists, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(recordings) == 0 {
+		return nil, nil
+	}
+	candidates := parseMusicBrainzCandidates(recordings)
+	if len(cleanTags) == 0 {
+		return candidates, nil
+	}
+	return client.reconcileAlbumGenres(ctx, candidates, cleanTags), nil
+}
+
+func (client *musicBrainzDiscoveryClient) searchSeededRecordings(
+	ctx context.Context,
+	cleanTags []string,
+	seedArtists []string,
+	limit int,
+) ([]musicBrainzRecording, error) {
 	seeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
 	if len(seeds) == 0 {
-		return client.Search(ctx, searchTags, limit)
+		return client.searchTagRecordings(ctx, cleanTags, limit)
 	}
-
-	cleanTags, _ := normalizeDiscoveryTags(searchTags)
-
 	seen := make(map[string]bool)
 	var recordings []musicBrainzRecording
 	addRecording := func(rec musicBrainzRecording) {
@@ -483,17 +550,7 @@ func (client *musicBrainzDiscoveryClient) SearchWithSeeds(
 		}
 	}
 
-	if len(recordings) == 0 {
-		return nil, nil
-	}
-	candidates := parseMusicBrainzCandidates(recordings)
-	// Release-group genre reconciliation only discards candidates when tags are
-	// actually being searched. Artist-anchored results without tags should be
-	// preserved as-is rather than dropped for an empty genre match.
-	if len(cleanTags) == 0 {
-		return candidates, nil
-	}
-	return client.reconcileAlbumGenres(ctx, candidates, cleanTags), nil
+	return recordings, nil
 }
 
 func (client *musicBrainzDiscoveryClient) searchTagRecordings(

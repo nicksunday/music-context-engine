@@ -102,6 +102,7 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		prompt TEXT,
 		mood TEXT,
 		notes TEXT,
+		mode TEXT,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -110,12 +111,14 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
 		artist TEXT NOT NULL,
 		album TEXT NOT NULL,
+		song TEXT,
 		clean_artist TEXT NOT NULL,
 		clean_title TEXT NOT NULL,
 		starter_track TEXT,
 		release_year INTEGER,
 		genre_tags TEXT,
 		streaming_url TEXT,
+		streaming_app_url TEXT,
 		rank INTEGER,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -235,6 +238,12 @@ func ensureAlignedSchema(db *sql.DB) error {
 	if err := ensureRecommendationSchema(db); err != nil {
 		return err
 	}
+	if err := ensureRecommendationBatchModeColumn(db); err != nil {
+		return err
+	}
+	if err := ensureRecommendationSongColumns(db); err != nil {
+		return err
+	}
 	if err := ensureRecommendationStreamingURLColumn(db); err != nil {
 		return err
 	}
@@ -345,6 +354,7 @@ func ensureRecommendationSchema(db *sql.DB) error {
 			prompt TEXT,
 			mood TEXT,
 			notes TEXT,
+			mode TEXT,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 
@@ -353,12 +363,15 @@ func ensureRecommendationSchema(db *sql.DB) error {
 			batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
 			artist TEXT NOT NULL,
 			album TEXT NOT NULL,
+			song TEXT,
 			clean_artist TEXT NOT NULL,
 			clean_title TEXT NOT NULL,
 			starter_track TEXT,
 			release_year INTEGER,
 			genre_tags TEXT,
 			streaming_url TEXT,
+			streaming_provider TEXT,
+			streaming_app_url TEXT,
 			rank INTEGER,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
@@ -383,6 +396,20 @@ func ensureRecommendationSchema(db *sql.DB) error {
 	return nil
 }
 
+func ensureRecommendationBatchModeColumn(db *sql.DB) error {
+	exists, err := columnExists(db, "recommendation_batches", "mode")
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if _, err := db.Exec("ALTER TABLE recommendation_batches ADD COLUMN mode TEXT"); err != nil {
+		return fmt.Errorf("failed to add recommendation_batches.mode column: %w", err)
+	}
+	return nil
+}
+
 func ensureRecommendationStreamingURLColumn(db *sql.DB) error {
 	exists, err := columnExists(db, "recommendation_candidates", "streaming_url")
 	if err != nil {
@@ -394,6 +421,22 @@ func ensureRecommendationStreamingURLColumn(db *sql.DB) error {
 
 	if _, err := db.Exec("ALTER TABLE recommendation_candidates ADD COLUMN streaming_url TEXT"); err != nil {
 		return fmt.Errorf("failed to add recommendation_candidates.streaming_url column: %w", err)
+	}
+	return nil
+}
+
+func ensureRecommendationSongColumns(db *sql.DB) error {
+	for _, name := range []string{"song", "streaming_provider", "streaming_app_url"} {
+		exists, err := columnExists(db, "recommendation_candidates", name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf("ALTER TABLE recommendation_candidates ADD COLUMN %s TEXT", name)); err != nil {
+			return fmt.Errorf("failed to add recommendation_candidates.%s column: %w", name, err)
+		}
 	}
 	return nil
 }
