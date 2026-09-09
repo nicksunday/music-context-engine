@@ -158,6 +158,108 @@ func TestModeScopedBatchEndpointsDoNotCrossRecommendationTypes(t *testing.T) {
 	}
 }
 
+func TestPromptFitEndpointPersistsAndClearsCandidateState(t *testing.T) {
+	db := openWebTestDB(t)
+	batch, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "request", Candidates: []database.RecommendationCandidateInput{{Artist: "Artist", Album: "Album"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	body := `{"batch_id":"` + batch.ID + `","candidate_id":"` + batch.Candidates[0].ID + `","verdict":"missed","reason":"wrong_genre","notes":"not what I asked for"}`
+	record := httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodPost, "/api/prompt-fit", bytes.NewBufferString(body)))
+	if record.Code != http.StatusOK {
+		t.Fatalf("save status = %d, body = %s", record.Code, record.Body.String())
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, "/api/batch?id="+url.QueryEscape(batch.ID), nil))
+	if record.Code != http.StatusOK {
+		t.Fatalf("batch status = %d", record.Code)
+	}
+	var response BatchResponse
+	if err := json.NewDecoder(record.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Batch == nil || response.Batch.Candidates[0].PromptFit == nil || response.Batch.Candidates[0].PromptFit.Verdict != "missed" {
+		t.Fatalf("batch response = %#v", response.Batch)
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodDelete, "/api/prompt-fit", bytes.NewBufferString(`{"batch_id":"`+batch.ID+`","candidate_id":"`+batch.Candidates[0].ID+`"}`)))
+	if record.Code != http.StatusOK {
+		t.Fatalf("clear status = %d, body = %s", record.Code, record.Body.String())
+	}
+}
+
+func TestPromptFitEndpointRejectsMismatchedBatch(t *testing.T) {
+	db := openWebTestDB(t)
+	first, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "first", Candidates: []database.RecommendationCandidateInput{{Artist: "Artist", Album: "Album"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "second", Candidates: []database.RecommendationCandidateInput{{Artist: "Other", Album: "Other"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	record := httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodPost, "/api/prompt-fit", bytes.NewBufferString(`{"batch_id":"`+second.ID+`","candidate_id":"`+first.Candidates[0].ID+`","verdict":"met"}`)))
+	if record.Code != http.StatusBadRequest || !strings.Contains(record.Body.String(), "does not belong") {
+		t.Fatalf("status = %d, body = %s", record.Code, record.Body.String())
+	}
+}
+
+func TestExportReviewAndDownloadUsePortableApprovedPayloads(t *testing.T) {
+	db := openWebTestDB(t)
+	batch, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "export request", Candidates: []database.RecommendationCandidateInput{{Artist: "Artist", Album: "Album", Song: "Song"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fit, err := database.SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, database.RecommendationPromptFitFeedbackInput{BatchID: batch.ID, CandidateID: batch.Candidates[0].ID, Verdict: "met"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	record := httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, "/api/export/review", nil))
+	if record.Code != http.StatusOK || !strings.Contains(record.Body.String(), fit.ID) {
+		t.Fatalf("review status = %d, body = %s", record.Code, record.Body.String())
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, "/api/export/example?feedback_id="+url.QueryEscape(fit.ID), nil))
+	if record.Code != http.StatusOK || strings.Contains(record.Body.String(), batch.Candidates[0].ID) || strings.Contains(record.Body.String(), "clean_artist") {
+		t.Fatalf("portable example leaked local fields: status=%d body=%s", record.Code, record.Body.String())
+	}
+	var example database.RecommendationExportExample
+	if err := json.NewDecoder(record.Body).Decode(&example); err != nil {
+		t.Fatal(err)
+	}
+	redacted := example
+	redacted.Request = "redacted request"
+	payload, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodPost, "/api/export/draft", bytes.NewReader(append([]byte(`{"feedback_id":"`+fit.ID+`","payload":`), append(payload, '}')...))))
+	if record.Code != http.StatusOK {
+		t.Fatalf("draft status = %d body=%s", record.Code, record.Body.String())
+	}
+	var draft database.RecommendationExportDraft
+	if err := json.NewDecoder(record.Body).Decode(&draft); err != nil {
+		t.Fatal(err)
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodPost, "/api/export/approve", bytes.NewBufferString(`{"draft_id":"`+draft.ID+`"}`)))
+	if record.Code != http.StatusOK {
+		t.Fatalf("approve status = %d body=%s", record.Code, record.Body.String())
+	}
+	record = httptest.NewRecorder()
+	handler.ServeHTTP(record, httptest.NewRequest(http.MethodPost, "/api/export/download", bytes.NewBufferString(`{"draft_ids":["`+draft.ID+`"]}`)))
+	if record.Code != http.StatusOK || !strings.Contains(record.Body.String(), "redacted request") || strings.Contains(record.Body.String(), batch.Candidates[0].ID) {
+		t.Fatalf("download status = %d body=%s", record.Code, record.Body.String())
+	}
+}
+
 func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 	db := openWebTestDB(t)
 	handler := NewServer(db.Ctx, Options{})
@@ -180,7 +282,7 @@ func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *test
 	for name, expected := range map[string][]string{
 		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
 		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt"},
-		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
+		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
 		if err != nil {

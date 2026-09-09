@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/nicksunday/music-context-platform/internal/database"
 	"github.com/nicksunday/music-context-platform/internal/enrich"
+	"github.com/nicksunday/music-context-platform/internal/evaluation"
 	"github.com/nicksunday/music-context-platform/internal/ingest"
 	mcpserver "github.com/nicksunday/music-context-platform/internal/mcp"
 	webserver "github.com/nicksunday/music-context-platform/internal/web"
@@ -60,9 +62,74 @@ func main() {
 		runServe(os.Args[2:])
 	case "web":
 		runWeb(os.Args[2:])
+	case "eval-recommendations":
+		runEvalRecommendations(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
+	}
+}
+
+func runEvalRecommendations(args []string) {
+	flags := flag.NewFlagSet("eval-recommendations", flag.ExitOnError)
+	corpusPath := flags.String("corpus", "", "versioned JSONL evaluation corpus")
+	baselinePath := flags.String("baseline", "", "optional JSON report to compare against")
+	jsonPath := flags.String("json", "", "write the JSON report to this path")
+	replay := flags.Bool("replay", false, "apply the deterministic production candidate policy")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: music-vault eval-recommendations --corpus path [--baseline report.json] [--json report.json]")
+	}
+	if err := flags.Parse(args); err != nil {
+		log.Fatalf("failed to parse eval-recommendations args: %v", err)
+	}
+	if strings.TrimSpace(*corpusPath) == "" || len(flags.Args()) > 0 {
+		flags.Usage()
+		os.Exit(2)
+	}
+	cases, corpusHash, err := evaluation.LoadCorpus(*corpusPath)
+	if err != nil {
+		log.Fatalf("failed to load evaluation corpus: %v", err)
+	}
+	var report evaluation.Report
+	if *replay {
+		report = evaluation.EvaluateWithPolicy(cases, corpusHash, func(request evaluation.Request, mode string, candidates []evaluation.Candidate, seed int64) []evaluation.Candidate {
+			input := make([]webserver.OfflineCandidate, 0, len(candidates))
+			for _, candidate := range candidates {
+				input = append(input, webserver.OfflineCandidate{ID: candidate.ID, Artist: candidate.Artist, Album: candidate.Album, Song: candidate.Song, GenreTags: candidate.GenreTags, Rank: candidate.Rank, Eligible: candidate.Eligible})
+			}
+			output := webserver.ReplayOfflineCandidatePolicy(webserver.OfflinePolicyRequest{Message: request.Message, Mood: request.Mood, Avoid: request.Avoid, Mode: mode}, input, seed)
+			result := make([]evaluation.Candidate, 0, len(output))
+			for _, candidate := range output {
+				result = append(result, evaluation.Candidate{ID: candidate.ID, Artist: candidate.Artist, Album: candidate.Album, Song: candidate.Song, GenreTags: candidate.GenreTags, Rank: candidate.Rank, Eligible: candidate.Eligible})
+			}
+			return result
+		}, 1)
+	} else {
+		report = evaluation.Evaluate(cases, corpusHash)
+	}
+	if strings.TrimSpace(*baselinePath) != "" {
+		raw, err := os.ReadFile(*baselinePath)
+		if err != nil {
+			log.Fatalf("failed to read baseline report: %v", err)
+		}
+		var baseline evaluation.Report
+		if err := json.Unmarshal(raw, &baseline); err != nil {
+			log.Fatalf("failed to decode baseline report: %v", err)
+		}
+		report.Comparison = evaluation.Compare(report, baseline)
+	}
+	raw, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		log.Fatalf("failed to encode evaluation report: %v", err)
+	}
+	if strings.TrimSpace(*jsonPath) != "" {
+		if err := os.WriteFile(*jsonPath, append(raw, '\n'), 0o644); err != nil {
+			log.Fatalf("failed to write evaluation report: %v", err)
+		}
+	}
+	fmt.Printf("Evaluation: %d passed, %d failed, %d ineligible (%d eligible)\n", report.Summary.Passed, report.Summary.Failed, report.Summary.Ineligible, report.Summary.Eligible)
+	if report.Summary.Eligible == 0 || report.Summary.Failed > 0 {
+		os.Exit(1)
 	}
 }
 
@@ -804,5 +871,5 @@ func defaultWebModel() string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve|web> [args]")
+	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve|web|eval-recommendations> [args]")
 }

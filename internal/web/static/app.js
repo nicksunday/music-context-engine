@@ -43,7 +43,13 @@ const elements = {
   pageDescription: document.querySelector("#pageDescription"),
   sessionHeading: document.querySelector("#sessionHeading"),
   modeChooser: document.querySelector("#modeChooser"),
+  exportReview: document.querySelector("#exportReview"),
+  exportPreview: document.querySelector("#exportPreview"),
+  approveExport: document.querySelector("#approveExport"),
+  downloadExport: document.querySelector("#downloadExport"),
 };
+
+const exportState = { items: [], selected: new Set(), payloads: new Map() };
 
 const initialPrompt = elements.message.value;
 
@@ -65,6 +71,66 @@ async function loadContext() {
   state.context = context;
   renderContext(context);
   setStatus("");
+}
+
+async function loadExportReview() {
+  const response = await api("/api/export/review");
+  exportState.items = response.items || [];
+  elements.exportReview.replaceChildren();
+  for (const item of exportState.items) {
+    const label = document.createElement("label");
+    label.className = "export-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = exportState.selected.has(item.feedback_id);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) exportState.selected.add(item.feedback_id); else exportState.selected.delete(item.feedback_id);
+      updateExportPreview();
+    });
+    const text = document.createElement("span");
+    text.textContent = `${item.mode}: ${item.request} — ${item.verdict}${item.approved ? " (approved)" : ""}`;
+    label.append(checkbox, text);
+    elements.exportReview.append(label);
+  }
+  updateExportPreview();
+}
+
+async function updateExportPreview() {
+  const examples = [];
+  for (const item of exportState.items.filter(value => exportState.selected.has(value.feedback_id))) {
+    try {
+      const example = await api(`/api/export/example?feedback_id=${encodeURIComponent(item.feedback_id)}`);
+      examples.push(example);
+      exportState.payloads.set(item.feedback_id, example);
+    } catch (error) { appendMessage("error", error.message); }
+  }
+  elements.exportPreview.hidden = examples.length === 0;
+  elements.exportPreview.value = examples.map(example => JSON.stringify(example)).join("\n");
+  elements.approveExport.disabled = examples.length === 0;
+  elements.downloadExport.disabled = examples.length === 0;
+}
+
+async function approveSelectedExports() {
+  const editedLines = elements.exportPreview.value.split("\n").map(line => line.trim()).filter(Boolean);
+  const selectedItems = exportState.items.filter(value => exportState.selected.has(value.feedback_id));
+  if (editedLines.length !== selectedItems.length) throw new Error("Export preview must contain one JSON object per selected example.");
+  for (const [index, item] of selectedItems.entries()) {
+    let payload;
+    try { payload = JSON.parse(editedLines[index]); } catch (_) { throw new Error("Export preview contains invalid JSON."); }
+    if (!payload) continue;
+    const draft = await api("/api/export/draft", { method: "POST", body: JSON.stringify({ feedback_id: item.feedback_id, payload }) });
+    await api("/api/export/approve", { method: "POST", body: JSON.stringify({ draft_id: draft.id }) });
+  }
+  await loadExportReview();
+}
+
+async function downloadSelectedExports() {
+  const draftIDs = exportState.items.filter(item => exportState.selected.has(item.feedback_id) && item.draft_id && item.approved).map(item => item.draft_id);
+  if (!draftIDs.length) throw new Error("Approve selected examples before downloading.");
+  const response = await fetch("/api/export/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ draft_ids: draftIDs }) });
+  if (!response.ok) throw new Error("Export download failed");
+  const blob = await response.blob();
+  const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "music-vault-fit-examples.jsonl"; link.click(); URL.revokeObjectURL(link.href);
 }
 
 function openAppleMusic(url, appURL) {
@@ -208,7 +274,7 @@ function renderSessions(sessions) {
 
 function renderContext(context) {
   elements.modelLine.textContent = `${context.model || "no model"} at ${context.ollama_url || "no Ollama URL"}`;
-  renderRows(elements.feedbackList, context.recent_feedback.slice(0, 8), (feedback) => ({
+  renderRows(elements.feedbackList, (context.recent_feedback || []).slice(0, 8), (feedback) => ({
     name: `${feedback.album} · ${feedback.artist}`,
     meta: `${feedback.verdict}${feedback.notes ? ` · ${feedback.notes}` : ""}`,
   }));
@@ -375,7 +441,76 @@ function renderBatch(batch) {
     if (note.textContent) card.append(note);
     if (tags.children.length > 0) card.append(tags);
     card.append(buttons);
+    card.append(renderPromptFitControls(candidate));
     elements.candidateList.append(card);
+  }
+}
+
+function renderPromptFitControls(candidate) {
+  const group = document.createElement("div");
+  group.className = "prompt-fit";
+  const label = document.createElement("div");
+  label.className = "prompt-fit-label";
+  label.textContent = "Request fit";
+  const actions = document.createElement("div");
+  actions.className = "prompt-fit-actions";
+  for (const [verdict, text] of [["met", "Met my request"], ["missed", "Missed my request"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button secondary prompt-fit-button";
+    button.textContent = text;
+    if (candidate.prompt_fit?.verdict === verdict) button.classList.add("selected");
+    button.addEventListener("click", () => savePromptFit(candidate, verdict, group));
+    actions.append(button);
+  }
+  if (candidate.prompt_fit) {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "button secondary";
+    clear.textContent = "Clear";
+    clear.addEventListener("click", () => clearPromptFit(candidate));
+    actions.append(clear);
+  }
+  const reason = document.createElement("select");
+  reason.className = "prompt-fit-reason";
+  reason.innerHTML = '<option value="">Reason (optional)</option><option value="wrong_genre">Wrong genre</option><option value="wrong_energy">Wrong energy</option><option value="violated_exclusion">Violated exclusion</option><option value="inaccurate_explanation">Inaccurate explanation</option><option value="other">Other</option>';
+  reason.value = candidate.prompt_fit?.reason || "";
+  const notes = document.createElement("input");
+  notes.className = "prompt-fit-notes";
+  notes.placeholder = "Optional note";
+  notes.value = candidate.prompt_fit?.notes || "";
+  group.append(label, actions, reason, notes);
+  return group;
+}
+
+async function savePromptFit(candidate, verdict, group) {
+  const buttons = group.querySelectorAll("button");
+  buttons.forEach(button => button.disabled = true);
+  try {
+    const response = await api("/api/prompt-fit", { method: "POST", body: JSON.stringify({
+      batch_id: candidate.batch_id,
+      candidate_id: candidate.id,
+      verdict,
+      reason: group.querySelector(".prompt-fit-reason").value,
+      notes: group.querySelector(".prompt-fit-notes").value.trim(),
+    }) });
+    candidate.prompt_fit = response;
+    renderBatch(state.currentBatch);
+    setStatus("Request-fit judgment saved");
+  } catch (error) {
+    appendMessage("error", error.message);
+    buttons.forEach(button => button.disabled = false);
+  }
+}
+
+async function clearPromptFit(candidate) {
+  try {
+    await api("/api/prompt-fit", { method: "DELETE", body: JSON.stringify({ batch_id: candidate.batch_id, candidate_id: candidate.id }) });
+    delete candidate.prompt_fit;
+    renderBatch(state.currentBatch);
+    setStatus("Request-fit judgment cleared");
+  } catch (error) {
+    appendMessage("error", error.message);
   }
 }
 
@@ -419,7 +554,7 @@ function renderSongCandidate(candidate) {
     setStatus("Removed for now");
   });
   actions.append(dismiss);
-  row.append(identity, actions);
+  row.append(identity, actions, renderPromptFitControls(candidate));
   elements.candidateList.append(row);
 }
 
@@ -514,12 +649,14 @@ function configureMode() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadContext(), loadRail(), loadLatestBatch(), loadSessions()]);
+  await Promise.all([loadContext(), loadRail(), loadLatestBatch(), loadSessions(), loadExportReview()]);
 }
 
 elements.promptForm.addEventListener("submit", submitPrompt);
 elements.quickFeedback.addEventListener("submit", submitQuickFeedback);
 elements.refreshContext.addEventListener("click", () => refreshAll().catch((error) => appendMessage("error", error.message)));
+elements.approveExport.addEventListener("click", () => approveSelectedExports().catch((error) => appendMessage("error", error.message)));
+elements.downloadExport.addEventListener("click", () => downloadSelectedExports().catch((error) => appendMessage("error", error.message)));
 
 configureMode();
 renderBatch(null);

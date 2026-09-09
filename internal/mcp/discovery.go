@@ -49,6 +49,7 @@ const (
 // DiscoveryCandidate is metadata returned by the external discovery source
 // after validation and local-library exclusion.
 type DiscoveryCandidate struct {
+	ID          string   `json:"-"`
 	TrackName   string   `json:"track_name"`
 	Artist      string   `json:"artist"`
 	Album       string   `json:"album"`
@@ -422,6 +423,12 @@ func diversifyDiscoveryCandidatesWithRand(candidates []DiscoveryCandidate, searc
 		start = end
 	}
 	return diversified
+}
+
+// DiversifyDiscoveryCandidatesForEvaluation applies the production diversity
+// policy with deterministic tie ordering for offline replay.
+func DiversifyDiscoveryCandidatesForEvaluation(candidates []DiscoveryCandidate, searchTags []string, seed int64) []DiscoveryCandidate {
+	return diversifyDiscoveryCandidatesWithRand(candidates, searchTags, rand.New(rand.NewSource(seed)))
 }
 
 func discoveryCandidateTagScore(candidate DiscoveryCandidate, searchTags []string) int {

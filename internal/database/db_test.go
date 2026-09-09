@@ -231,6 +231,25 @@ func TestInitDBAddsRecommendationStreamingURLColumnToExistingDB(t *testing.T) {
 	if artist != "black midi" {
 		t.Fatalf("migrated candidate artist = %q, want black midi", artist)
 	}
+	for _, table := range []string{"recommendation_prompt_fit_feedback", "recommendation_batch_snapshots", "recommendation_export_drafts"} {
+		var count int
+		if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil {
+			t.Fatalf("failed to inspect migrated table %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Fatalf("migrated table %s missing", table)
+		}
+	}
+	legacyBatch, err := FetchRecommendationBatchByID(context.Background(), db.Ctx, "batch-1")
+	if err != nil {
+		t.Fatalf("failed to load legacy recommendation batch: %v", err)
+	}
+	if legacyBatch.SnapshotAvailable {
+		t.Fatal("legacy batch incorrectly reports a generated snapshot")
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: "batch-1", CandidateID: "candidate-1", Verdict: "missed", Reason: "other"}); err != nil {
+		t.Fatalf("legacy batch fit feedback failed: %v", err)
+	}
 
 	if _, err := db.Ctx.Exec(`
 		INSERT INTO recommendation_candidates (

@@ -136,6 +136,37 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		mood TEXT,
 		notes TEXT,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_prompt_fit_feedback (
+		id TEXT PRIMARY KEY,
+		batch_id TEXT NOT NULL REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+		candidate_id TEXT NOT NULL UNIQUE REFERENCES recommendation_candidates(id) ON DELETE CASCADE,
+		verdict TEXT NOT NULL CHECK (verdict IN ('met', 'missed')),
+		reason TEXT CHECK (reason IS NULL OR reason IN ('wrong_genre', 'wrong_energy', 'violated_exclusion', 'inaccurate_explanation', 'other')),
+		notes TEXT,
+		revision INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_batch_snapshots (
+		batch_id TEXT PRIMARY KEY REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+		schema_version INTEGER NOT NULL DEFAULT 1,
+		payload TEXT NOT NULL,
+		complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0, 1)),
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_export_drafts (
+		id TEXT PRIMARY KEY,
+		feedback_id TEXT NOT NULL UNIQUE REFERENCES recommendation_prompt_fit_feedback(id) ON DELETE CASCADE,
+		payload TEXT NOT NULL,
+		source_revision INTEGER NOT NULL,
+		content_hash TEXT NOT NULL,
+		approved_at TEXT,
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);`
 
 	_, err = db.Exec(schema)
@@ -246,6 +277,48 @@ func ensureAlignedSchema(db *sql.DB) error {
 	}
 	if err := ensureRecommendationStreamingURLColumn(db); err != nil {
 		return err
+	}
+	if err := ensureRecommendationFeedbackExportSchema(db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureRecommendationFeedbackExportSchema is intentionally additive so older
+// databases retain all existing taste feedback and recommendation history.
+func ensureRecommendationFeedbackExportSchema(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS recommendation_prompt_fit_feedback (
+			id TEXT PRIMARY KEY,
+			batch_id TEXT NOT NULL REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+			candidate_id TEXT NOT NULL UNIQUE REFERENCES recommendation_candidates(id) ON DELETE CASCADE,
+			verdict TEXT NOT NULL CHECK (verdict IN ('met', 'missed')),
+			reason TEXT CHECK (reason IS NULL OR reason IN ('wrong_genre', 'wrong_energy', 'violated_exclusion', 'inaccurate_explanation', 'other')),
+			notes TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS recommendation_batch_snapshots (
+			batch_id TEXT PRIMARY KEY REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+			schema_version INTEGER NOT NULL DEFAULT 1,
+			payload TEXT NOT NULL,
+			complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0, 1)),
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS recommendation_export_drafts (
+			id TEXT PRIMARY KEY,
+			feedback_id TEXT NOT NULL UNIQUE REFERENCES recommendation_prompt_fit_feedback(id) ON DELETE CASCADE,
+			payload TEXT NOT NULL,
+			source_revision INTEGER NOT NULL,
+			content_hash TEXT NOT NULL,
+			approved_at TEXT,
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to ensure recommendation fit feedback schema: %w", err)
 	}
 	return nil
 }
@@ -462,6 +535,8 @@ func ensureIndexes(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_recommendation_candidates_clean_album ON recommendation_candidates(clean_artist, clean_title);
 		CREATE INDEX IF NOT EXISTS idx_recommendation_feedback_clean_album ON recommendation_feedback(clean_artist, clean_title);
 		CREATE INDEX IF NOT EXISTS idx_recommendation_feedback_created_at ON recommendation_feedback(created_at);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_prompt_fit_batch ON recommendation_prompt_fit_feedback(batch_id);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_prompt_fit_updated_at ON recommendation_prompt_fit_feedback(updated_at);
 	`)
 	return err
 }

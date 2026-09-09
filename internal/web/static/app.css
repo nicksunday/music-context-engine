@@ -72,6 +72,73 @@ p,
   line-height: 1.45;
 }
 
+.prompt-fit {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.prompt-fit-label {
+  color: #4a545b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-fit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.prompt-fit-reason,
+.prompt-fit-notes {
+  height: 32px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.export-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.export-item {
+  display: flex;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.export-item input {
+  width: auto;
+  height: auto;
+}
+
+.export-preview {
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .shell {
   display: grid;
   grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);

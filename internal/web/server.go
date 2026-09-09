@@ -310,6 +310,47 @@ type RecommendationDiagnostics struct {
 	ReturnedCount          int
 }
 
+// OfflineCandidate is the bounded candidate shape used by deterministic
+// evaluation. It intentionally contains no database or network fields.
+type OfflineCandidate struct {
+	ID        string
+	Artist    string
+	Album     string
+	Song      string
+	GenreTags []string
+	Rank      int
+	Eligible  bool
+}
+
+type OfflinePolicyRequest struct {
+	Message string
+	Mood    string
+	Avoid   string
+	Mode    string
+}
+
+// ReplayOfflineCandidatePolicy reuses production prompt scoring, avoidance,
+// and diversity rules while replacing interactive randomness with a seed.
+func ReplayOfflineCandidatePolicy(request OfflinePolicyRequest, candidates []OfflineCandidate, seed int64) []OfflineCandidate {
+	webRequest := RecommendationRequest{Message: request.Message, Mood: request.Mood, Avoid: request.Avoid, Mode: recommendationMode(request.Mode)}
+	plan := calibrateDiscoveryPlanForPrompt(webRequest, modelDiscoveryPlan{})
+	discovery := make([]mcpserver.DiscoveryCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if !candidate.Eligible {
+			continue
+		}
+		discovery = append(discovery, mcpserver.DiscoveryCandidate{ID: candidate.ID, Artist: candidate.Artist, Album: candidate.Album, TrackName: candidate.Song, GenreTags: append([]string(nil), candidate.GenreTags...), ReleaseYear: 0})
+	}
+	discovery = filterAvoidedDiscoveryCandidates(discovery, requestAvoidTags(webRequest))
+	discovery = rankDiscoveryCandidatesForPromptSeeded(webRequest, plan, discovery, seed)
+	discovery = mcpserver.DiversifyDiscoveryCandidatesForEvaluation(discovery, plan.FallbackTags, seed)
+	result := make([]OfflineCandidate, 0, len(discovery))
+	for index, candidate := range discovery {
+		result = append(result, OfflineCandidate{ID: candidate.ID, Artist: candidate.Artist, Album: candidate.Album, Song: candidate.TrackName, GenreTags: candidate.GenreTags, Rank: index + 1, Eligible: true})
+	}
+	return result
+}
+
 func (diagnostics RecommendationDiagnostics) shortfallReason() string {
 	if diagnostics.ReturnedCount >= diagnostics.RequestedCount {
 		return ""
@@ -404,6 +445,13 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	mux.HandleFunc("GET /api/batches", server.handleBatches)
 	mux.HandleFunc("POST /api/recommendations", server.handleRecommendations)
 	mux.HandleFunc("POST /api/feedback", server.handleFeedback)
+	mux.HandleFunc("POST /api/prompt-fit", server.handlePromptFitFeedback)
+	mux.HandleFunc("DELETE /api/prompt-fit", server.handlePromptFitFeedback)
+	mux.HandleFunc("GET /api/export/example", server.handleExportExample)
+	mux.HandleFunc("GET /api/export/review", server.handleExportReview)
+	mux.HandleFunc("POST /api/export/draft", server.handleExportDraft)
+	mux.HandleFunc("POST /api/export/approve", server.handleExportApprove)
+	mux.HandleFunc("POST /api/export/download", server.handleExportDownload)
 	mux.HandleFunc("POST /api/playlists/apple-music", server.handleAppleMusicPlaylist)
 	mux.HandleFunc("GET /api/apple-music/config", server.handleAppleMusicConfig)
 	mux.Handle("/", staticHandler())
@@ -626,6 +674,18 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		Notes:      draft.Reply,
 		Mode:       input.Mode,
 		Candidates: draft.Candidates,
+		Snapshot: &database.RecommendationBatchSnapshotInput{
+			SchemaVersion: 1,
+			Complete:      true,
+			Payload: map[string]any{
+				"request":          map[string]any{"message": input.Message, "mood": input.Mood, "avoid": input.Avoid, "limit": input.Limit, "mode": input.Mode},
+				"model":            server.model,
+				"ollama_url":       server.ollamaURL,
+				"reply":            strings.TrimSpace(draft.Reply),
+				"candidate_output": draft.Candidates,
+				"diagnostics":      draft.Diagnostics,
+			},
+		},
 	})
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to persist recommendation batch.")
@@ -670,6 +730,106 @@ func (server *Server) handleFeedback(writer http.ResponseWriter, request *http.R
 	}
 
 	writeJSON(writer, http.StatusOK, result)
+}
+
+func (server *Server) handlePromptFitFeedback(writer http.ResponseWriter, request *http.Request) {
+	var input database.RecommendationPromptFitFeedbackInput
+	if err := decodeJSON(request, &input); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "Request body must be a JSON object.")
+		return
+	}
+	input.BatchID = strings.TrimSpace(input.BatchID)
+	input.CandidateID = strings.TrimSpace(input.CandidateID)
+	if request.Method == http.MethodDelete {
+		if err := database.ClearRecommendationPromptFitFeedback(request.Context(), server.db, input.BatchID, input.CandidateID); err != nil {
+			writeJSONError(writer, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"cleared": true, "batch_id": input.BatchID, "candidate_id": input.CandidateID})
+		return
+	}
+	result, err := database.SaveRecommendationPromptFitFeedback(request.Context(), server.db, input)
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (server *Server) handleExportExample(writer http.ResponseWriter, request *http.Request) {
+	example, err := database.BuildRecommendationExportExample(request.Context(), server.db, request.URL.Query().Get("feedback_id"))
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, example)
+}
+
+func (server *Server) handleExportReview(writer http.ResponseWriter, request *http.Request) {
+	items, err := database.ListRecommendationExportReview(request.Context(), server.db, 100)
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load export review items.")
+		return
+	}
+	if items == nil {
+		items = []database.RecommendationExportReviewItem{}
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items})
+}
+
+func (server *Server) handleExportDraft(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		FeedbackID string          `json:"feedback_id"`
+		Payload    json.RawMessage `json:"payload"`
+	}
+	if err := decodeJSON(request, &input); err != nil || len(input.Payload) == 0 {
+		writeJSONError(writer, http.StatusBadRequest, "feedback_id and payload are required")
+		return
+	}
+	draft, err := database.SaveRecommendationExportDraft(request.Context(), server.db, input.FeedbackID, string(input.Payload))
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, draft)
+}
+
+func (server *Server) handleExportApprove(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		DraftID string `json:"draft_id"`
+	}
+	if err := decodeJSON(request, &input); err != nil || strings.TrimSpace(input.DraftID) == "" {
+		writeJSONError(writer, http.StatusBadRequest, "draft_id is required")
+		return
+	}
+	if err := database.ApproveRecommendationExportDraft(request.Context(), server.db, input.DraftID); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"approved": true, "draft_id": input.DraftID})
+}
+
+func (server *Server) handleExportDownload(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		DraftIDs []string `json:"draft_ids"`
+	}
+	if err := decodeJSON(request, &input); err != nil || len(input.DraftIDs) == 0 {
+		writeJSONError(writer, http.StatusBadRequest, "draft_ids are required")
+		return
+	}
+	sort.Strings(input.DraftIDs)
+	drafts, err := database.FetchApprovedRecommendationExportDrafts(request.Context(), server.db, input.DraftIDs)
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writer.Header().Set("Content-Type", "application/x-ndjson")
+	writer.Header().Set("Content-Disposition", "attachment; filename=music-vault-fit-examples.jsonl")
+	for _, draft := range drafts {
+		if _, err := io.WriteString(writer, draft.Payload+"\n"); err != nil {
+			return
+		}
+	}
 }
 
 func (server *Server) handleAppleMusicPlaylist(writer http.ResponseWriter, request *http.Request) {
@@ -3354,6 +3514,19 @@ func rankDiscoveryCandidatesForPrompt(
 		leftScore := promptAlignmentScore(request, plan, ranked[i])
 		rightScore := promptAlignmentScore(request, plan, ranked[j])
 		return leftScore > rightScore
+	})
+	return ranked
+}
+
+func rankDiscoveryCandidatesForPromptSeeded(request RecommendationRequest, plan modelDiscoveryPlan, candidates []mcpserver.DiscoveryCandidate, seed int64) []mcpserver.DiscoveryCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	ranked := append([]mcpserver.DiscoveryCandidate(nil), candidates...)
+	rng := rand.New(rand.NewSource(seed))
+	rng.Shuffle(len(ranked), func(i, j int) { ranked[i], ranked[j] = ranked[j], ranked[i] })
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return promptAlignmentScore(request, plan, ranked[i]) > promptAlignmentScore(request, plan, ranked[j])
 	})
 	return ranked
 }

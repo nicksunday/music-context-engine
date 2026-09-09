@@ -121,6 +121,17 @@
             </label>
             <button class="button secondary" type="submit">Log Feedback</button>
           </form>
+
+          <section class="export-panel">
+            <div class="panel-title">Export Review</div>
+            <p class="meta">Select reviewed request-fit judgments, inspect the portable preview, then approve before downloading.</p>
+            <div id="exportReview" class="stack compact"></div>
+            <textarea id="exportPreview" class="export-preview" rows="8" hidden aria-label="Editable export preview"></textarea>
+            <div class="export-actions">
+              <button id="approveExport" class="button secondary" type="button" disabled>Approve selected</button>
+              <button id="downloadExport" class="button secondary" type="button" disabled>Download selected</button>
+            </div>
+          </section>
         </aside>
       </div>
     </section>

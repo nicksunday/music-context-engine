@@ -2,11 +2,23 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
 )
+
+func openRecommendationTestDB(t *testing.T) *DBClient {
+	t.Helper()
+	unsetMusicVaultDBPathEnv(t)
+	db, err := InitDB(filepath.Join(t.TempDir(), "recommendations.db"))
+	if err != nil {
+		t.Fatalf("InitDB() error = %v", err)
+	}
+	t.Cleanup(func() { db.Ctx.Close() })
+	return db
+}
 
 func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	unsetMusicVaultDBPathEnv(t)
@@ -69,6 +81,112 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	}
 	if persistedStreamingURL != wantStreamingURL {
 		t.Fatalf("persisted streaming_url = %q, want %q", persistedStreamingURL, wantStreamingURL)
+	}
+}
+
+func TestPromptFitFeedbackIsIndependentAndValidated(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	first, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "heavy songs", Mode: "song", Candidates: []RecommendationCandidateInput{
+			{Artist: "Artist", Album: "Album", Song: "One"},
+			{Artist: "Artist", Album: "Album", Song: "Two"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{Prompt: "other", Candidates: []RecommendationCandidateInput{{Artist: "Other", Album: "Other"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: first.ID, CandidateID: first.Candidates[0].ID, Verdict: "missed", Reason: "wrong_energy", Notes: "too soft"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: first.ID, CandidateID: first.Candidates[1].ID, Verdict: "met"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: second.ID, CandidateID: first.Candidates[0].ID, Verdict: "met"}); err == nil {
+		t.Fatal("mismatched batch accepted")
+	}
+
+	loaded, err := FetchRecommendationBatchByID(context.Background(), db.Ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Candidates[0].PromptFit == nil || loaded.Candidates[0].PromptFit.Verdict != "missed" || loaded.Candidates[1].PromptFit == nil || loaded.Candidates[1].PromptFit.Verdict != "met" {
+		t.Fatalf("loaded prompt fit = %#v", loaded.Candidates)
+	}
+	if _, err := LogRecommendationFeedback(context.Background(), db.Ctx, RecommendationFeedbackInput{Artist: "Artist", Album: "Album", CandidateID: first.Candidates[0].ID, Verdict: "good"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearRecommendationPromptFitFeedback(context.Background(), db.Ctx, first.ID, first.Candidates[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = FetchRecommendationBatchByID(context.Background(), db.Ctx, first.ID)
+	if err != nil || loaded.Candidates[0].PromptFit != nil || loaded.Candidates[1].PromptFit == nil {
+		t.Fatalf("after clear candidates = %#v, err = %v", loaded.Candidates, err)
+	}
+}
+
+func TestRecommendationBatchSnapshotIsPersistedAndImmutable(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	batch, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "snapshot prompt", Candidates: []RecommendationCandidateInput{{Artist: "Artist", Album: "Album"}},
+		Snapshot: &RecommendationBatchSnapshotInput{SchemaVersion: 1, Complete: false, Payload: map[string]any{"model": "old", "request": "snapshot prompt"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := FetchRecommendationBatchSnapshot(context.Background(), db.Ctx, batch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Payload["model"] != "old" || snapshot.Complete {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if _, err := db.Ctx.Exec("UPDATE recommendation_batches SET prompt = ? WHERE id = ?", "edited", batch.ID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = FetchRecommendationBatchSnapshot(context.Background(), db.Ctx, batch.ID)
+	if err != nil || snapshot.Payload["request"] != "snapshot prompt" {
+		t.Fatalf("snapshot changed after batch edit = %#v, err = %v", snapshot, err)
+	}
+}
+
+func TestRecommendationExportDraftApprovalInvalidatesOnSourceChange(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	batch, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{Prompt: "export", Candidates: []RecommendationCandidateInput{{Artist: "Artist", Album: "Album"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fit, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: batch.ID, CandidateID: batch.Candidates[0].ID, Verdict: "missed", Reason: "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	example, err := BuildRecommendationExportExample(context.Background(), db.Ctx, fit.ID)
+	if err != nil || example.ExampleID == "" || example.ProvenanceComplete {
+		t.Fatalf("example = %#v, err = %v", example, err)
+	}
+	payload, err := json.Marshal(example)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err := SaveRecommendationExportDraft(context.Background(), db.Ctx, fit.ID, string(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApproveRecommendationExportDraft(context.Background(), db.Ctx, draft.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FetchApprovedRecommendationExportDrafts(context.Background(), db.Ctx, []string{draft.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: batch.ID, CandidateID: batch.Candidates[0].ID, Verdict: "met"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FetchApprovedRecommendationExportDrafts(context.Background(), db.Ctx, []string{draft.ID}); err == nil {
+		t.Fatal("stale approved draft was exported")
 	}
 }
 
