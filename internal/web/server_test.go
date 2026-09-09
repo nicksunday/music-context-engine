@@ -862,6 +862,158 @@ func TestFallbackDiscoveryDraftDefaultsToOneAlbumPerArtist(t *testing.T) {
 	}
 }
 
+func TestBackfillRecommendationCandidatesFillsUnderSelectedBatch(t *testing.T) {
+	request := RecommendationRequest{Message: "technical progressive metal", Limit: 3}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	selected := []database.RecommendationCandidateInput{{Artist: "First Artist", Album: "First Album", Song: "First Song"}}
+	pool := []mcpserver.DiscoveryCandidate{
+		{Artist: "First Artist", Album: "First Album", TrackName: "First Song"},
+		{Artist: "Second Artist", Album: "Second Album", TrackName: "Second Song"},
+		{Artist: "Third Artist", Album: "Third Album", TrackName: "Third Song"},
+		{Artist: "Fourth Artist", Album: "Fourth Album", TrackName: "Fourth Song"},
+	}
+
+	got, added := backfillRecommendationCandidates(request, selected, pool, plan, 3, map[int]bool{0: true})
+	if len(got) != 3 {
+		t.Fatalf("backfilled candidates = %#v, want 3 candidates", got)
+	}
+	if added != 2 {
+		t.Fatalf("backfill count = %d, want 2", added)
+	}
+	if got[1].Artist != "Second Artist" || got[2].Artist != "Third Artist" {
+		t.Fatalf("backfilled candidates = %#v, want remaining candidates in ranked order", got)
+	}
+}
+
+func TestSongRecommendationDiversityAllowsDistinctTracksByArtist(t *testing.T) {
+	request := RecommendationRequest{Mode: "song", Message: "technical metal", Limit: 3}
+	candidates := []database.RecommendationCandidateInput{
+		{Artist: "Same Artist", Album: "First Album", Song: "First Song"},
+		{Artist: "Same Artist", Album: "First Album", Song: "Second Song"},
+		{Artist: "Other Artist", Album: "Other Album", Song: "Other Song"},
+	}
+
+	got := applyRecommendationBatchDiversity(request, candidates)
+	if len(got) != 3 {
+		t.Fatalf("song-diverse candidates = %#v, want all 3 distinct tracks", got)
+	}
+}
+
+func TestRecommendationDiagnosticsClassifiesShortfalls(t *testing.T) {
+	tests := []struct {
+		name        string
+		diagnostics RecommendationDiagnostics
+		wantReason  string
+	}{
+		{
+			name:        "complete",
+			diagnostics: RecommendationDiagnostics{RequestedCount: 3, ReturnedCount: 3},
+		},
+		{
+			name:        "discovery pool",
+			diagnostics: RecommendationDiagnostics{RequestedCount: 5, DiscoveryPoolCount: 3, ReturnedCount: 3},
+			wantReason:  "discovery_pool_exhausted",
+		},
+		{
+			name:        "verification",
+			diagnostics: RecommendationDiagnostics{RequestedCount: 5, DiscoveryPoolCount: 8, VerifiedCount: 3, VerificationRejected: 5, ReturnedCount: 3},
+			wantReason:  "verification_rejected",
+		},
+		{
+			name:        "diversity",
+			diagnostics: RecommendationDiagnostics{RequestedCount: 5, DiscoveryPoolCount: 8, VerifiedCount: 8, DiversityRejectedCount: 2, ReturnedCount: 3},
+			wantReason:  "diversity_filtered",
+		},
+		{
+			name:        "excluded",
+			diagnostics: RecommendationDiagnostics{RequestedCount: 5, DiscoveryPoolCount: 8, VerifiedCount: 5, ExcludedCount: 3, ReturnedCount: 2},
+			wantReason:  "excluded_or_avoided",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.diagnostics.shortfallReason(); got != tt.wantReason {
+				t.Fatalf("shortfallReason() = %q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestFeedbackRankingPrefersLikedArtistWithoutOverridingPromptFit(t *testing.T) {
+	request := RecommendationRequest{Message: "progressive metal", Limit: 2}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	candidates := []mcpserver.DiscoveryCandidate{
+		{Artist: "Liked Artist", Album: "Album", TrackName: "Track", GenreTags: []string{"heavy metal"}},
+		{Artist: "Prompt Fit", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+	}
+	feedback := []database.RecommendationFeedbackLog{{Artist: "Liked Artist", Album: "Other Album", Verdict: "great", CreatedAt: time.Now().UTC().Format(time.RFC3339)}}
+
+	got := rankDiscoveryCandidatesWithFeedback(request, plan, candidates, feedback)
+	if got[0].Artist != "Prompt Fit" {
+		t.Fatalf("feedback-ranked candidates = %#v, want prompt-fit candidate first", got)
+	}
+}
+
+func TestFeedbackRankingPenalizesRecentlyDislikedArtist(t *testing.T) {
+	request := RecommendationRequest{Message: "progressive metal", Limit: 2}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	candidates := []mcpserver.DiscoveryCandidate{
+		{Artist: "Disliked Artist", Album: "New Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Other Artist", Album: "Other Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+	}
+	feedback := []database.RecommendationFeedbackLog{{Artist: "Disliked Artist", Album: "Old Album", Verdict: "disliked", CreatedAt: time.Now().UTC().Format(time.RFC3339)}}
+
+	got := rankDiscoveryCandidatesWithFeedback(request, plan, candidates, feedback)
+	if got[0].Artist != "Other Artist" {
+		t.Fatalf("feedback-ranked candidates = %#v, want disliked artist moved behind neutral candidate", got)
+	}
+}
+
+func TestFeedbackRankingIgnoresStaleFeedback(t *testing.T) {
+	request := RecommendationRequest{Message: "progressive metal", Limit: 2}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	candidates := []mcpserver.DiscoveryCandidate{
+		{Artist: "Old Favorite", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Other Artist", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+	}
+	feedback := []database.RecommendationFeedbackLog{{Artist: "Old Favorite", Album: "Old Album", Verdict: "great", CreatedAt: time.Now().Add(-120 * 24 * time.Hour).UTC().Format(time.RFC3339)}}
+
+	got := rankDiscoveryCandidatesWithFeedback(request, plan, candidates, feedback)
+	if got[0].Artist != "Old Favorite" {
+		t.Fatalf("stale feedback-ranked candidates = %#v, want original prompt-fit order", got)
+	}
+}
+
+func TestFeedbackRankingUsesGenreTagsAsSmallSignal(t *testing.T) {
+	request := RecommendationRequest{Message: "progressive metal", Limit: 2}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	candidates := []mcpserver.DiscoveryCandidate{
+		{Artist: "Genre Match", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Neutral Artist", Album: "Album", TrackName: "Track", GenreTags: []string{"power metal"}},
+	}
+	feedback := []database.RecommendationFeedbackLog{{Artist: "Prior Artist", Album: "Prior Album", Verdict: "great", GenreTags: []string{"progressive metal"}, CreatedAt: time.Now().UTC().Format(time.RFC3339)}}
+
+	got := rankDiscoveryCandidatesWithFeedback(request, plan, candidates, feedback)
+	if got[0].Artist != "Genre Match" {
+		t.Fatalf("genre-ranked candidates = %#v, want genre match first", got)
+	}
+}
+
+func TestFeedbackRankingIgnoresNotTodayGenreSignal(t *testing.T) {
+	request := RecommendationRequest{Message: "progressive metal", Limit: 2}
+	plan := modelDiscoveryPlan{FallbackTags: []string{"progressive metal"}}
+	candidates := []mcpserver.DiscoveryCandidate{
+		{Artist: "Genre Match", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Neutral Artist", Album: "Album", TrackName: "Track", GenreTags: []string{"power metal"}},
+	}
+	feedback := []database.RecommendationFeedbackLog{{Artist: "Prior Artist", Album: "Prior Album", Verdict: "not_for_me_today", GenreTags: []string{"progressive metal"}, CreatedAt: time.Now().UTC().Format(time.RFC3339)}}
+
+	got := rankDiscoveryCandidatesWithFeedback(request, plan, candidates, feedback)
+	if got[0].Artist != "Genre Match" {
+		t.Fatalf("not-today genre-ranked candidates = %#v, want prompt-fit order", got)
+	}
+}
+
 func TestAvoidedTagFilteringDropsCandidatesWithAvoidedGenres(t *testing.T) {
 	avoidTags := parseAvoidTags("avante garde metal; tech death")
 	discoveryCandidates := filterAvoidedDiscoveryCandidates([]mcpserver.DiscoveryCandidate{

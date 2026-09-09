@@ -83,19 +83,20 @@ type RecommendationFeedbackInput struct {
 }
 
 type RecommendationFeedbackLog struct {
-	ID           string `json:"id"`
-	Artist       string `json:"artist"`
-	Album        string `json:"album"`
-	CleanArtist  string `json:"clean_artist"`
-	CleanTitle   string `json:"clean_title"`
-	StarterTrack string `json:"starter_track,omitempty"`
-	BatchID      string `json:"batch_id,omitempty"`
-	CandidateID  string `json:"candidate_id,omitempty"`
-	Verdict      string `json:"verdict"`
-	Mood         string `json:"mood,omitempty"`
-	Notes        string `json:"notes,omitempty"`
-	RowsInserted int64  `json:"rows_inserted,omitempty"`
-	CreatedAt    string `json:"created_at,omitempty"`
+	ID           string   `json:"id"`
+	Artist       string   `json:"artist"`
+	Album        string   `json:"album"`
+	CleanArtist  string   `json:"clean_artist"`
+	CleanTitle   string   `json:"clean_title"`
+	StarterTrack string   `json:"starter_track,omitempty"`
+	BatchID      string   `json:"batch_id,omitempty"`
+	CandidateID  string   `json:"candidate_id,omitempty"`
+	Verdict      string   `json:"verdict"`
+	Mood         string   `json:"mood,omitempty"`
+	Notes        string   `json:"notes,omitempty"`
+	GenreTags    []string `json:"genre_tags,omitempty"`
+	RowsInserted int64    `json:"rows_inserted,omitempty"`
+	CreatedAt    string   `json:"created_at,omitempty"`
 }
 
 func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input RecommendationBatchInput) (RecommendationBatch, error) {
@@ -246,9 +247,12 @@ func FetchRecentRecommendationFeedback(ctx context.Context, db *sql.DB, limit in
 	}
 
 	rows, err := db.QueryContext(ctx, `
-		SELECT id, artist, album, clean_artist, clean_title, starter_track, batch_id, candidate_id, verdict, mood, notes, created_at
-		FROM recommendation_feedback
-		ORDER BY created_at DESC, rowid DESC
+		SELECT f.id, f.artist, f.album, f.clean_artist, f.clean_title, f.starter_track, f.batch_id, f.candidate_id, f.verdict, f.mood, f.notes, f.created_at,
+			COALESCE(NULLIF(NULLIF(candidate.genre_tags, ''), '[]'), NULLIF(NULLIF(local_album.genres, ''), '[]'))
+		FROM recommendation_feedback AS f
+		LEFT JOIN recommendation_candidates AS candidate ON candidate.id = f.candidate_id
+		LEFT JOIN albums AS local_album ON local_album.clean_artist = f.clean_artist AND local_album.clean_title = f.clean_title
+		ORDER BY f.created_at DESC, f.rowid DESC
 		LIMIT ?`,
 		limit,
 	)
@@ -260,7 +264,7 @@ func FetchRecentRecommendationFeedback(ctx context.Context, db *sql.DB, limit in
 	var feedback []RecommendationFeedbackLog
 	for rows.Next() {
 		var row RecommendationFeedbackLog
-		var starterTrack, batchID, candidateID, mood, notes, createdAt sql.NullString
+		var starterTrack, batchID, candidateID, mood, notes, createdAt, genreTags sql.NullString
 		if err := rows.Scan(
 			&row.ID,
 			&row.Artist,
@@ -274,6 +278,7 @@ func FetchRecentRecommendationFeedback(ctx context.Context, db *sql.DB, limit in
 			&mood,
 			&notes,
 			&createdAt,
+			&genreTags,
 		); err != nil {
 			return nil, err
 		}
@@ -283,6 +288,12 @@ func FetchRecentRecommendationFeedback(ctx context.Context, db *sql.DB, limit in
 		row.Mood = nullStringText(mood)
 		row.Notes = nullStringText(notes)
 		row.CreatedAt = nullStringText(createdAt)
+		if genreTags.Valid && strings.TrimSpace(genreTags.String) != "" && strings.TrimSpace(genreTags.String) != "[]" {
+			if err := json.Unmarshal([]byte(genreTags.String), &row.GenreTags); err != nil {
+				return nil, fmt.Errorf("unmarshal recommendation feedback genre tags: %w", err)
+			}
+			row.GenreTags = compactGenreTags(row.GenreTags)
+		}
 		feedback = append(feedback, row)
 	}
 	if err := rows.Err(); err != nil {

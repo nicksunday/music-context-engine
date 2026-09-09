@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -289,8 +291,42 @@ type RecommendationRequest struct {
 }
 
 type RecommendationDraft struct {
-	Reply      string                                  `json:"reply"`
-	Candidates []database.RecommendationCandidateInput `json:"candidates"`
+	Reply       string                                  `json:"reply"`
+	Candidates  []database.RecommendationCandidateInput `json:"candidates"`
+	Diagnostics RecommendationDiagnostics               `json:"-"`
+}
+
+type RecommendationDiagnostics struct {
+	RequestedCount         int
+	DiscoveryPoolCount     int
+	DiscoveryAvoidedCount  int
+	ModelSelectedCount     int
+	BackfillAddedCount     int
+	VerifiedCount          int
+	VerificationRejected   int
+	ExcludedCount          int
+	AvoidedCount           int
+	DiversityRejectedCount int
+	ReturnedCount          int
+}
+
+func (diagnostics RecommendationDiagnostics) shortfallReason() string {
+	if diagnostics.ReturnedCount >= diagnostics.RequestedCount {
+		return ""
+	}
+	if diagnostics.DiversityRejectedCount > 0 {
+		return "diversity_filtered"
+	}
+	if diagnostics.VerificationRejected > 0 && diagnostics.VerifiedCount < diagnostics.RequestedCount {
+		return "verification_rejected"
+	}
+	if diagnostics.DiscoveryPoolCount < diagnostics.RequestedCount {
+		return "discovery_pool_exhausted"
+	}
+	if diagnostics.ExcludedCount > 0 || diagnostics.AvoidedCount > 0 || diagnostics.DiscoveryAvoidedCount > 0 {
+		return "excluded_or_avoided"
+	}
+	return "eligible_pool_exhausted"
 }
 
 func songRecommendationMode(request RecommendationRequest) bool {
@@ -527,8 +563,13 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadGateway, recommendationCandidateEmptyMessage(input))
 		return
 	}
+	draft.Diagnostics.RequestedCount = input.Limit
+	before := len(draft.Candidates)
 	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+	draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
+	before = len(draft.Candidates)
 	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
+	draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
 	if songRecommendationMode(input) {
 		for idx := range draft.Candidates {
 			if strings.TrimSpace(draft.Candidates[idx].Song) == "" {
@@ -540,18 +581,27 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
 		return
 	}
+	before = len(draft.Candidates)
 	draft.Candidates, err = server.verifyCandidates(request.Context(), draft.Candidates)
+	draft.Diagnostics.VerifiedCount = len(draft.Candidates)
+	draft.Diagnostics.VerificationRejected += before - len(draft.Candidates)
 	if err != nil {
 		writeJSONError(writer, http.StatusBadGateway, err.Error())
 		return
 	}
+	before = len(draft.Candidates)
 	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+	draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
+	before = len(draft.Candidates)
 	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
+	draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
 	if len(draft.Candidates) == 0 {
 		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived external verification, album-level exclusions, and avoid filters. Try again with a more specific prompt.")
 		return
 	}
+	before = len(draft.Candidates)
 	draft.Candidates = applyRecommendationBatchDiversity(input, draft.Candidates)
+	draft.Diagnostics.DiversityRejectedCount += before - len(draft.Candidates)
 	if len(draft.Candidates) == 0 {
 		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived final artist-diversity filtering. Try again with a broader prompt.")
 		return
@@ -559,6 +609,10 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	if len(draft.Candidates) > input.Limit {
 		draft.Candidates = draft.Candidates[:input.Limit]
 		resetRecommendationCandidateRanks(draft.Candidates)
+	}
+	draft.Diagnostics.ReturnedCount = len(draft.Candidates)
+	if reason := draft.Diagnostics.shortfallReason(); reason != "" {
+		log.Printf("recommendation_shortfall mode=%s requested=%d returned=%d discovery_pool=%d discovery_avoided=%d model_selected=%d backfill_added=%d verified=%d verification_rejected=%d excluded=%d avoided=%d diversity_rejected=%d reason=%s", input.Mode, draft.Diagnostics.RequestedCount, draft.Diagnostics.ReturnedCount, draft.Diagnostics.DiscoveryPoolCount, draft.Diagnostics.DiscoveryAvoidedCount, draft.Diagnostics.ModelSelectedCount, draft.Diagnostics.BackfillAddedCount, draft.Diagnostics.VerifiedCount, draft.Diagnostics.VerificationRejected, draft.Diagnostics.ExcludedCount, draft.Diagnostics.AvoidedCount, draft.Diagnostics.DiversityRejectedCount, reason)
 	}
 	if songRecommendationMode(input) {
 		draft.Candidates = server.resolveSongLinks(request.Context(), draft.Candidates)
@@ -2054,16 +2108,27 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 	if err != nil {
 		return RecommendationDraft{}, fmt.Errorf("MCP verified discovery failed: %w", err)
 	}
+	diagnostics := RecommendationDiagnostics{
+		RequestedCount:     clampBatchLimit(request.Mode, request.Limit),
+		DiscoveryPoolCount: len(candidates),
+	}
 	if len(candidates) == 0 {
 		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates for those tags. Try a slightly broader prompt.")
 	}
+	beforeAvoid := len(candidates)
 	candidates = filterAvoidedDiscoveryCandidates(candidates, requestAvoidTags(request))
+	diagnostics.DiscoveryAvoidedCount = beforeAvoid - len(candidates)
 	if len(candidates) == 0 {
 		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates after applying avoid filters. Try a slightly broader prompt or fewer avoided styles.")
 	}
 	candidates = rankDiscoveryCandidatesForPrompt(request, plan, candidates)
+	candidates = rankDiscoveryCandidatesWithFeedback(request, plan, candidates, profile.RecentFeedback)
 
-	return recommender.selectDiscoveryCandidates(ctx, request, profile, plan, candidates)
+	draft, err := recommender.selectDiscoveryCandidates(ctx, request, profile, plan, candidates)
+	diagnostics.ModelSelectedCount = draft.Diagnostics.ModelSelectedCount
+	diagnostics.BackfillAddedCount = draft.Diagnostics.BackfillAddedCount
+	draft.Diagnostics = diagnostics
+	return draft, err
 }
 
 func (recommender *MCPGroundedOllamaRecommender) planDiscovery(
@@ -2164,7 +2229,10 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 		}
 		draft.Candidates = append(draft.Candidates, candidateInput)
 	}
-	draft.Candidates = applyRecommendationBatchDiversity(request, draft.Candidates)
+	draft.Diagnostics.ModelSelectedCount = len(draft.Candidates)
+	var backfillAdded int
+	draft.Candidates, backfillAdded = backfillRecommendationCandidates(request, draft.Candidates, candidates, plan, limit, seen)
+	draft.Diagnostics.BackfillAddedCount = backfillAdded
 	if len(draft.Candidates) > limit {
 		draft.Candidates = draft.Candidates[:limit]
 		resetRecommendationCandidateRanks(draft.Candidates)
@@ -3123,7 +3191,43 @@ func applyRecommendationBatchDiversity(
 	request RecommendationRequest,
 	candidates []database.RecommendationCandidateInput,
 ) []database.RecommendationCandidateInput {
-	return dedupeRecommendationCandidates(candidates, requestAllowsRepeatedArtists(request))
+	return dedupeRecommendationCandidates(candidates, requestAllowsRepeatedArtists(request) || songRecommendationMode(request))
+}
+
+func backfillRecommendationCandidates(
+	request RecommendationRequest,
+	selected []database.RecommendationCandidateInput,
+	pool []mcpserver.DiscoveryCandidate,
+	plan modelDiscoveryPlan,
+	limit int,
+	selectedIndexes map[int]bool,
+) ([]database.RecommendationCandidateInput, int) {
+	if limit <= 0 {
+		limit = defaultBatchLimit
+	}
+	result := applyRecommendationBatchDiversity(request, selected)
+	if len(result) >= limit {
+		return result, 0
+	}
+	backfillAdded := 0
+
+	for idx, candidate := range pool {
+		if selectedIndexes[idx] {
+			continue
+		}
+		candidateInput := discoveryCandidateInput(candidate, len(result)+1, fallbackDiscoveryNote(request, plan, candidate))
+		if songRecommendationMode(request) {
+			candidateInput.Song = candidate.TrackName
+		}
+		result = applyRecommendationBatchDiversity(request, append(result, candidateInput))
+		if len(result) > len(selected)+backfillAdded {
+			backfillAdded++
+		}
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result, backfillAdded
 }
 
 func requestAllowsRepeatedArtists(request RecommendationRequest) bool {
@@ -3243,12 +3347,160 @@ func rankDiscoveryCandidatesForPrompt(
 	}
 
 	ranked := append([]mcpserver.DiscoveryCandidate(nil), candidates...)
+	rand.New(rand.NewSource(time.Now().UnixNano())).Shuffle(len(ranked), func(i, j int) {
+		ranked[i], ranked[j] = ranked[j], ranked[i]
+	})
 	sort.SliceStable(ranked, func(i, j int) bool {
 		leftScore := promptAlignmentScore(request, plan, ranked[i])
 		rightScore := promptAlignmentScore(request, plan, ranked[j])
 		return leftScore > rightScore
 	})
 	return ranked
+}
+
+type recommendationFeedbackSignal struct {
+	artist  string
+	album   string
+	genres  map[string]bool
+	verdict string
+	weight  int
+}
+
+func rankDiscoveryCandidatesWithFeedback(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidates []mcpserver.DiscoveryCandidate,
+	feedback []database.RecommendationFeedbackLog,
+) []mcpserver.DiscoveryCandidate {
+	if len(candidates) < 2 || len(feedback) == 0 {
+		return candidates
+	}
+
+	signals := make([]recommendationFeedbackSignal, 0, len(feedback))
+	for _, entry := range feedback {
+		artist, album := recommendationCandidateKeys(database.RecommendationCandidateInput{
+			Artist: entry.Artist,
+			Album:  entry.Album,
+		})
+		if artist == "" && album == "" {
+			continue
+		}
+		genres := make(map[string]bool, len(entry.GenreTags))
+		for _, tag := range entry.GenreTags {
+			tag = normalizeStyleText(tag)
+			if tag != "" {
+				genres[tag] = true
+			}
+		}
+		age, ok := recommendationFeedbackAge(entry.CreatedAt)
+		if ok && age > 90*24*time.Hour {
+			continue
+		}
+		feedbackWeight := 1
+		if ok {
+			feedbackWeight = recommendationFeedbackWeight(age)
+		}
+		signals = append(signals, recommendationFeedbackSignal{
+			artist:  artist,
+			album:   album,
+			genres:  genres,
+			verdict: entry.Verdict,
+			weight:  feedbackWeight,
+		})
+	}
+	if len(signals) == 0 {
+		return candidates
+	}
+
+	ranked := append([]mcpserver.DiscoveryCandidate(nil), candidates...)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := promptAlignmentScore(request, plan, ranked[i])*100 + discoveryFeedbackScore(ranked[i], signals)
+		right := promptAlignmentScore(request, plan, ranked[j])*100 + discoveryFeedbackScore(ranked[j], signals)
+		return left > right
+	})
+	return ranked
+}
+
+func discoveryFeedbackScore(candidate mcpserver.DiscoveryCandidate, signals []recommendationFeedbackSignal) int {
+	artist, album := recommendationCandidateKeys(database.RecommendationCandidateInput{
+		Artist: candidate.Artist,
+		Album:  candidate.Album,
+	})
+	score := 0
+	candidateGenres := make(map[string]bool, len(candidate.GenreTags))
+	for _, tag := range candidate.GenreTags {
+		tag = normalizeStyleText(tag)
+		if tag != "" {
+			candidateGenres[tag] = true
+		}
+	}
+	for _, signal := range signals {
+		weight := 0
+		if signal.artist == artist {
+			weight += signal.weight + 2
+		}
+		if signal.album == album {
+			weight += signal.weight + 2
+		}
+		for tag := range candidateGenres {
+			if signal.genres[tag] {
+				score += genreFeedbackWeight(signal.verdict, signal.weight)
+			}
+		}
+		switch signal.verdict {
+		case "great", "good":
+			if weight > 0 {
+				score += weight
+			}
+		case "disliked":
+			if weight > 0 {
+				score -= weight
+			}
+		}
+	}
+	return score
+}
+
+func genreFeedbackWeight(verdict string, recencyWeight int) int {
+	switch verdict {
+	case "great":
+		return recencyWeight
+	case "good":
+		return recencyWeight / 2
+	case "disliked":
+		return -recencyWeight
+	default:
+		return 0
+	}
+}
+
+func recommendationFeedbackAge(createdAt string) (time.Duration, bool) {
+	createdAt = strings.TrimSpace(createdAt)
+	if createdAt == "" {
+		return 0, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		created, err := time.Parse(layout, createdAt)
+		if err == nil {
+			age := time.Since(created)
+			if age < 0 {
+				age = 0
+			}
+			return age, true
+		}
+	}
+	return 0, false
+}
+
+func recommendationFeedbackWeight(age time.Duration) int {
+	switch {
+	case age <= 7*24*time.Hour:
+		return 3
+	case age <= 30*24*time.Hour:
+		return 2
+	default:
+		return 1
+	}
 }
 
 func promptAlignmentScore(

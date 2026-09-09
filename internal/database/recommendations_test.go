@@ -148,6 +148,67 @@ func TestLogRecommendationFeedbackCanonicalizesVerdict(t *testing.T) {
 	}
 }
 
+func TestFetchRecentRecommendationFeedbackResolvesCandidateGenreTags(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+	db, err := InitDB(filepath.Join(t.TempDir(), "feedback-genres.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Ctx.Close()
+
+	batch, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "progressive metal",
+		Candidates: []RecommendationCandidateInput{{
+			Artist: "Test Artist", Album: "Test Album", GenreTags: []string{"Progressive Metal", "progressive metal", "Power Metal"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = LogRecommendationFeedback(context.Background(), db.Ctx, RecommendationFeedbackInput{
+		Artist: "Test Artist", Album: "Test Album", CandidateID: batch.Candidates[0].ID, Verdict: "good",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	feedback, err := FetchRecentRecommendationFeedback(context.Background(), db.Ctx, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feedback) != 1 || len(feedback[0].GenreTags) != 2 || feedback[0].GenreTags[0] != "progressive metal" || feedback[0].GenreTags[1] != "power metal" {
+		t.Fatalf("feedback = %#v, want normalized candidate genre tags", feedback)
+	}
+}
+
+func TestFetchRecentRecommendationFeedbackFallsBackToLocalAlbumGenres(t *testing.T) {
+	unsetMusicVaultDBPathEnv(t)
+	db, err := InitDB(filepath.Join(t.TempDir(), "feedback-local-genres.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Ctx.Close()
+
+	_, err = db.Ctx.Exec(`INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres) VALUES (?, ?, ?, ?, ?, ?)`,
+		"local-album", "Local Album", "Local Artist", "local album", "local artist", `["Art Rock","Progressive Rock"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LogRecommendationFeedback(context.Background(), db.Ctx, RecommendationFeedbackInput{
+		Artist: "Local Artist", Album: "Local Album", Verdict: "great",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	feedback, err := FetchRecentRecommendationFeedback(context.Background(), db.Ctx, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feedback) != 1 || len(feedback[0].GenreTags) != 2 || feedback[0].GenreTags[0] != "art rock" || feedback[0].GenreTags[1] != "progressive rock" {
+		t.Fatalf("feedback = %#v, want local album genre fallback", feedback)
+	}
+}
+
 func TestFetchLatestRecommendationBatchEmptyWhenNoBatches(t *testing.T) {
 	unsetMusicVaultDBPathEnv(t)
 

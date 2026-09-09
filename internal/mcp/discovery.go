@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
@@ -321,6 +322,7 @@ func getVerifiedDiscoveryCandidatesSeededWithOptions(
 	if err != nil {
 		return nil, fmt.Errorf("search external discovery source: %w", err)
 	}
+	liveCandidates = diversifyDiscoveryCandidates(liveCandidates, cleanTags)
 	if len(cleanTags) == 0 && len(cleanSeeds) == 0 {
 		return nil, fmt.Errorf("at least one discovery tag or seed artist must be provided")
 	}
@@ -378,6 +380,60 @@ func getVerifiedDiscoveryCandidatesSeededWithOptions(
 	}
 
 	return candidates, nil
+}
+
+func diversifyDiscoveryCandidates(candidates []DiscoveryCandidate, searchTags []string) []DiscoveryCandidate {
+	return diversifyDiscoveryCandidatesWithRand(candidates, searchTags, rand.New(rand.NewSource(time.Now().UnixNano())))
+}
+
+func diversifyDiscoveryCandidatesWithRand(candidates []DiscoveryCandidate, searchTags []string, rng *rand.Rand) []DiscoveryCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	hasTagEvidence := false
+	for _, candidate := range candidates {
+		if len(candidate.GenreTags) > 0 {
+			hasTagEvidence = true
+			break
+		}
+	}
+	if !hasTagEvidence {
+		return candidates
+	}
+	diversified := append([]DiscoveryCandidate(nil), candidates...)
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	sort.SliceStable(diversified, func(i, j int) bool {
+		left := discoveryCandidateTagScore(diversified[i], searchTags)
+		right := discoveryCandidateTagScore(diversified[j], searchTags)
+		return left > right
+	})
+	for start := 0; start < len(diversified); {
+		score := discoveryCandidateTagScore(diversified[start], searchTags)
+		end := start + 1
+		for end < len(diversified) && discoveryCandidateTagScore(diversified[end], searchTags) == score {
+			end++
+		}
+		for idx := end - 1; idx > start; idx-- {
+			swap := rng.Intn(idx-start+1) + start
+			diversified[idx], diversified[swap] = diversified[swap], diversified[idx]
+		}
+		start = end
+	}
+	return diversified
+}
+
+func discoveryCandidateTagScore(candidate DiscoveryCandidate, searchTags []string) int {
+	score := 0
+	for _, candidateTag := range candidate.GenreTags {
+		for _, searchTag := range searchTags {
+			if strings.EqualFold(strings.TrimSpace(candidateTag), strings.TrimSpace(searchTag)) {
+				score++
+			}
+		}
+	}
+	return score
 }
 
 func discoverySearchLimit(limit int) int {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -284,6 +285,26 @@ func TestDiscoverySearchLimitPadsAndCapsExternalFetches(t *testing.T) {
 				t.Fatalf("discoverySearchLimit(%d) = %d, want %d", tt.limit, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDiversifyDiscoveryCandidatesPreservesFitAndVariesTies(t *testing.T) {
+	candidates := []DiscoveryCandidate{
+		{Artist: "Weak", Album: "Weak Album", TrackName: "Weak Track", GenreTags: []string{"heavy metal"}},
+		{Artist: "Tie One", Album: "One", TrackName: "One Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Tie Two", Album: "Two", TrackName: "Two Track", GenreTags: []string{"progressive metal"}},
+	}
+
+	first := diversifyDiscoveryCandidatesWithRand(candidates, []string{"progressive metal"}, rand.New(rand.NewSource(1)))
+	second := diversifyDiscoveryCandidatesWithRand(candidates, []string{"progressive metal"}, rand.New(rand.NewSource(2)))
+	if first[0].Artist != "Tie One" && first[0].Artist != "Tie Two" {
+		t.Fatalf("first diversified candidate = %#v, want a strongest-fit candidate", first[0])
+	}
+	if second[0].Artist != "Tie One" && second[0].Artist != "Tie Two" {
+		t.Fatalf("second diversified candidate = %#v, want a strongest-fit candidate", second[0])
+	}
+	if first[0].Artist == second[0].Artist && first[1].Artist == second[1].Artist {
+		t.Fatalf("seeded tie ordering did not vary: first=%#v second=%#v", first, second)
 	}
 }
 
