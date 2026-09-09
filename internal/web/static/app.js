@@ -10,6 +10,11 @@ const state = {
   })(),
 };
 
+const defaultPrompts = {
+  song: "Give me a handful of individual songs to hear next.",
+  album: "Give me a handful of high-impact albums to check out next.",
+};
+
 const verdictLabels = {
   disliked: "Disliked",
   not_for_me_today: "Not Today",
@@ -39,6 +44,8 @@ const elements = {
   sessionHeading: document.querySelector("#sessionHeading"),
   modeChooser: document.querySelector("#modeChooser"),
 };
+
+const initialPrompt = elements.message.value;
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -496,6 +503,9 @@ function configureMode() {
   elements.pageTitle.textContent = title;
   elements.pageDescription.textContent = description;
   elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : "Album Sessions";
+  if (defaultPrompts[state.mode] && (!elements.message.value || elements.message.value === initialPrompt)) {
+    elements.message.value = defaultPrompts[state.mode];
+  }
   elements.modeChooser.hidden = state.mode !== "entry";
   document.querySelectorAll(".recommendation-nav a").forEach(link => {
     link.classList.toggle("active", link.dataset.mode === state.mode);

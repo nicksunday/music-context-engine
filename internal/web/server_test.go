@@ -179,8 +179,8 @@ func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
 	for name, expected := range map[string][]string{
 		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
-		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode="},
-		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice"},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt"},
+		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
 		if err != nil {
