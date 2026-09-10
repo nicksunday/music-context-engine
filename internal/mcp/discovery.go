@@ -575,45 +575,65 @@ func (client *musicBrainzDiscoveryClient) searchSeededRecordings(
 	if len(seeds) == 0 {
 		return client.searchTagRecordings(ctx, cleanTags, limit)
 	}
+	// Search prompt tags before catalogs so they always get a discovery opportunity.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var tagRecords []musicBrainzRecording
+	if len(cleanTags) > 0 {
+		tagRecords, _ = client.searchTagRecordings(ctx, cleanTags, limit)
+	}
+	var artistRecords [][]musicBrainzRecording
+	for _, artist := range seeds {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		recs, err := client.searchArtistRecordings(ctx, artist, limit)
+		if err == nil {
+			artistRecords = append(artistRecords, recs)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return mergeDiscoveryRecordings(tagRecords, artistRecords), nil
+}
+
+// mergeDiscoveryRecordings reserves half the pool for prompt tags, then gives
+// each artist a turn. Sparse sources donate unused capacity to other sources.
+func mergeDiscoveryRecordings(tags []musicBrainzRecording, artists [][]musicBrainzRecording) []musicBrainzRecording {
 	seen := make(map[string]bool)
 	var recordings []musicBrainzRecording
-	addRecording := func(rec musicBrainzRecording) {
-		if len(recordings) >= maxDiscoveryReconcileCandidates {
-			return
+	take := func(list *[]musicBrainzRecording) bool {
+		for len(*list) > 0 && len(recordings) < maxDiscoveryReconcileCandidates {
+			rec := (*list)[0]
+			*list = (*list)[1:]
+			key := musicBrainzRecordingKey(rec)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			recordings = append(recordings, rec)
+			return true
 		}
-		key := musicBrainzRecordingKey(rec)
-		if key == "" || seen[key] {
-			return
-		}
-		seen[key] = true
-		recordings = append(recordings, rec)
+		return false
 	}
-
-	for _, artist := range seeds {
-		recs, err := client.searchArtistRecordings(ctx, artist, limit)
-		if err != nil {
-			// Best-effort per seed: a misspelled or unknown similar artist
-			// shouldn't discard results from the remaining seeds.
-			continue
+	for len(recordings) < (maxDiscoveryReconcileCandidates+1)/2 && take(&tags) {
+	}
+	// Copy slice headers so consuming lists does not mutate the caller's lists.
+	artists = append([][]musicBrainzRecording(nil), artists...)
+	for len(recordings) < maxDiscoveryReconcileCandidates {
+		before := len(recordings)
+		for i := range artists {
+			take(&artists[i])
 		}
-		for _, rec := range recs {
-			addRecording(rec)
-		}
-		if len(recordings) >= maxDiscoveryReconcileCandidates {
+		if len(recordings) == before {
 			break
 		}
 	}
-
-	if len(cleanTags) > 0 && len(recordings) < maxDiscoveryReconcileCandidates {
-		tagRecs, err := client.searchTagRecordings(ctx, cleanTags, limit)
-		if err == nil {
-			for _, rec := range tagRecs {
-				addRecording(rec)
-			}
-		}
+	for take(&tags) {
 	}
-
-	return recordings, nil
+	return recordings
 }
 
 func (client *musicBrainzDiscoveryClient) searchTagRecordings(

@@ -62,34 +62,36 @@ func SimilarArtistNames(
 	if source == nil || maxArtists <= 0 {
 		return nil
 	}
-	seen := make(map[string]bool)
-	var out []string
-	for _, rawSeed := range seeds {
-		if len(out) >= maxArtists {
+	var lists [][]similarArtist
+	for _, seed := range compactDiscoverySeeds(seeds, maxDiscoverySeedArtists) {
+		if ctx.Err() != nil {
 			break
 		}
-		cleanSeed, err := utils.NormalizeSearchText(rawSeed)
-		if err != nil || cleanSeed == "" {
-			continue
+		similar, err := source.SimilarArtists(ctx, seed, maxSimilarArtistsPerSeed)
+		if err == nil {
+			lists = append(lists, similar)
 		}
-		similar, err := source.SimilarArtists(ctx, rawSeed, maxSimilarArtistsPerSeed)
-		if err != nil {
-			continue
-		}
-		for _, entry := range similar {
-			if len(out) >= maxArtists {
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for len(out) < maxArtists {
+		before := len(out)
+		for i := range lists {
+			for len(lists[i]) > 0 && len(out) < maxArtists {
+				entry := lists[i][0]
+				lists[i] = lists[i][1:]
+				name := strings.TrimSpace(entry.Name)
+				clean, err := utils.NormalizeSearchText(name)
+				if err != nil || clean == "" || seen[clean] || exclude[clean] {
+					continue
+				}
+				seen[clean] = true
+				out = append(out, name)
 				break
 			}
-			name := strings.TrimSpace(entry.Name)
-			cleanName, cleanErr := utils.NormalizeSearchText(name)
-			if cleanErr != nil || cleanName == "" || seen[cleanName] {
-				continue
-			}
-			if exclude != nil && exclude[cleanName] {
-				continue
-			}
-			seen[cleanName] = true
-			out = append(out, name)
+		}
+		if len(out) == before {
+			break
 		}
 	}
 	return out

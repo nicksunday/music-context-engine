@@ -218,6 +218,7 @@ p,
 }
 
 .composer {
+  container-type: inline-size;
   padding: 14px 22px;
   border-bottom: 1px solid var(--line);
   background: #fbfaf6;
@@ -225,6 +226,7 @@ p,
 
 .recommendation-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 10px 22px;
   border-bottom: 1px solid var(--line);
@@ -397,6 +399,10 @@ button:focus-visible {
   overflow: auto;
 }
 
+.results-panel {
+  container-type: inline-size;
+}
+
 .section-header {
   display: flex;
   align-items: flex-start;
@@ -434,7 +440,8 @@ button:focus-visible {
 }
 
 .song-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -444,6 +451,25 @@ button:focus-visible {
 
 .song-identity {
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.song-row .prompt-fit {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+  margin-top: 0;
+}
+
+.song-row .prompt-fit-label,
+.song-row .prompt-fit-actions {
+  grid-column: 1 / -1;
+}
+
+.song-row .prompt-fit-actions .button {
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: 12px;
 }
 
 .song-identity h3 {
@@ -708,7 +734,28 @@ button:focus-visible {
   font-size: 13px;
 }
 
-@media (max-width: 1180px) {
+@container (max-width: 760px) {
+  .field-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 86px;
+  }
+
+  .field-grid > label:first-child {
+    grid-column: 1 / -1;
+  }
+}
+
+@container (max-width: 560px) {
+  .song-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .song-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 1400px) {
   body {
     height: auto;
     overflow: auto;
@@ -728,6 +775,11 @@ button:focus-visible {
     overflow: visible;
   }
 
+  .workspace {
+    grid-template-rows: auto auto auto auto;
+    align-content: start;
+  }
+
   .workbench {
     grid-template-columns: 1fr;
     overflow: visible;
@@ -741,7 +793,12 @@ button:focus-visible {
 
 @media (max-width: 820px) {
   .shell {
-    display: block;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .workspace {
+    order: -1;
   }
 
   .rail,
@@ -768,13 +825,26 @@ button:focus-visible {
   }
 
   .song-row {
-    align-items: flex-start;
-    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
   }
 
   .song-actions {
     justify-content: flex-start;
     width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .toolbar,
+  .composer,
+  .workbench,
+  .recommendation-nav {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .song-row .prompt-fit {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

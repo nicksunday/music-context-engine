@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -49,5 +50,52 @@ func TestSimilarArtistNamesDedupesNormalizedNamesAndHonorsCap(t *testing.T) {
 	names := SimilarArtistNames(context.Background(), source, []string{"Mastodon", "Opeth"}, nil, 1)
 	if !reflect.DeepEqual(names, []string{"Gojira"}) {
 		t.Fatalf("SimilarArtistNames(cap=1) = %#v, want [Gojira]", names)
+	}
+}
+
+type trackedSimilarSource struct {
+	results map[string][]similarArtist
+	calls   []string
+}
+
+func (f *trackedSimilarSource) SimilarArtists(_ context.Context, artist string, limit int) ([]similarArtist, error) {
+	f.calls = append(f.calls, artist)
+	if limit != maxSimilarArtistsPerSeed {
+		panic("unexpected lookup limit")
+	}
+	if artist == "failed" {
+		return nil, fmt.Errorf("unavailable")
+	}
+	return f.results[artist], nil
+}
+
+func TestSimilarArtistNamesBalancesSeeds(t *testing.T) {
+	source := &trackedSimilarSource{results: map[string][]similarArtist{
+		"A": {{Name: "A1"}, {Name: "A2"}, {Name: "A3"}, {Name: "A4"}},
+		"B": {{Name: "B1"}}, "C": {{Name: "C1"}}, "D": {{Name: "D1"}},
+	}}
+	got := SimilarArtistNames(context.Background(), source, []string{"A", " a ", "B", "C", "D", "E"}, nil, 4)
+	if !reflect.DeepEqual(got, []string{"A1", "B1", "C1", "D1"}) {
+		t.Fatalf("unbalanced neighbors: %v", got)
+	}
+	if !reflect.DeepEqual(source.calls, []string{"A", "B", "C", "D"}) {
+		t.Fatalf("unbounded/duplicate calls: %v", source.calls)
+	}
+}
+
+func TestSimilarArtistNamesRedistributesAndSkipsDuplicates(t *testing.T) {
+	source := &trackedSimilarSource{results: map[string][]similarArtist{
+		"A": {{Name: "blocked"}, {Name: "Shared"}, {Name: "A2"}},
+		"B": {{Name: "shared"}, {Name: "B1"}, {Name: "B2"}},
+	}}
+	got := SimilarArtistNames(context.Background(), source, []string{"A", "failed", "empty", "B"}, map[string]bool{"blocked": true}, 5)
+	if !reflect.DeepEqual(got, []string{"Shared", "B1", "A2", "B2"}) {
+		t.Fatalf("neighbors: %v", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	source.calls = nil
+	if got := SimilarArtistNames(ctx, source, []string{"A"}, nil, 4); len(got) != 0 || len(source.calls) != 0 {
+		t.Fatal("canceled lookup ran")
 	}
 }
