@@ -33,6 +33,7 @@ const elements = {
   batchMeta: document.querySelector("#batchMeta"),
   candidateList: document.querySelector("#candidateList"),
   promptForm: document.querySelector("#promptForm"),
+  limit: document.querySelector("#limit"),
   quickFeedback: document.querySelector("#quickFeedback"),
   refreshContext: document.querySelector("#refreshContext"),
   sendButton: document.querySelector("#sendButton"),
@@ -637,6 +638,7 @@ function configureMode() {
   const [title, description] = labels[state.mode];
   elements.pageTitle.textContent = title;
   elements.pageDescription.textContent = description;
+  elements.limit.max = state.mode === "song" ? "20" : "10";
   elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : "Album Sessions";
   if (defaultPrompts[state.mode] && (!elements.message.value || elements.message.value === initialPrompt)) {
     elements.message.value = defaultPrompts[state.mode];
