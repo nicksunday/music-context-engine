@@ -32,3 +32,30 @@ for (const width of [1920, 1440, 1280, 1024, 821, 768, 390]) {
     await expect(page.locator(".prompt-fit-notes").first()).toBeInViewport();
   });
 }
+
+for (const width of [1920, 1440, 1280, 390]) {
+  test(`full song batch scrolls to the last feedback controls at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.route("**/api/batch/latest?mode=song", async route => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      const candidate = payload.batch.candidates[0];
+      payload.batch.candidates = Array.from({ length: 10 }, (_, index) => ({
+        ...candidate, id: `scroll-song-${index}`, song: `Scroll Song ${index + 1}`,
+      }));
+      await route.fulfill({ response, json: payload });
+    });
+    await page.goto("/recommendations/songs");
+    const last = page.locator(".song-row").last();
+    await expect(last).toContainText("Scroll Song 10");
+    if (width > 1400) {
+      const panel = page.locator(".results-panel");
+      const bounds = await panel.boundingBox();
+      await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + 60);
+      await page.mouse.wheel(0, 4000);
+      await expect.poll(() => panel.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    }
+    await last.locator(".prompt-fit-notes").scrollIntoViewIfNeeded();
+    await expect(last.locator(".prompt-fit-notes")).toBeInViewport();
+  });
+}

@@ -643,9 +643,9 @@ func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 
 func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
 	for name, expected := range map[string][]string{
-		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\"", "id=\"exampleForm\"", "Request Examples"},
-		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "updateExampleSongVisibility", "restorePrompt(response.batch", "response.degraded_reason"},
-		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", ".examples-panel", ".example-row", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
+		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "restorePrompt(response.batch", "response.degraded_reason"},
+		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
 		if err != nil {

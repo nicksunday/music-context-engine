@@ -48,10 +48,9 @@ const elements = {
   exportPreview: document.querySelector("#exportPreview"),
   approveExport: document.querySelector("#approveExport"),
   downloadExport: document.querySelector("#downloadExport"),
-  exampleList: document.querySelector("#exampleList"),
-  exampleForm: document.querySelector("#exampleForm"),
-  loadExamples: document.querySelector("#loadExamples"),
 };
+
+const savedVerdicts = new Map();
 
 const exportState = { items: [], selected: new Set(), payloads: new Map() };
 state.examples = [];
@@ -390,44 +389,6 @@ async function loadExamples() {
   const query = new URLSearchParams(fields);
   const response = await api(`/api/examples?${query}`);
   state.examples = response.examples || [];
-  renderExamples();
-}
-
-function renderExamples() {
-  elements.exampleList.replaceChildren();
-  for (const example of state.examples) {
-    const row = document.createElement("div");
-    row.className = "example-row";
-    row.textContent = `${example.entity_scope}: ${example.supplied_text} · ${example.polarity}${example.notes ? ` · ${example.notes}` : ""}`;
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "button secondary";
-    remove.textContent = "Remove";
-    remove.addEventListener("click", async () => {
-      await api("/api/examples", { method: "DELETE", body: JSON.stringify({ ...exampleRequestFields(), example }) });
-      await loadExamples();
-    });
-    row.append(remove);
-    elements.exampleList.append(row);
-  }
-}
-
-async function saveExample(event) {
-  event.preventDefault();
-  const form = new FormData(elements.exampleForm);
-  const example = Object.fromEntries(form.entries());
-  if (example.entity_scope === "artist") example.song = "";
-  await api("/api/examples", { method: "POST", body: JSON.stringify({ ...exampleRequestFields(), example }) });
-  await loadExamples();
-  elements.exampleForm.reset();
-  updateExampleSongVisibility();
-}
-
-function updateExampleSongVisibility() {
-  const scope = elements.exampleForm.elements.entity_scope.value;
-  const field = elements.exampleForm.querySelector(".example-song-field");
-  field.hidden = scope === "artist";
-  field.querySelector("input").disabled = scope === "artist";
 }
 
 function renderBatch(batch) {
@@ -501,6 +462,7 @@ function renderBatch(batch) {
       const button = document.createElement("button");
       button.type = "button";
       button.textContent = verdictLabels[verdict];
+      setFeedbackSelection(button, savedVerdicts.get(candidate.id) === verdict);
       button.addEventListener("click", () => logCandidateFeedback(candidate, verdict, button));
       buttons.append(button);
     }
@@ -527,7 +489,7 @@ function renderPromptFitControls(candidate) {
     button.type = "button";
     button.className = "button secondary prompt-fit-button";
     button.textContent = text;
-    if (candidate.prompt_fit?.verdict === verdict) button.classList.add("selected");
+    setFeedbackSelection(button, candidate.prompt_fit?.verdict === verdict);
     button.addEventListener("click", () => savePromptFit(candidate, verdict, group));
     actions.append(button);
   }
@@ -609,6 +571,7 @@ function renderSongCandidate(candidate) {
     button.type = "button";
     button.className = "button secondary song-feedback";
     button.textContent = label;
+    setFeedbackSelection(button, savedVerdicts.get(candidate.id) === verdict);
     button.addEventListener("click", () => logCandidateFeedback(candidate, verdict, button));
     actions.append(button);
   }
@@ -626,8 +589,17 @@ function renderSongCandidate(candidate) {
   elements.candidateList.append(row);
 }
 
+function setFeedbackSelection(button, selected) {
+  if (!button.hasAttribute("aria-label")) button.setAttribute("aria-label", button.textContent);
+  button.classList.toggle("selected", selected);
+  button.setAttribute("aria-pressed", String(selected));
+}
+
 async function logCandidateFeedback(candidate, verdict, button) {
-  button.disabled = true;
+  const buttons = [...button.parentElement.querySelectorAll("button")];
+  const originalLabel = button.textContent;
+  buttons.forEach(item => item.disabled = true);
+  button.textContent = "Saving…";
   setStatus("Logging feedback");
   try {
     await api("/api/feedback", {
@@ -642,16 +614,17 @@ async function logCandidateFeedback(candidate, verdict, button) {
         notes: candidate.note || "",
       }),
     });
-    for (const sibling of button.parentElement.querySelectorAll("button")) {
-      sibling.classList.remove("selected");
+    savedVerdicts.set(candidate.id, verdict);
+    for (const sibling of buttons) {
+      if (sibling.hasAttribute("aria-pressed")) setFeedbackSelection(sibling, sibling === button);
     }
-    button.classList.add("selected");
     await loadContext();
     await loadRail();
   } catch (error) {
     appendMessage("error", error.message);
   } finally {
-    button.disabled = false;
+    button.textContent = originalLabel;
+    buttons.forEach(item => item.disabled = false);
     setStatus("");
   }
 }
@@ -722,10 +695,6 @@ async function refreshAll() {
 }
 
 elements.promptForm.addEventListener("submit", submitPrompt);
-elements.exampleForm.addEventListener("submit", saveExample);
-elements.loadExamples.addEventListener("click", () => loadExamples().catch((error) => appendMessage("error", error.message)));
-elements.exampleForm.elements.entity_scope.addEventListener("change", updateExampleSongVisibility);
-updateExampleSongVisibility();
 elements.quickFeedback.addEventListener("submit", submitQuickFeedback);
 elements.refreshContext.addEventListener("click", () => refreshAll().catch((error) => appendMessage("error", error.message)));
 elements.approveExport.addEventListener("click", () => approveSelectedExports().catch((error) => appendMessage("error", error.message)));
