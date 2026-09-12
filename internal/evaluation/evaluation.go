@@ -24,7 +24,21 @@ type Case struct {
 	Candidates    []Candidate    `json:"candidates,omitempty"`
 	Assertions    []Assertion    `json:"assertions"`
 	Plan          map[string]any `json:"plan,omitempty"`
+	References    []Reference    `json:"references,omitempty"`
+	Providers     []Provider     `json:"providers,omitempty"`
 	ContentHash   string         `json:"content_hash,omitempty"`
+}
+
+type Reference struct {
+	SuppliedText string `json:"supplied_text"`
+	Scope        string `json:"scope"`
+	Polarity     string `json:"polarity"`
+	Origin       string `json:"origin"`
+}
+
+type Provider struct {
+	Name  string `json:"name"`
+	Calls int    `json:"calls"`
 }
 
 type Request struct {
@@ -34,13 +48,15 @@ type Request struct {
 }
 
 type Candidate struct {
-	ID        string   `json:"id"`
-	Artist    string   `json:"artist"`
-	Album     string   `json:"album"`
-	Song      string   `json:"song,omitempty"`
-	GenreTags []string `json:"genre_tags,omitempty"`
-	Rank      int      `json:"rank"`
-	Eligible  bool     `json:"eligible"`
+	ID             string   `json:"id"`
+	Artist         string   `json:"artist"`
+	Album          string   `json:"album"`
+	Song           string   `json:"song,omitempty"`
+	GenreTags      []string `json:"genre_tags,omitempty"`
+	Rank           int      `json:"rank"`
+	Eligible       bool     `json:"eligible"`
+	Qualification  string   `json:"qualification,omitempty"`
+	EvidenceScopes []string `json:"evidence_scopes,omitempty"`
 }
 
 // CandidatePolicy is an optional deterministic production-policy adapter.
@@ -49,13 +65,18 @@ type Candidate struct {
 type CandidatePolicy func(Request, string, []Candidate, int64) []Candidate
 
 type Assertion struct {
-	Type         string `json:"type"`
-	CandidateID  string `json:"candidate_id,omitempty"`
-	First        string `json:"first,omitempty"`
-	Second       string `json:"second,omitempty"`
-	Trait        string `json:"trait,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-	ExpectedMode string `json:"expected_mode,omitempty"`
+	Type          string `json:"type"`
+	CandidateID   string `json:"candidate_id,omitempty"`
+	First         string `json:"first,omitempty"`
+	Second        string `json:"second,omitempty"`
+	Trait         string `json:"trait,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	ExpectedMode  string `json:"expected_mode,omitempty"`
+	Scope         string `json:"scope,omitempty"`
+	Polarity      string `json:"polarity,omitempty"`
+	Origin        string `json:"origin,omitempty"`
+	MaxCalls      int    `json:"max_calls,omitempty"`
+	Qualification string `json:"qualification,omitempty"`
 }
 
 type AssertionResult struct {
@@ -213,6 +234,28 @@ func evaluateAssertion(item Case, assertion Assertion) AssertionResult {
 		value, ok := item.Plan[assertion.Trait]
 		result.Passed = ok && value != nil
 		result.Message = "plan trait checked"
+	case "reference_present":
+		result.Passed = false
+		for _, reference := range item.References {
+			if reference.SuppliedText == assertion.CandidateID && (assertion.Scope == "" || reference.Scope == assertion.Scope) && (assertion.Polarity == "" || reference.Polarity == assertion.Polarity) && (assertion.Origin == "" || reference.Origin == assertion.Origin) {
+				result.Passed = true
+				break
+			}
+		}
+		result.Message = "reference provenance checked"
+	case "candidate_qualification":
+		index := findCandidate(item, assertion.CandidateID)
+		result.Passed = index >= 0 && item.Candidates[index].Qualification == assertion.Qualification
+		result.Message = "candidate qualification checked"
+	case "provider_calls_bounded":
+		result.Passed = false
+		for _, provider := range item.Providers {
+			if provider.Name == assertion.CandidateID {
+				result.Passed = provider.Calls <= assertion.MaxCalls
+				break
+			}
+		}
+		result.Message = "provider call bound checked"
 	default:
 		result.Message = "unsupported assertion type"
 		result.Passed = false

@@ -231,7 +231,7 @@ func TestInitDBAddsRecommendationStreamingURLColumnToExistingDB(t *testing.T) {
 	if artist != "black midi" {
 		t.Fatalf("migrated candidate artist = %q, want black midi", artist)
 	}
-	for _, table := range []string{"recommendation_prompt_fit_feedback", "recommendation_batch_snapshots", "recommendation_export_drafts"} {
+	for _, table := range []string{"recommendation_prompt_fit_feedback", "recommendation_batch_snapshots", "recommendation_export_drafts", "recommendation_examples"} {
 		var count int
 		if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil {
 			t.Fatalf("failed to inspect migrated table %s: %v", table, err)
@@ -249,6 +249,16 @@ func TestInitDBAddsRecommendationStreamingURLColumnToExistingDB(t *testing.T) {
 	}
 	if _, err := SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: "batch-1", CandidateID: "candidate-1", Verdict: "missed", Reason: "other"}); err != nil {
 		t.Fatalf("legacy batch fit feedback failed: %v", err)
+	}
+	var candidateCount, feedbackCount int
+	if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM recommendation_candidates WHERE batch_id='batch-1'").Scan(&candidateCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM recommendation_prompt_fit_feedback WHERE batch_id='batch-1'").Scan(&feedbackCount); err != nil {
+		t.Fatal(err)
+	}
+	if candidateCount != 1 || feedbackCount != 1 {
+		t.Fatalf("legacy rows changed during migration: candidates=%d feedback=%d", candidateCount, feedbackCount)
 	}
 
 	if _, err := db.Ctx.Exec(`

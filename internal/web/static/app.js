@@ -48,9 +48,13 @@ const elements = {
   exportPreview: document.querySelector("#exportPreview"),
   approveExport: document.querySelector("#approveExport"),
   downloadExport: document.querySelector("#downloadExport"),
+  exampleList: document.querySelector("#exampleList"),
+  exampleForm: document.querySelector("#exampleForm"),
+  loadExamples: document.querySelector("#loadExamples"),
 };
 
 const exportState = { items: [], selected: new Set(), payloads: new Map() };
+state.examples = [];
 
 const initialPrompt = elements.message.value;
 
@@ -178,6 +182,8 @@ async function loadSession(session) {
   try {
     const response = await api(`/api/batch?id=${encodeURIComponent(session.id)}&mode=${encodeURIComponent(state.mode)}`);
     setCurrentBatch(response.batch);
+    restorePrompt(response.batch || session);
+    await loadExamples();
   } catch (error) {
     // Partial recovery (D3): restore the prompt client-side and surface an
     // explicit error in the Current Batch surface instead of a silent no-op.
@@ -340,6 +346,7 @@ async function submitPrompt(event) {
     avoid: String(form.get("avoid") || "").trim(),
     limit: Number(form.get("limit") || 6),
     mode: state.mode === "song" ? "song" : "album",
+    examples: state.examples || [],
   };
   if (!request.message) return;
 
@@ -351,6 +358,10 @@ async function submitPrompt(event) {
       method: "POST",
       body: JSON.stringify(request),
     });
+    if (response.batch) {
+      response.batch.degraded_reason = response.degraded_reason || "";
+      response.batch.shortfall_reason = response.shortfall_reason || "";
+    }
     setCurrentBatch(response.batch);
     appendMessage("assistant", response.reply || "Batch generated.");
     await loadContext();
@@ -364,6 +375,61 @@ async function submitPrompt(event) {
   }
 }
 
+function exampleRequestFields() {
+  return {
+    message: elements.message.value.trim(),
+    mood: elements.mood.value.trim(),
+    avoid: document.querySelector("#avoid").value.trim(),
+    mode: state.mode === "song" ? "song" : "album",
+  };
+}
+
+async function loadExamples() {
+  const fields = exampleRequestFields();
+  if (!fields.message) return;
+  const query = new URLSearchParams(fields);
+  const response = await api(`/api/examples?${query}`);
+  state.examples = response.examples || [];
+  renderExamples();
+}
+
+function renderExamples() {
+  elements.exampleList.replaceChildren();
+  for (const example of state.examples) {
+    const row = document.createElement("div");
+    row.className = "example-row";
+    row.textContent = `${example.entity_scope}: ${example.supplied_text} · ${example.polarity}${example.notes ? ` · ${example.notes}` : ""}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button secondary";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", async () => {
+      await api("/api/examples", { method: "DELETE", body: JSON.stringify({ ...exampleRequestFields(), example }) });
+      await loadExamples();
+    });
+    row.append(remove);
+    elements.exampleList.append(row);
+  }
+}
+
+async function saveExample(event) {
+  event.preventDefault();
+  const form = new FormData(elements.exampleForm);
+  const example = Object.fromEntries(form.entries());
+  if (example.entity_scope === "artist") example.song = "";
+  await api("/api/examples", { method: "POST", body: JSON.stringify({ ...exampleRequestFields(), example }) });
+  await loadExamples();
+  elements.exampleForm.reset();
+  updateExampleSongVisibility();
+}
+
+function updateExampleSongVisibility() {
+  const scope = elements.exampleForm.elements.entity_scope.value;
+  const field = elements.exampleForm.querySelector(".example-song-field");
+  field.hidden = scope === "artist";
+  field.querySelector("input").disabled = scope === "artist";
+}
+
 function renderBatch(batch) {
   elements.candidateList.replaceChildren();
   elements.candidateList.classList.toggle("song-list", batch?.mode === "song");
@@ -374,7 +440,8 @@ function renderBatch(batch) {
   }
   const count = batch.candidates.length;
   const isSongBatch = batch.mode === "song";
-  elements.batchMeta.textContent = `${count} ${isSongBatch ? "song" : "album"}${count === 1 ? "" : "s"} from the latest verified discovery run`;
+  const state = [batch.degraded_reason && `degraded: ${batch.degraded_reason}`, batch.shortfall_reason && `shortfall: ${batch.shortfall_reason}`].filter(Boolean).join(" · ");
+  elements.batchMeta.textContent = `${count} ${isSongBatch ? "song" : "album"}${count === 1 ? "" : "s"} from the latest verified discovery run${state ? ` · ${state}` : ""}`;
   for (const candidate of batch.candidates) {
     if (isSongBatch) {
       renderSongCandidate(candidate);
@@ -655,6 +722,10 @@ async function refreshAll() {
 }
 
 elements.promptForm.addEventListener("submit", submitPrompt);
+elements.exampleForm.addEventListener("submit", saveExample);
+elements.loadExamples.addEventListener("click", () => loadExamples().catch((error) => appendMessage("error", error.message)));
+elements.exampleForm.elements.entity_scope.addEventListener("change", updateExampleSongVisibility);
+updateExampleSongVisibility();
 elements.quickFeedback.addEventListener("submit", submitQuickFeedback);
 elements.refreshContext.addEventListener("click", () => refreshAll().catch((error) => appendMessage("error", error.message)));
 elements.approveExport.addEventListener("click", () => approveSelectedExports().catch((error) => appendMessage("error", error.message)));

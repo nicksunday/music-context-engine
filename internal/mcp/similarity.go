@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nicksunday/music-context-platform/internal/recommendation"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -47,6 +48,46 @@ type similarArtistSource interface {
 // artists gathered from Last.fm.
 type SimilarArtistSource = similarArtistSource
 
+// SimilarArtistEdges contains every valid direct provider edge from the
+// bounded seed lookups. A neighbor may occur more than once when multiple
+// references contribute to it; callers can deduplicate the neighbor for
+// selection while retaining every edge for provenance.
+func SimilarArtistEdges(
+	ctx context.Context,
+	source SimilarArtistSource,
+	seeds []string,
+) []recommendation.SimilarityEdge {
+	if source == nil {
+		return nil
+	}
+	edges := make([]recommendation.SimilarityEdge, 0)
+	for _, seed := range compactDiscoverySeeds(seeds, maxDiscoverySeedArtists) {
+		if ctx.Err() != nil {
+			break
+		}
+		neighbors, err := source.SimilarArtists(ctx, seed, maxSimilarArtistsPerSeed)
+		if err != nil {
+			continue
+		}
+		for _, neighbor := range neighbors {
+			name := strings.TrimSpace(neighbor.Name)
+			if name == "" {
+				continue
+			}
+			if _, err := utils.NormalizeSearchText(name); err != nil {
+				continue
+			}
+			edges = append(edges, recommendation.SimilarityEdge{
+				Source:        "last.fm",
+				ReferenceText: strings.TrimSpace(seed),
+				Neighbor:      name,
+				Match:         neighbor.Match,
+			})
+		}
+	}
+	return edges
+}
+
 // SimilarArtistNames returns up to maxArtists real similar-artist names (from
 // the configured source, normally Last.fm) for the given seed artists, excluding
 // any name whose normalized form is present in exclude. It returns nil when the
@@ -63,14 +104,13 @@ func SimilarArtistNames(
 		return nil
 	}
 	var lists [][]similarArtist
+	edges := SimilarArtistEdges(ctx, source, seeds)
+	bySeed := make(map[string][]similarArtist)
+	for _, edge := range edges {
+		bySeed[edge.ReferenceText] = append(bySeed[edge.ReferenceText], similarArtist{Name: edge.Neighbor, Match: edge.Match})
+	}
 	for _, seed := range compactDiscoverySeeds(seeds, maxDiscoverySeedArtists) {
-		if ctx.Err() != nil {
-			break
-		}
-		similar, err := source.SimilarArtists(ctx, seed, maxSimilarArtistsPerSeed)
-		if err == nil {
-			lists = append(lists, similar)
-		}
+		lists = append(lists, bySeed[seed])
 	}
 	seen := make(map[string]bool)
 	var out []string

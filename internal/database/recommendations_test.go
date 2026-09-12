@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -82,6 +83,143 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	if persistedStreamingURL != wantStreamingURL {
 		t.Fatalf("persisted streaming_url = %q, want %q", persistedStreamingURL, wantStreamingURL)
 	}
+}
+
+func TestRecommendationExamplesAreScopedRevisionedAndClearable(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	ctx := context.Background()
+	first, err := SaveRecommendationExample(ctx, db.Ctx, RecommendationExample{
+		RequestKey: "request-1", EntityScope: "artist", SuppliedText: "Luca Turilli", Artist: "Luca Turilli", Polarity: "positive", Notes: "more melodic leads",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Active || first.Revision != 1 || first.Artist != "Luca Turilli" {
+		t.Fatalf("first example = %#v", first)
+	}
+	second, err := SaveRecommendationExample(ctx, db.Ctx, RecommendationExample{
+		RequestKey: "request-1", EntityScope: "artist", SuppliedText: "Luca Turilli", Artist: "Luca Turilli", Polarity: "negative", Notes: "correction",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID || second.Revision != 2 || second.Polarity != "negative" {
+		t.Fatalf("revised example = %#v, want same row revision 2", second)
+	}
+	current, err := ListRecommendationExamples(ctx, db.Ctx, "request-1")
+	if err != nil || len(current) != 1 || current[0].Notes != "correction" {
+		t.Fatalf("current examples = %#v, err = %v", current, err)
+	}
+	if err := ClearRecommendationExample(ctx, db.Ctx, "request-1", "artist", "Luca Turilli", "Luca Turilli", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	current, err = ListRecommendationExamples(ctx, db.Ctx, "request-1")
+	if err != nil || len(current) != 0 {
+		t.Fatalf("cleared current examples = %#v, err = %v", current, err)
+	}
+	var active, revision int
+	if err := db.Ctx.QueryRow("SELECT active, revision FROM recommendation_examples WHERE id=?", first.ID).Scan(&active, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 || revision != 3 {
+		t.Fatalf("cleared example row = active %d revision %d", active, revision)
+	}
+}
+
+func TestFetchRelevantRecommendationContextIsBoundedAndLabelsSignals(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id,title,artist,clean_title,clean_artist,user_rating) VALUES
+		 ('relevant-album','Relevant Album','Symphony X','relevant album','symphony x',4.5),
+		 ('unrelated-album','Unrelated Album','Pop Artist','unrelated album','pop artist',5.0);
+		INSERT INTO tracks (id,album_id,title,album,artist,clean_title,clean_artist,is_favorite) VALUES
+		 ('relevant-track','relevant-album','Relevant Song','Relevant Album','Symphony X','relevant song','symphony x',1);
+		INSERT INTO apple_music_play_activity (id,artist,album,song_name) VALUES
+		 ('play-1','Symphony X','Relevant Album','Relevant Song'),('play-2','Symphony X','Relevant Album','Relevant Song');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := FetchRelevantRecommendationContext(context.Background(), db.Ctx, []string{"symphony x"}, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 3 {
+		t.Fatalf("context = %#v, want favorite, rating, and listening signals", got)
+	}
+	for _, record := range got {
+		if record.Artist == "Pop Artist" {
+			t.Fatalf("unrelated history dominated context: %#v", got)
+		}
+		if record.SignalType == "listening_activity" && !strings.Contains(record.Details, "not a fit judgment") {
+			t.Fatalf("listening signal mislabeled: %#v", record)
+		}
+	}
+	empty, err := FetchRelevantRecommendationContext(context.Background(), db.Ctx, nil, 24)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("sparse context = %#v, err=%v", empty, err)
+	}
+}
+
+func TestCorrectedFitFeedbackChangesCurrentContextButNotSnapshotOrTaste(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	ctx := context.Background()
+	batch, err := CreateRecommendationBatch(ctx, db.Ctx, RecommendationBatchInput{
+		Prompt: "technical metal songs", Mode: "song",
+		Candidates: []RecommendationCandidateInput{{Artist: "Symphony X", Album: "The Odyssey", Song: "Inferno"}},
+		Snapshot:   &RecommendationBatchSnapshotInput{SchemaVersion: 1, Complete: true, Payload: map[string]any{"request": "technical metal songs", "effective_examples": []any{"Luca Turilli"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LogRecommendationFeedback(ctx, db.Ctx, RecommendationFeedbackInput{Artist: "Symphony X", Album: "The Odyssey", CandidateID: batch.Candidates[0].ID, Verdict: "good"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(ctx, db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: batch.ID, CandidateID: batch.Candidates[0].ID, Verdict: "missed", Reason: "wrong_energy"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := FetchRelevantRecommendationContext(ctx, db.Ctx, []string{"symphony x"}, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contextHasSignal(current, "prompt_fit", "missed") || !contextHasSignal(current, "taste_feedback", "good") {
+		t.Fatalf("initial context = %#v", current)
+	}
+	if _, err := SaveRecommendationPromptFitFeedback(ctx, db.Ctx, RecommendationPromptFitFeedbackInput{BatchID: batch.ID, CandidateID: batch.Candidates[0].ID, Verdict: "met"}); err != nil {
+		t.Fatal(err)
+	}
+	current, err = FetchRelevantRecommendationContext(ctx, db.Ctx, []string{"symphony x"}, 24)
+	if err != nil || contextHasSignal(current, "prompt_fit", "missed") || !contextHasSignal(current, "prompt_fit", "met") {
+		t.Fatalf("corrected context = %#v, err=%v", current, err)
+	}
+	if err := ClearRecommendationPromptFitFeedback(ctx, db.Ctx, batch.ID, batch.Candidates[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err = FetchRelevantRecommendationContext(ctx, db.Ctx, []string{"symphony x"}, 24)
+	if err != nil || contextHasSignalType(current, "prompt_fit") || !contextHasSignal(current, "taste_feedback", "good") {
+		t.Fatalf("cleared context = %#v, err=%v", current, err)
+	}
+	snapshot, err := FetchRecommendationBatchSnapshot(ctx, db.Ctx, batch.ID)
+	if err != nil || snapshot.Payload["request"] != "technical metal songs" {
+		t.Fatalf("snapshot changed after feedback correction = %#v, err=%v", snapshot, err)
+	}
+}
+
+func contextHasSignal(records []RecommendationContextRecord, signalType, value string) bool {
+	for _, record := range records {
+		if record.SignalType == signalType && record.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func contextHasSignalType(records []RecommendationContextRecord, signalType string) bool {
+	for _, record := range records {
+		if record.SignalType == signalType {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPromptFitFeedbackIsIndependentAndValidated(t *testing.T) {

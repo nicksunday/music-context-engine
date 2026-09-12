@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/nicksunday/music-context-platform/internal/database"
 	mcpserver "github.com/nicksunday/music-context-platform/internal/mcp"
+	recommendation "github.com/nicksunday/music-context-platform/internal/recommendation"
 )
 
 type fakeRecommender struct {
@@ -78,6 +80,367 @@ func TestAppleMusicAppURLConvertsCanonicalDestination(t *testing.T) {
 	}
 	if got := AppleMusicAppURL("https://example.com/song/123"); got != "" {
 		t.Fatalf("AppleMusicAppURL(non-Apple Music URL) = %q, want empty", got)
+	}
+}
+
+func TestRecommendationDiagnosticsStageMetricsAreCredentialFree(t *testing.T) {
+	diagnostics := RecommendationDiagnostics{}
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "planning", time.Now(), 1)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "similarity", time.Now(), 2)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "discovery", time.Now(), 1)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "selection", time.Now(), 1)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "verification", time.Now(), 3)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "destination_resolution", time.Now(), 3)
+	diagnostics.Stages = appendStageMetric(diagnostics.Stages, "persistence", time.Now(), 1)
+	raw, err := json.Marshal(diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "api_key") || strings.Contains(string(raw), "token") || strings.Contains(string(raw), "http") {
+		t.Fatalf("diagnostics contain credential or URL data: %s", raw)
+	}
+	wanted := []string{"planning", "similarity", "discovery", "selection", "verification", "destination_resolution", "persistence"}
+	if len(diagnostics.Stages) != len(wanted) {
+		t.Fatalf("stage metrics = %#v", diagnostics.Stages)
+	}
+	for index, stage := range diagnostics.Stages {
+		if stage.Stage != wanted[index] || stage.ExternalCalls < 0 {
+			t.Fatalf("stage metric %d = %#v", index, stage)
+		}
+	}
+}
+
+func TestValidateRecommendationExamplesAllowsArtistWithoutSong(t *testing.T) {
+	err := validateRecommendationExamples([]recommendation.Reference{{
+		SuppliedText: "Luca Turilli", Artist: "Luca Turilli", EntityScope: "artist", Polarity: "positive",
+	}})
+	if err != nil {
+		t.Fatalf("artist example validation failed: %v", err)
+	}
+}
+
+func TestValidateRecommendationExamplesRejectsMalformedShape(t *testing.T) {
+	tests := []recommendation.Reference{
+		{SuppliedText: "bad", EntityScope: "artist", Polarity: "maybe"},
+		{SuppliedText: "bad", EntityScope: "artist", Polarity: "positive", Song: "track"},
+		{SuppliedText: "bad", EntityScope: "song", Polarity: "positive", Artist: "Artist", Album: "Album"},
+	}
+	for _, example := range tests {
+		if err := validateRecommendationExamples([]recommendation.Reference{example}); err == nil {
+			t.Fatalf("expected malformed example to fail: %#v", example)
+		}
+	}
+}
+
+func TestReconcileRecommendationReferencesExplicitExamplesOverrideOnlySameEntity(t *testing.T) {
+	extracted := []recommendation.Reference{
+		{SuppliedText: "Symphony X", Artist: "Symphony X", EntityScope: "artist", Polarity: "positive"},
+		{SuppliedText: "Children of Bodom", Artist: "Children of Bodom", EntityScope: "artist", Polarity: "positive"},
+		{SuppliedText: "Rhapsody", Artist: "Rhapsody", EntityScope: "artist", Polarity: "positive", Resolution: "ambiguous"},
+	}
+	explicit := []recommendation.Reference{
+		{SuppliedText: "Symphony X", Artist: "Symphony X", EntityScope: "artist", Polarity: "negative"},
+	}
+	got := reconcileRecommendationReferences(extracted, explicit)
+	if len(got) != 3 {
+		t.Fatalf("references = %#v, want three distinct references", got)
+	}
+	if got[0].Polarity != "negative" || got[0].Origin != "structured_example" {
+		t.Fatalf("explicit example did not override extracted reference: %#v", got[0])
+	}
+	seenChildren, seenRhapsody := false, false
+	for _, reference := range got {
+		if reference.SuppliedText == "Children of Bodom" {
+			seenChildren = true
+		}
+		if reference.SuppliedText == "Rhapsody" && reference.Resolution == "unresolved" {
+			seenRhapsody = true
+		}
+	}
+	if !seenChildren || !seenRhapsody {
+		t.Fatalf("distinct or unresolved references were lost: %#v", got)
+	}
+}
+
+func TestReconcileRecommendationReferencesKeepsDistinctAlbums(t *testing.T) {
+	got := reconcileRecommendationReferences(nil, []recommendation.Reference{
+		{Artist: "Rhapsody", Album: "Dawn of Victory", EntityScope: "album", Polarity: "positive"},
+		{Artist: "Rhapsody", Album: "Rain of a Thousand Flames", EntityScope: "album", Polarity: "positive"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("album references = %#v, want both albums", got)
+	}
+}
+
+func TestReconcileRecommendationReferencesDoesNotTrustModelIdentity(t *testing.T) {
+	got := reconcileRecommendationReferences([]recommendation.Reference{{
+		SuppliedText: "Rhapsody", Artist: "Rhapsody", EntityScope: "artist", Polarity: "positive",
+		CanonicalName: "Rhapsody of Fire", MBID: "fake-mbid", Resolution: "resolved",
+	}}, nil)
+	if len(got) != 1 || got[0].CanonicalName != "" || got[0].MBID != "" || got[0].Resolution != "unresolved" {
+		t.Fatalf("untrusted model identity survived: %#v", got)
+	}
+}
+
+func TestPlanDiscoveryExtractsReferencesAndUsesOneModelCall(t *testing.T) {
+	callCount := 0
+	ollama := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		callCount++
+		if request.URL.Path != "/api/chat" {
+			t.Fatalf("path = %q, want /api/chat", request.URL.Path)
+		}
+		_ = json.NewEncoder(writer).Encode(ollamaChatResponse{Message: ollamaMessage{Content: `{"vibe_summary":"technical metal","references":[{"supplied_text":"Symphony X","artist":"Symphony X","entity_scope":"artist","polarity":"positive","resolution":"resolved","mbid":"model-id"}],"fallback_tags":["progressive metal"]}`}})
+	}))
+	defer ollama.Close()
+
+	recommender := NewOllamaRecommenderWithTimeout(ollama.URL, "fake", time.Second)
+	planner := &MCPGroundedOllamaRecommender{ollama: recommender}
+	plan, err := planner.planDiscovery(context.Background(), RecommendationRequest{
+		Message:  "same vein as Symphony X",
+		Examples: []recommendation.Reference{{SuppliedText: "Symphony X", Artist: "Symphony X", EntityScope: "artist", Polarity: "negative"}},
+	}, ProfileContext{})
+	if err != nil {
+		t.Fatalf("planDiscovery() error = %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("planning calls = %d, want one", callCount)
+	}
+	if len(plan.References) != 1 || plan.References[0].Polarity != "negative" || plan.References[0].Origin != "structured_example" {
+		t.Fatalf("references = %#v, want explicit negative reference", plan.References)
+	}
+	if plan.References[0].MBID != "" || plan.References[0].Resolution != "unresolved" {
+		t.Fatalf("model identity was trusted: %#v", plan.References[0])
+	}
+}
+
+func TestSimilaritySeedsPreferPositiveReferencesAndExcludeNegativeExamples(t *testing.T) {
+	positive := []recommendation.Reference{
+		{Artist: "Symphony X", SuppliedText: "Symphony X", EntityScope: "artist", Polarity: "positive"},
+		{Artist: "Children of Bodom", SuppliedText: "Children of Bodom", EntityScope: "artist", Polarity: "positive"},
+		{Artist: "Avoided", SuppliedText: "Avoided", EntityScope: "artist", Polarity: "negative"},
+	}
+	got := similaritySeedsForPlan(positive, []database.ArtistAffinity{{Artist: "Historical Favorite"}})
+	if !reflect.DeepEqual(got, []string{"Symphony X", "Children of Bodom"}) {
+		t.Fatalf("reference seeds = %#v, want explicit positive references only", got)
+	}
+	got = similaritySeedsForPlan([]recommendation.Reference{{Artist: "Avoided", SuppliedText: "Avoided", EntityScope: "artist", Polarity: "negative"}}, []database.ArtistAffinity{{Artist: "Historical Favorite"}})
+	if !reflect.DeepEqual(got, []string{"Historical Favorite"}) {
+		t.Fatalf("affinity fallback seeds = %#v, want historical favorite", got)
+	}
+}
+
+func TestSimilarArtistsFromEdgesDeduplicatesNeighborsWithoutLosingEdgeInput(t *testing.T) {
+	edges := []recommendation.SimilarityEdge{
+		{Source: "last.fm", ReferenceText: "Symphony X", Neighbor: "Dream Theater", Match: .9},
+		{Source: "last.fm", ReferenceText: "Children of Bodom", Neighbor: "Dream Theater", Match: .7},
+		{Source: "last.fm", ReferenceText: "Children of Bodom", Neighbor: "Ayreon", Match: .6},
+	}
+	got := similarArtistsFromEdges(edges, []recommendation.Reference{{Artist: "Symphony X"}}, nil)
+	if !reflect.DeepEqual(got, []string{"Dream Theater", "Ayreon"}) {
+		t.Fatalf("discovery neighbors = %#v", got)
+	}
+	if len(edges) != 3 || edges[0].Match != .9 || edges[1].ReferenceText != "Children of Bodom" {
+		t.Fatalf("edge provenance was mutated: %#v", edges)
+	}
+}
+
+func TestSimilarityProviderStatusIsSafeAndExplicit(t *testing.T) {
+	if got := similarityProviderStatus(nil, nil, nil); got != "unconfigured" {
+		t.Fatalf("nil source status = %q", got)
+	}
+	if got := similarityProviderStatus(nil, []string{"Symphony X"}, []recommendation.SimilarityEdge{{Neighbor: "Dream Theater"}}); got != "available" {
+		t.Fatalf("available status = %q", got)
+	}
+}
+
+func TestRelevantContextPromptPreservesSignalTypes(t *testing.T) {
+	var builder strings.Builder
+	appendRelevantContextPrompt(&builder, []database.RecommendationContextRecord{
+		{Source: "tracks", Entity: "track", Artist: "Symphony X", SignalType: "favorite", Value: "favorite"},
+		{Source: "recommendation_prompt_fit_feedback", Entity: "candidate", Artist: "Dream Theater", SignalType: "prompt_fit", Value: "missed"},
+		{Source: "apple_music_play_activity", Entity: "listening_activity", Artist: "Symphony X", SignalType: "listening_activity", Value: "4", Details: "play events; not a fit judgment"},
+	})
+	text := builder.String()
+	for _, want := range []string{"signal=favorite", "signal=prompt_fit", "signal=listening_activity", "not a fit judgment"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("context prompt = %q, missing %q", text, want)
+		}
+	}
+}
+
+func TestPerformanceTraitsRequireScopedEvidenceNotGenreTags(t *testing.T) {
+	request := RecommendationRequest{Message: "virtuosic metal"}
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"virtuosic/lead-playing"}}
+	_, unsupported := promptTraitCoverageForPlan(request, plan, mcpserver.DiscoveryCandidate{GenreTags: []string{"neoclassical metal", "power metal"}})
+	if !containsString(unsupported, "virtuosic/lead-playing") {
+		t.Fatalf("tag-only performance claim was supported: %#v", unsupported)
+	}
+	withEvidence := mcpserver.DiscoveryCandidate{GenreTags: []string{"power metal"}, Evidence: []recommendation.Evidence{{EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "virtuosic lead playing"}}}
+	supported, unsupported := promptTraitCoverageForPlan(request, plan, withEvidence)
+	if !containsString(supported, "virtuosic/lead-playing") || containsString(unsupported, "virtuosic/lead-playing") {
+		t.Fatalf("scoped performance evidence ignored: supported=%#v unsupported=%#v", supported, unsupported)
+	}
+}
+
+func TestValidateCandidateSelectionAssessmentRequiresExistingEvidenceForSupported(t *testing.T) {
+	candidate := mcpserver.DiscoveryCandidate{TrackName: "Track", Evidence: []recommendation.Evidence{{ID: "e1", EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified recording"}}}
+	valid := validateCandidateSelectionAssessment(modelCandidateSelection{Fit: "supported", EvidenceIDs: []string{"e1"}}, candidate)
+	if !valid.Valid {
+		t.Fatalf("valid assessment rejected: %#v", valid)
+	}
+	if validateCandidateSelectionAssessment(modelCandidateSelection{Fit: "supported", EvidenceIDs: []string{"missing"}}, candidate).Valid {
+		t.Fatal("missing evidence accepted")
+	}
+	if validateCandidateSelectionAssessment(modelCandidateSelection{Fit: "supported"}, candidate).Valid {
+		t.Fatal("supported assessment without evidence accepted")
+	}
+	if validateCandidateSelectionAssessment(modelCandidateSelection{Fit: "contradicted", EvidenceIDs: []string{"e1"}}, candidate).Valid {
+		t.Fatal("contradicted assessment accepted")
+	}
+}
+
+func TestSelectionFallbackMarksMalformedOutputAsDegraded(t *testing.T) {
+	ollama := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"message":{"content":"not json"}}`))
+	}))
+	defer ollama.Close()
+	discovery := []mcpserver.DiscoveryCandidate{{Artist: "Artist", Album: "Album", TrackName: "Track"}}
+	recommender := &MCPGroundedOllamaRecommender{ollama: NewOllamaRecommenderWithTimeout(ollama.URL, "fake", time.Second)}
+	draft, err := recommender.selectDiscoveryCandidates(context.Background(), RecommendationRequest{Message: "progressive metal", Limit: 1}, ProfileContext{}, modelDiscoveryPlan{}, discovery)
+	if err != nil || draft.DegradedReason != "selection_malformed_json" || len(draft.Candidates) != 1 || draft.Candidates[0].Artist != "Artist" {
+		t.Fatalf("degraded selection = %#v, err=%v", draft, err)
+	}
+}
+
+func TestSelectionFallbackMarksTimeoutAsDegraded(t *testing.T) {
+	ollama := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = writer.Write([]byte(`{"message":{"content":"late response"}}`))
+	}))
+	defer ollama.Close()
+	discovery := []mcpserver.DiscoveryCandidate{{Artist: "Artist", Album: "Album", TrackName: "Track"}}
+	recommender := &MCPGroundedOllamaRecommender{ollama: NewOllamaRecommenderWithTimeout(ollama.URL, "fake", 10*time.Millisecond)}
+	draft, err := recommender.selectDiscoveryCandidates(context.Background(), RecommendationRequest{Message: "progressive metal", Limit: 1}, ProfileContext{}, modelDiscoveryPlan{}, discovery)
+	if err != nil || draft.DegradedReason != "selection_model_error" || len(draft.Candidates) != 1 || draft.Candidates[0].Artist != "Artist" {
+		t.Fatalf("timeout fallback = %#v, err=%v", draft, err)
+	}
+}
+
+func TestTraceEndpointExposesSnapshotAndLegacyMissingProvenance(t *testing.T) {
+	db := openWebTestDB(t)
+	ctx := context.Background()
+	current, err := database.CreateRecommendationBatch(ctx, db.Ctx, database.RecommendationBatchInput{
+		Prompt: "trace request", Candidates: []database.RecommendationCandidateInput{{Artist: "Artist", Album: "Album"}},
+		Snapshot: &database.RecommendationBatchSnapshotInput{SchemaVersion: 1, Complete: true, Payload: map[string]any{
+			"references":       []recommendation.Reference{{SuppliedText: "Symphony X", EntityScope: "artist", Polarity: "positive"}},
+			"examples":         []recommendation.Reference{{SuppliedText: "Luca Turilli", EntityScope: "artist", Polarity: "positive"}},
+			"providers":        []recommendation.ProviderStatus{{Provider: "last.fm", Status: "available"}},
+			"similarity_edges": []recommendation.SimilarityEdge{{Source: "last.fm", ReferenceText: "Symphony X", Neighbor: "Dream Theater", Match: .8}},
+			"diagnostics":      map[string]any{"stages": []recommendation.StageMetric{{Stage: "planning", ElapsedMS: 3, ExternalCalls: 1}}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := database.CreateRecommendationBatch(ctx, db.Ctx, database.RecommendationBatchInput{Prompt: "legacy", Candidates: []database.RecommendationCandidateInput{{Artist: "Old", Album: "Album"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/trace?id="+current.ID, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Dream Theater") || !strings.Contains(response.Body.String(), "Luca Turilli") {
+		t.Fatalf("current trace response = %d %s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/trace?id="+legacy.ID, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "stage_metrics") || !strings.Contains(response.Body.String(), "legacy") {
+		t.Fatalf("legacy trace response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestQualifyDiscoveryCandidateSeparatesGeneralTagsFromSpecificPerformance(t *testing.T) {
+	general := qualifyDiscoveryCandidate(RecommendationRequest{Message: "progressive metal"}, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{GenreTags: []string{"progressive metal"}})
+	if general.Status != recommendation.QualificationPlausible {
+		t.Fatalf("general tag qualification = %#v", general)
+	}
+	specific := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal"}, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{GenreTags: []string{"progressive metal"}})
+	if specific.Status != recommendation.QualificationInsufficient || specific.Reason != "missing_candidate_evidence" {
+		t.Fatalf("specific tag qualification = %#v", specific)
+	}
+	withEvidence := mcpserver.DiscoveryCandidate{TrackName: "Track", Evidence: []recommendation.Evidence{{ID: "lead", EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "virtuosic lead playing"}}}
+	qualified := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal", Mode: "song"}, modelDiscoveryPlan{}, withEvidence)
+	if qualified.Status != recommendation.QualificationPlausible {
+		t.Fatalf("scoped evidence qualification = %#v", qualified)
+	}
+	missingTrack := qualifyDiscoveryCandidate(RecommendationRequest{Message: "progressive metal songs", Mode: "song"}, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{Evidence: []recommendation.Evidence{{ID: "album", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceGenreProxy, Claim: "catalog tag"}}})
+	if missingTrack.Status != recommendation.QualificationInsufficient || missingTrack.Reason != "track_identity_missing" {
+		t.Fatalf("missing track qualification = %#v", missingTrack)
+	}
+}
+
+func TestBackfillSkipsUnqualifiedCandidates(t *testing.T) {
+	request := RecommendationRequest{Message: "virtuosic metal", Limit: 2}
+	plan := modelDiscoveryPlan{}
+	selected := []database.RecommendationCandidateInput{}
+	pool := []mcpserver.DiscoveryCandidate{
+		{Artist: "Unknown", Album: "Unknown", TrackName: "Track", GenreTags: []string{"progressive metal"}},
+		{Artist: "Supported", Album: "Album", TrackName: "Track", GenreTags: []string{"progressive metal"}, Evidence: []recommendation.Evidence{{ID: "lead", EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "virtuosic lead playing"}}},
+	}
+	got, added := backfillRecommendationCandidates(request, selected, pool, plan, 2, nil)
+	if len(got) != 1 || got[0].Artist != "Supported" || added != 1 {
+		t.Fatalf("backfill = %#v, added=%d; want only qualified candidate", got, added)
+	}
+}
+
+func TestExamplesEndpointPersistsRevisesAndClearsRequestScopedExamples(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{})
+	body := `{"message":"same vein as Symphony X","mode":"song","example":{"supplied_text":"Luca Turilli","artist":"Luca Turilli","entity_scope":"artist","polarity":"positive","notes":"more melodic"}}`
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/examples", strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /api/examples status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var saved database.RecommendationExample
+	if err := json.NewDecoder(response.Body).Decode(&saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.RequestKey != database.RecommendationRequestKey("same vein as Symphony X", "", "", "song") || saved.Revision != 1 {
+		t.Fatalf("saved example = %#v", saved)
+	}
+
+	getURL := "/api/examples?message=same+vein+as+Symphony+X&mode=song"
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, getURL, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Luca Turilli") {
+		t.Fatalf("GET /api/examples status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	body = `{"message":"same vein as Symphony X","mode":"song","example":{"supplied_text":"Luca Turilli","artist":"Luca Turilli","entity_scope":"artist","polarity":"negative","notes":"corrected"}}`
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/examples", strings.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("revision POST status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if err := json.NewDecoder(response.Body).Decode(&saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Revision != 2 || saved.Polarity != "negative" {
+		t.Fatalf("revised example = %#v", saved)
+	}
+
+	body = `{"message":"same vein as Symphony X","mode":"song","example":{"supplied_text":"Luca Turilli","artist":"Luca Turilli","entity_scope":"artist","polarity":"negative"}}`
+	request := httptest.NewRequest(http.MethodDelete, "/api/examples", strings.NewReader(body))
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/examples status = %d, body = %s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, getURL, nil))
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "Luca Turilli") {
+		t.Fatalf("cleared example still current: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -280,9 +643,9 @@ func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 
 func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
 	for name, expected := range map[string][]string{
-		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
-		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt"},
-		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
+		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\"", "id=\"exampleForm\"", "Request Examples"},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "updateExampleSongVisibility", "restorePrompt(response.batch", "response.degraded_reason"},
+		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", ".examples-panel", ".example-row", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
 		if err != nil {
@@ -618,13 +981,13 @@ func TestPromptTraitCoverageFlagsVirtuosicLeadPlaying(t *testing.T) {
 	supported, unsupported = promptTraitCoverage(request, mcpserver.DiscoveryCandidate{
 		GenreTags: []string{"progressive metal", "power metal", "neoclassical metal"},
 	})
-	if !containsString(supported, "virtuosic/lead-playing") ||
+	if containsString(supported, "virtuosic/lead-playing") ||
 		!containsString(supported, "melodic") ||
 		!containsString(supported, "heavy") {
-		t.Fatalf("supported = %#v, want virtuosic/lead-playing, melodic, and heavy", supported)
+		t.Fatalf("supported = %#v, want melodic and heavy but not unverified lead-playing", supported)
 	}
-	if len(unsupported) != 0 {
-		t.Fatalf("unsupported = %#v, want none", unsupported)
+	if !containsString(unsupported, "virtuosic/lead-playing") {
+		t.Fatalf("unsupported = %#v, want unverified lead-playing", unsupported)
 	}
 }
 
@@ -785,49 +1148,14 @@ func TestDiscoveryPlanCalibrationAddsComparisonFields(t *testing.T) {
 		modelDiscoveryPlan{},
 	)
 
-	for _, want := range []string{"rage against the machine"} {
-		if !containsString(plan.ReferenceAnchors, want) {
-			t.Fatalf("ReferenceAnchors = %#v, want %q", plan.ReferenceAnchors, want)
-		}
-	}
-	for _, want := range []string{"funk metal", "rap metal", "rhythmic groove", "staccato riffs"} {
-		if !containsString(plan.ComparisonTraits, want) {
-			t.Fatalf("ComparisonTraits = %#v, want %q", plan.ComparisonTraits, want)
-		}
-	}
-	if !containsString(plan.FalseFriendTraits, "generic heavy metal") {
-		t.Fatalf("FalseFriendTraits = %#v, want generic heavy metal", plan.FalseFriendTraits)
-	}
-	if !containsString(plan.BridgeTraits, "alternative metal") {
-		t.Fatalf("BridgeTraits = %#v, want alternative metal", plan.BridgeTraits)
-	}
-	for _, want := range []string{"funk metal", "rap metal", "alternative metal", "funk rock"} {
-		if !containsString(plan.FallbackTags, want) {
-			t.Fatalf("FallbackTags = %#v, want %q", plan.FallbackTags, want)
-		}
-	}
-
-	plan = calibrateDiscoveryPlanForPrompt(
-		RecommendationRequest{Message: "Something like KNOWER but heavier"},
-		modelDiscoveryPlan{},
-	)
-	if !containsString(plan.ReferenceAnchors, "knower") {
-		t.Fatalf("ReferenceAnchors = %#v, want knower", plan.ReferenceAnchors)
-	}
-	if !containsString(plan.ComparisonModifiers, "heavier") {
-		t.Fatalf("ComparisonModifiers = %#v, want heavier", plan.ComparisonModifiers)
-	}
-	if !containsString(plan.ComparisonTraits, "jazz-funk") || !containsString(plan.ComparisonTraits, "electronic fusion") {
-		t.Fatalf("ComparisonTraits = %#v, want jazz-funk and electronic fusion", plan.ComparisonTraits)
-	}
-	if !containsString(plan.BridgeTraits, "added weight") {
-		t.Fatalf("BridgeTraits = %#v, want added weight", plan.BridgeTraits)
+	if len(plan.ReferenceAnchors) != 0 || len(plan.ComparisonTraits) != 0 || len(plan.FallbackTags) != 0 {
+		t.Fatalf("calibration added artist-specific rules: %#v", plan)
 	}
 }
 
 func TestRankDiscoveryCandidatesForRATMComparisonPreservesGroove(t *testing.T) {
 	request := RecommendationRequest{Message: "Give me Rage Against the Machine vibes"}
-	plan := calibrateDiscoveryPlanForPrompt(request, modelDiscoveryPlan{})
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"funk metal", "rap metal", "rhythmic groove"}, BridgeTraits: []string{"alternative metal"}}
 
 	ranked := rankDiscoveryCandidatesForPrompt(request, plan, []mcpserver.DiscoveryCandidate{
 		{
@@ -849,7 +1177,7 @@ func TestRankDiscoveryCandidatesForRATMComparisonPreservesGroove(t *testing.T) {
 
 func TestRankDiscoveryCandidatesForKNOWERButHeavierPreservesFusion(t *testing.T) {
 	request := RecommendationRequest{Message: "Something like KNOWER but heavier"}
-	plan := calibrateDiscoveryPlanForPrompt(request, modelDiscoveryPlan{})
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"jazz-funk", "electronic fusion"}, BridgeTraits: []string{"added weight"}}
 
 	ranked := rankDiscoveryCandidatesForPrompt(request, plan, []mcpserver.DiscoveryCandidate{
 		{
@@ -871,7 +1199,7 @@ func TestRankDiscoveryCandidatesForKNOWERButHeavierPreservesFusion(t *testing.T)
 
 func TestRankDiscoveryCandidatesForOpethLessDeathMetalRespectsSubtractiveConstraint(t *testing.T) {
 	request := RecommendationRequest{Message: "Something like Opeth but less death metal"}
-	plan := calibrateDiscoveryPlanForPrompt(request, modelDiscoveryPlan{})
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"progressive metal", "melodic", "dynamic contrast"}, FalseFriendTraits: []string{"death metal", "technical death metal"}}
 
 	ranked := rankDiscoveryCandidatesForPrompt(request, plan, []mcpserver.DiscoveryCandidate{
 		{
@@ -895,7 +1223,7 @@ func TestPromptTraitCoverageDoesNotTreatTechnicalityAsComparisonSupport(t *testi
 	request := RecommendationRequest{
 		Message: "I'd like virtuosic metal like Symphony X or Children of Bodom, especially symphonic metal",
 	}
-	plan := calibrateDiscoveryPlanForPrompt(request, modelDiscoveryPlan{})
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"virtuosic/lead-playing", "symphonic metal"}}
 
 	supported, unsupported := promptTraitCoverageForPlan(request, plan, mcpserver.DiscoveryCandidate{
 		GenreTags: []string{"technical death metal", "deathcore"},
@@ -910,7 +1238,7 @@ func TestPromptTraitCoverageDoesNotTreatTechnicalityAsComparisonSupport(t *testi
 
 func TestFallbackDiscoveryDraftKeepsComparisonNotesGrounded(t *testing.T) {
 	request := RecommendationRequest{Message: "Something like KNOWER but heavier", Limit: 2}
-	plan := calibrateDiscoveryPlanForPrompt(request, modelDiscoveryPlan{})
+	plan := modelDiscoveryPlan{ComparisonTraits: []string{"jazz-funk"}, BridgeTraits: []string{"added weight"}}
 
 	draft := fallbackDiscoveryDraft(request, []mcpserver.DiscoveryCandidate{
 		{
@@ -920,6 +1248,7 @@ func TestFallbackDiscoveryDraftKeepsComparisonNotesGrounded(t *testing.T) {
 			Runtime:     "4:00",
 			ReleaseYear: 2020,
 			GenreTags:   []string{"heavy metal"},
+			Evidence:    []recommendation.Evidence{{ID: "catalog", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified album identity"}},
 		},
 		{
 			Artist:      "Fusion Weight",
@@ -928,6 +1257,7 @@ func TestFallbackDiscoveryDraftKeepsComparisonNotesGrounded(t *testing.T) {
 			Runtime:     "3:22",
 			ReleaseYear: 2021,
 			GenreTags:   []string{"jazz-funk", "funk metal"},
+			Evidence:    []recommendation.Evidence{{ID: "catalog", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified album identity"}},
 		},
 	}, plan, 2)
 
@@ -1149,7 +1479,7 @@ func TestMCPGroundedRecommenderFiltersAvoidedDiscoveryCandidates(t *testing.T) {
 		case 0:
 			content = `{"vibe_summary":"melodic virtuosic metal","required_traits":["new-to-user"],"flexible_traits":["melodic","heavy","virtuosic"],"target_vibe":"","fallback_tags":["technical death metal","progressive metal","power metal"]}`
 		case 1:
-			content = `{"reply":"Try the melodic power-metal pick.","selections":[{"candidate_index":1,"note":"Keeps the melodic, virtuosic side without avoided tags."}]}`
+			content = `{"reply":"Try the melodic power-metal pick.","selections":[{"candidate_index":2,"fit":"supported","evidence_ids":["catalog","lead"],"note":"Keeps the melodic and lead-playing side without avoided tags."}]}`
 		default:
 			t.Fatalf("unexpected Ollama call %d", callCount+1)
 		}
@@ -1171,6 +1501,7 @@ func TestMCPGroundedRecommenderFiltersAvoidedDiscoveryCandidates(t *testing.T) {
 			Runtime:     "4:19",
 			ReleaseYear: 2024,
 			GenreTags:   []string{"progressive metal", "technical death metal"},
+			Evidence:    []recommendation.Evidence{{ID: "catalog", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified album identity"}},
 		},
 		{
 			Artist:      "Adagio",
@@ -1179,6 +1510,7 @@ func TestMCPGroundedRecommenderFiltersAvoidedDiscoveryCandidates(t *testing.T) {
 			Runtime:     "7:39",
 			ReleaseYear: 2003,
 			GenreTags:   []string{"progressive metal", "power metal"},
+			Evidence:    []recommendation.Evidence{{ID: "catalog", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified album identity"}, {ID: "lead", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceCatalogIdentity, Claim: "virtuosic lead playing"}},
 		},
 	}}
 	recommender := newMCPGroundedOllamaRecommenderWithDiscovery(ollama.URL, "fake", time.Minute, discovery)

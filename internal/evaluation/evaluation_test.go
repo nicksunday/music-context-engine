@@ -69,3 +69,65 @@ func TestUnsupportedAssertionFailsExplicitly(t *testing.T) {
 		t.Fatalf("report = %#v", report)
 	}
 }
+
+func TestReferenceLedCorpusChecksProvenanceQualificationAndProviderBounds(t *testing.T) {
+	path := filepath.Join("..", "..", "testdata", "recommendation-fit", "reference-led.jsonl")
+	cases, hash, err := LoadCorpus(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := Evaluate(cases, hash)
+	if report.Summary.Passed != 4 || report.Summary.Failed != 0 || report.Summary.Ineligible != 0 {
+		t.Fatalf("report summary = %#v", report.Summary)
+	}
+}
+
+func TestSummarizeLiveObservationsSeparatesFitFailuresAndReportsLatency(t *testing.T) {
+	report := SummarizeLiveObservations([]LiveObservation{
+		{CaseID: "a", Mode: "song", Request: "a", FitJudgment: "met", ReturnedCount: 3, TotalMS: 100},
+		{CaseID: "b", Mode: "album", Request: "b", FitJudgment: "missed", ReturnedCount: 0, Empty: true, ProviderFailure: "timeout", TotalMS: 300},
+		{CaseID: "c", Mode: "album", Request: "c", ReturnedCount: 1, TotalMS: 200},
+	})
+	if report.Evaluation != "live_manual" || report.Summary.Observations != 3 || report.Summary.FitJudged != 2 || report.Summary.FitMet != 1 || report.Summary.Empty != 1 || report.Summary.ProviderFailures != 1 {
+		t.Fatalf("live summary = %#v", report)
+	}
+	if report.Summary.TotalMedianMS != 200 || report.Summary.TotalP95MS != 200 {
+		t.Fatalf("latency summary = %#v, want median/p95 200", report.Summary)
+	}
+}
+
+func TestLoadLiveObservationsRejectsMissingRequiredFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "observations.jsonl")
+	if err := os.WriteFile(path, []byte(`{"case_id":"missing-request","mode":"song"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadLiveObservations(path); err == nil {
+		t.Fatal("invalid live observation accepted")
+	}
+}
+
+func TestCompareFrozenModelPoolRequiresComparableInputsAndPreservesAvailability(t *testing.T) {
+	report, err := CompareFrozenModelPool([]FrozenModelObservation{
+		{Model: "model-a", PoolHash: "pool", RequestHash: "request", Available: true, Selections: []string{"a"}},
+		{Model: "model-b", PoolHash: "pool", RequestHash: "request", Available: false, Reason: "not installed"},
+	})
+	if err != nil || len(report.SelectionModels) != 1 || len(report.Limitations) < 3 || report.Evaluation != "frozen_pool_selection" {
+		t.Fatalf("frozen comparison = %#v, err=%v", report, err)
+	}
+	if _, err := CompareFrozenModelPool([]FrozenModelObservation{{Model: "model-a", PoolHash: "one", RequestHash: "request"}, {Model: "model-b", PoolHash: "two", RequestHash: "request"}}); err == nil {
+		t.Fatal("incomparable pools accepted")
+	}
+}
+
+func TestCompareBeforeAfterSeparatesComparableSettingsAndSubjectiveFit(t *testing.T) {
+	before := []LiveObservation{{CaseID: "song", Mode: "song", Request: "prompt", SettingsHash: "same", FitJudgment: "missed", ReturnedCount: 1, TotalMS: 200}}
+	after := []LiveObservation{{CaseID: "song", Mode: "song", Request: "prompt", SettingsHash: "same", FitJudgment: "met", ReturnedCount: 2, TotalMS: 100}}
+	report := CompareBeforeAfter(before, after)
+	if !report.Comparable || report.Before.FitMet != 0 || report.After.FitMet != 1 || report.Before.TotalMedianMS != 200 || report.After.TotalMedianMS != 100 {
+		t.Fatalf("before/after = %#v", report)
+	}
+	report = CompareBeforeAfter(before, []LiveObservation{{CaseID: "song", Mode: "song", Request: "prompt", SettingsHash: "changed", TotalMS: 100}})
+	if report.Comparable {
+		t.Fatal("different settings reported comparable")
+	}
+}

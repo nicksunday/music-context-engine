@@ -159,8 +159,11 @@ func TestGetVerifiedDiscoveryCandidatesFetchesMusicBrainzAndFiltersExclusions(t 
 		ReleaseYear: 1974,
 		GenreTags:   []string{"progressive rock", "canterbury scene"},
 	}}
-	if !reflect.DeepEqual(candidates, want) {
-		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want %#v", candidates, want)
+	if len(candidates) != 1 || candidates[0].TrackName != want[0].TrackName || candidates[0].Artist != want[0].Artist || candidates[0].Album != want[0].Album || candidates[0].Runtime != want[0].Runtime || candidates[0].ReleaseYear != want[0].ReleaseYear || !reflect.DeepEqual(candidates[0].GenreTags, want[0].GenreTags) {
+		t.Fatalf("getVerifiedDiscoveryCandidates() = %#v, want identity/tags %#v", candidates, want)
+	}
+	if len(candidates[0].Evidence) == 0 || candidates[0].Evidence[0].EntityScope != "recording" {
+		t.Fatalf("candidate evidence = %#v, want scoped catalog evidence", candidates[0].Evidence)
 	}
 }
 

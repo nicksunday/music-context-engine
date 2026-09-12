@@ -64,10 +64,43 @@ func main() {
 		runWeb(os.Args[2:])
 	case "eval-recommendations":
 		runEvalRecommendations(os.Args[2:])
+	case "eval-recommendations-live":
+		runEvalRecommendationsLive(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+func runEvalRecommendationsLive(args []string) {
+	flags := flag.NewFlagSet("eval-recommendations-live", flag.ExitOnError)
+	observationsPath := flags.String("observations", "", "explicitly captured live/manual observation JSONL")
+	jsonPath := flags.String("json", "", "write the live report to this path")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "Usage: music-vault eval-recommendations-live --observations observations.jsonl [--json report.json]")
+	}
+	if err := flags.Parse(args); err != nil {
+		log.Fatalf("failed to parse live evaluation args: %v", err)
+	}
+	if strings.TrimSpace(*observationsPath) == "" || len(flags.Args()) > 0 {
+		flags.Usage()
+		os.Exit(2)
+	}
+	observations, err := evaluation.LoadLiveObservations(*observationsPath)
+	if err != nil {
+		log.Fatalf("failed to load live observations: %v", err)
+	}
+	report := evaluation.SummarizeLiveObservations(observations)
+	raw, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		log.Fatalf("failed to encode live report: %v", err)
+	}
+	if strings.TrimSpace(*jsonPath) != "" {
+		if err := os.WriteFile(*jsonPath, append(raw, '\n'), 0o644); err != nil {
+			log.Fatalf("failed to write live report: %v", err)
+		}
+	}
+	fmt.Printf("Live evaluation: %d observations, %d fit judged, %d empty, %d provider failures; median=%0.0fms p95=%0.0fms\n", report.Summary.Observations, report.Summary.FitJudged, report.Summary.Empty, report.Summary.ProviderFailures, report.Summary.TotalMedianMS, report.Summary.TotalP95MS)
 }
 
 func runEvalRecommendations(args []string) {
@@ -871,5 +904,5 @@ func defaultWebModel() string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve|web|eval-recommendations> [args]")
+	fmt.Fprintln(os.Stderr, "Usage: music-vault <ingest|enrich|optimize|profile|serve|web|eval-recommendations|eval-recommendations-live> [args]")
 }

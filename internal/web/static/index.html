@@ -77,6 +77,27 @@
         </div>
       </form>
 
+      <section class="examples-panel" aria-label="Request examples">
+        <div class="section-header">
+          <div>
+            <h3>Request Examples</h3>
+            <p>Guide this request without changing global taste ratings or exclusions.</p>
+          </div>
+          <button id="loadExamples" class="button secondary" type="button">Load examples</button>
+        </div>
+        <div id="exampleList" class="example-list"></div>
+        <form id="exampleForm" class="example-form">
+          <label><span>Type</span><select name="entity_scope"><option value="artist">Artist</option><option value="album">Album</option><option value="song">Song</option></select></label>
+          <label><span>Polarity</span><select name="polarity"><option value="positive">Positive</option><option value="negative">Negative</option></select></label>
+          <label><span>Supplied identity</span><input name="supplied_text" required placeholder="Luca Turilli"></label>
+          <label><span>Artist</span><input name="artist" placeholder="Artist"></label>
+          <label><span>Album</span><input name="album" placeholder="Album"></label>
+          <label class="example-song-field"><span>Song</span><input name="song" placeholder="Song"></label>
+          <label><span>Note</span><input name="notes" placeholder="Optional correction or reason"></label>
+          <button class="button secondary" type="submit">Save example</button>
+        </form>
+      </section>
+
       <div class="workbench">
         <section class="results-panel" aria-label="Current recommendation batch">
           <div class="section-header">

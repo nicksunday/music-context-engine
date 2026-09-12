@@ -34,6 +34,29 @@ func TestSimilarArtistNamesReturnsRealSimilarArtistsExcludingLibrary(t *testing.
 	}
 }
 
+func TestSimilarArtistEdgesRetainsScoresAndAllReferencePaths(t *testing.T) {
+	source := &fakeSimilarSource{results: map[string][]similarArtist{
+		"Symphony X":        {{Name: "Dream Theater", Match: 0.91}, {Name: "Ayreon", Match: 0.73}},
+		"Children of Bodom": {{Name: "Dream Theater", Match: 0.44}, {Name: "Blind Guardian", Match: 0.68}},
+	}}
+	edges := SimilarArtistEdges(context.Background(), source, []string{"Symphony X", "Children of Bodom"})
+	if len(edges) != 4 {
+		t.Fatalf("edges = %#v, want all four provider edges", edges)
+	}
+	paths := 0
+	for _, edge := range edges {
+		if edge.Neighbor == "Dream Theater" {
+			paths++
+		}
+		if edge.Source != "last.fm" || edge.Match <= 0 || edge.ReferenceText == "" {
+			t.Fatalf("edge lost source/provenance/score: %#v", edge)
+		}
+	}
+	if paths != 2 {
+		t.Fatalf("Dream Theater provenance paths = %d, want 2", paths)
+	}
+}
+
 func TestSimilarArtistNamesReturnsNilWhenSourceUnconfigured(t *testing.T) {
 	if got := SimilarArtistNames(context.Background(), nil, []string{"Mastodon"}, nil, 3); got != nil {
 		t.Fatalf("SimilarArtistNames(nil source) = %#v, want nil", got)

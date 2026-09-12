@@ -37,3 +37,27 @@ template changes require separate manual checks against Ollama and held-out case
 Use failures to propose normal reviewed code or corpus changes through GitHub. This
 feature does not train Ollama, perform reinforcement learning, upload feedback, or
 automatically improve other installations.
+
+## Explicit live/manual evaluation
+
+Live evaluation is never performed by the offline command. After an operator has
+explicitly run the web workflow and recorded one JSON object per observation, create
+an aggregate report with:
+
+```sh
+music-vault eval-recommendations-live \
+  --observations /path/to/observations.jsonl \
+  --json /tmp/recommendation-live-report.json
+```
+
+Each observation records the exact request and mode, model/application versions,
+requested and returned counts, an optional user-judged `fit_judgment`, empty outcome,
+provider failure, per-stage timing, total timing, and call counts. Reports label this
+as `live_manual` and include sample count, median, and p95 total latency. Subjective
+fit is not combined with deterministic assertions or provider failures.
+
+Before/after observations should share a `settings_hash`; otherwise the comparison
+must be treated as non-comparable and no improvement claim is valid. Use `cohort` to
+distinguish recurring prompts from held-out prompts. Frozen-pool model comparisons
+must additionally share `pool_hash` and `request_hash`; unavailable models are
+reported as limitations and are never downloaded implicitly.

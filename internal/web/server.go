@@ -23,6 +23,7 @@ import (
 
 	"github.com/nicksunday/music-context-platform/internal/database"
 	mcpserver "github.com/nicksunday/music-context-platform/internal/mcp"
+	recommendation "github.com/nicksunday/music-context-platform/internal/recommendation"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -283,17 +284,23 @@ type DiscoveryRequest struct {
 }
 
 type RecommendationRequest struct {
-	Message string `json:"message"`
-	Mood    string `json:"mood,omitempty"`
-	Avoid   string `json:"avoid,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
-	Mode    string `json:"mode,omitempty"`
+	Message  string                     `json:"message"`
+	Mood     string                     `json:"mood,omitempty"`
+	Avoid    string                     `json:"avoid,omitempty"`
+	Limit    int                        `json:"limit,omitempty"`
+	Mode     string                     `json:"mode,omitempty"`
+	Examples []recommendation.Reference `json:"examples,omitempty"`
 }
 
 type RecommendationDraft struct {
-	Reply       string                                  `json:"reply"`
-	Candidates  []database.RecommendationCandidateInput `json:"candidates"`
-	Diagnostics RecommendationDiagnostics               `json:"-"`
+	Reply           string                                  `json:"reply"`
+	Candidates      []database.RecommendationCandidateInput `json:"candidates"`
+	Diagnostics     RecommendationDiagnostics               `json:"-"`
+	References      []recommendation.Reference              `json:"references,omitempty"`
+	SimilarityEdges []recommendation.SimilarityEdge         `json:"similarity_edges,omitempty"`
+	Providers       []recommendation.ProviderStatus         `json:"providers,omitempty"`
+	DegradedReason  string                                  `json:"degraded_reason,omitempty"`
+	ShortfallReason string                                  `json:"shortfall_reason,omitempty"`
 }
 
 type RecommendationDiagnostics struct {
@@ -304,10 +311,16 @@ type RecommendationDiagnostics struct {
 	BackfillAddedCount     int
 	VerifiedCount          int
 	VerificationRejected   int
+	QualificationRejected  int
 	ExcludedCount          int
 	AvoidedCount           int
 	DiversityRejectedCount int
 	ReturnedCount          int
+	Stages                 []recommendation.StageMetric `json:"stages,omitempty"`
+}
+
+func appendStageMetric(metrics []recommendation.StageMetric, stage string, started time.Time, externalCalls int) []recommendation.StageMetric {
+	return append(metrics, recommendation.StageMetric{Stage: stage, ElapsedMS: time.Since(started).Milliseconds(), ExternalCalls: externalCalls})
 }
 
 // OfflineCandidate is the bounded candidate shape used by deterministic
@@ -382,9 +395,10 @@ func recommendationMode(value string) string {
 }
 
 type ProfileContext struct {
-	Artists        []database.ArtistAffinity            `json:"artists"`
-	Genres         []database.GenreTopography           `json:"genres"`
-	RecentFeedback []database.RecommendationFeedbackLog `json:"recent_feedback"`
+	Artists         []database.ArtistAffinity              `json:"artists"`
+	Genres          []database.GenreTopography             `json:"genres"`
+	RecentFeedback  []database.RecommendationFeedbackLog   `json:"recent_feedback"`
+	RelevantContext []database.RecommendationContextRecord `json:"relevant_context,omitempty"`
 }
 
 type ContextResponse struct {
@@ -397,8 +411,10 @@ type ContextResponse struct {
 }
 
 type RecommendationResponse struct {
-	Reply string                       `json:"reply"`
-	Batch database.RecommendationBatch `json:"batch"`
+	Reply           string                       `json:"reply"`
+	Batch           database.RecommendationBatch `json:"batch"`
+	DegradedReason  string                       `json:"degraded_reason,omitempty"`
+	ShortfallReason string                       `json:"shortfall_reason,omitempty"`
 }
 
 type BatchResponse struct {
@@ -442,8 +458,12 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	mux.HandleFunc("GET /api/rail", server.handleRail)
 	mux.HandleFunc("GET /api/batch/latest", server.handleLatestBatch)
 	mux.HandleFunc("GET /api/batch", server.handleBatchByID)
+	mux.HandleFunc("GET /api/trace", server.handleTrace)
 	mux.HandleFunc("GET /api/batches", server.handleBatches)
 	mux.HandleFunc("POST /api/recommendations", server.handleRecommendations)
+	mux.HandleFunc("GET /api/examples", server.handleExamples)
+	mux.HandleFunc("POST /api/examples", server.handleExamples)
+	mux.HandleFunc("DELETE /api/examples", server.handleExamples)
 	mux.HandleFunc("POST /api/feedback", server.handleFeedback)
 	mux.HandleFunc("POST /api/prompt-fit", server.handlePromptFitFeedback)
 	mux.HandleFunc("DELETE /api/prompt-fit", server.handlePromptFitFeedback)
@@ -502,7 +522,15 @@ func newMCPGroundedOllamaRecommenderWithDiscovery(
 	return &MCPGroundedOllamaRecommender{
 		ollama:    NewOllamaRecommenderWithTimeout(baseURL, model, timeout),
 		discovery: discovery,
+		db:        discoveryDatabase(discovery),
 	}
+}
+
+func discoveryDatabase(provider DiscoveryProvider) *sql.DB {
+	if provider, ok := provider.(*MCPDiscoveryProvider); ok && provider != nil {
+		return provider.db
+	}
+	return nil
 }
 
 func staticHandler() http.Handler {
@@ -579,6 +607,10 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	input.Message = strings.TrimSpace(input.Message)
 	input.Mood = strings.TrimSpace(input.Mood)
 	input.Avoid = strings.TrimSpace(input.Avoid)
+	if err := validateRecommendationExamples(input.Examples); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
 	if songRecommendationMode(input) {
 		input.Mode = "song"
 	} else {
@@ -594,6 +626,13 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load music profile context.")
 		return
+	}
+	contextTerms := recommendationContextTerms(input)
+	if names, nameErr := database.FindExactContextNames(request.Context(), server.db, strings.Join([]string{input.Message, input.Mood, input.Avoid}, " "), 24); nameErr == nil {
+		contextTerms = append(contextTerms, names...)
+	}
+	if relevant, contextErr := database.FetchRelevantRecommendationContext(request.Context(), server.db, contextTerms, 24); contextErr == nil {
+		profile.RelevantContext = relevant
 	}
 	exclusions, err := (&database.DB{Ctx: server.db}).GetDiscoveryAlbumExclusionsContext(request.Context())
 	if err != nil {
@@ -629,8 +668,10 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
 		return
 	}
+	verificationStarted := time.Now()
 	before = len(draft.Candidates)
 	draft.Candidates, err = server.verifyCandidates(request.Context(), draft.Candidates)
+	draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "verification", verificationStarted, before)
 	draft.Diagnostics.VerifiedCount = len(draft.Candidates)
 	draft.Diagnostics.VerificationRejected += before - len(draft.Candidates)
 	if err != nil {
@@ -660,14 +701,22 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	}
 	draft.Diagnostics.ReturnedCount = len(draft.Candidates)
 	if reason := draft.Diagnostics.shortfallReason(); reason != "" {
+		draft.ShortfallReason = reason
+		if draft.Reply == "" {
+			draft.Reply = "Returned a smaller batch because there were not enough qualified candidates (" + reason + ")."
+		}
 		log.Printf("recommendation_shortfall mode=%s requested=%d returned=%d discovery_pool=%d discovery_avoided=%d model_selected=%d backfill_added=%d verified=%d verification_rejected=%d excluded=%d avoided=%d diversity_rejected=%d reason=%s", input.Mode, draft.Diagnostics.RequestedCount, draft.Diagnostics.ReturnedCount, draft.Diagnostics.DiscoveryPoolCount, draft.Diagnostics.DiscoveryAvoidedCount, draft.Diagnostics.ModelSelectedCount, draft.Diagnostics.BackfillAddedCount, draft.Diagnostics.VerifiedCount, draft.Diagnostics.VerificationRejected, draft.Diagnostics.ExcludedCount, draft.Diagnostics.AvoidedCount, draft.Diagnostics.DiversityRejectedCount, reason)
 	}
+	destinationStarted := time.Now()
 	if songRecommendationMode(input) {
 		draft.Candidates = server.resolveSongLinks(request.Context(), draft.Candidates)
 	} else {
 		draft.Candidates = server.resolveCandidateLinks(request.Context(), draft.Candidates)
 	}
+	draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "destination_resolution", destinationStarted, len(draft.Candidates))
+	draft.References = append([]recommendation.Reference(nil), draft.References...)
 
+	persistenceStarted := time.Now()
 	batch, err := database.CreateRecommendationBatch(request.Context(), server.db, database.RecommendationBatchInput{
 		Prompt:     input.Message,
 		Mood:       input.Mood,
@@ -679,23 +728,85 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 			Complete:      true,
 			Payload: map[string]any{
 				"request":          map[string]any{"message": input.Message, "mood": input.Mood, "avoid": input.Avoid, "limit": input.Limit, "mode": input.Mode},
+				"examples":         input.Examples,
+				"references":       draft.References,
+				"providers":        draft.Providers,
+				"similarity_edges": draft.SimilarityEdges,
 				"model":            server.model,
 				"ollama_url":       server.ollamaURL,
 				"reply":            strings.TrimSpace(draft.Reply),
 				"candidate_output": draft.Candidates,
 				"diagnostics":      draft.Diagnostics,
+				"degraded_reason":  draft.DegradedReason,
+				"shortfall_reason": draft.ShortfallReason,
 			},
 		},
 	})
+	draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "persistence", persistenceStarted, 1)
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to persist recommendation batch.")
 		return
 	}
 
 	writeJSON(writer, http.StatusOK, RecommendationResponse{
-		Reply: strings.TrimSpace(draft.Reply),
-		Batch: batch,
+		Reply:           strings.TrimSpace(draft.Reply),
+		Batch:           batch,
+		DegradedReason:  draft.DegradedReason,
+		ShortfallReason: draft.ShortfallReason,
 	})
+}
+
+func (server *Server) handleExamples(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Message string                   `json:"message"`
+		Mood    string                   `json:"mood,omitempty"`
+		Avoid   string                   `json:"avoid,omitempty"`
+		Mode    string                   `json:"mode,omitempty"`
+		Example recommendation.Reference `json:"example"`
+	}
+	if request.Method == http.MethodGet {
+		input.Message = request.URL.Query().Get("message")
+		input.Mood = request.URL.Query().Get("mood")
+		input.Avoid = request.URL.Query().Get("avoid")
+		input.Mode = request.URL.Query().Get("mode")
+	} else if err := decodeJSON(request, &input); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "Request body must be a JSON object.")
+		return
+	}
+	mode := recommendationMode(input.Mode)
+	requestKey := database.RecommendationRequestKey(input.Message, input.Mood, input.Avoid, mode)
+	if request.Method == http.MethodGet {
+		examples, err := database.ListRecommendationExamples(request.Context(), server.db, requestKey)
+		if err != nil {
+			writeJSONError(writer, http.StatusInternalServerError, "Unable to load recommendation examples.")
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"request_key": requestKey, "examples": examples})
+		return
+	}
+	if err := validateRecommendationExamples([]recommendation.Reference{input.Example}); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.Method == http.MethodDelete {
+		err := database.ClearRecommendationExample(request.Context(), server.db, requestKey, input.Example.EntityScope, input.Example.SuppliedText, input.Example.Artist, input.Example.Album, input.Example.Song)
+		if err != nil {
+			writeJSONError(writer, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"cleared": true, "request_key": requestKey})
+		return
+	}
+	example, err := database.SaveRecommendationExample(request.Context(), server.db, database.RecommendationExample{
+		RequestKey: requestKey, EntityScope: input.Example.EntityScope, SuppliedText: input.Example.SuppliedText,
+		Artist: input.Example.Artist, Album: input.Example.Album, Song: input.Example.Song,
+		Polarity: input.Example.Polarity, Notes: input.Example.Notes,
+	})
+	if err != nil {
+		writeJSONError(writer, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, example)
 }
 
 func recommendationCandidateEmptyMessage(request RecommendationRequest) string {
@@ -933,6 +1044,89 @@ func (server *Server) handleBatchByID(writer http.ResponseWriter, request *http.
 	writeJSON(writer, http.StatusOK, BatchResponse{Batch: &batch})
 }
 
+type RecommendationTraceResponse struct {
+	BatchID   string               `json:"batch_id"`
+	Available bool                 `json:"available"`
+	Missing   []string             `json:"missing,omitempty"`
+	Trace     recommendation.Trace `json:"trace"`
+}
+
+func (server *Server) handleTrace(writer http.ResponseWriter, request *http.Request) {
+	id := strings.TrimSpace(request.URL.Query().Get("id"))
+	if id == "" {
+		writeJSONError(writer, http.StatusBadRequest, "Missing id query parameter.")
+		return
+	}
+	batch, err := database.FetchRecommendationBatchByID(request.Context(), server.db, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(writer, http.StatusNotFound, "Recommendation batch not found.")
+			return
+		}
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load recommendation trace.")
+		return
+	}
+	response := RecommendationTraceResponse{BatchID: batch.ID, Trace: recommendation.Trace{SchemaVersion: recommendation.CurrentSchemaVersion}}
+	if !batch.SnapshotAvailable || batch.Snapshot == nil {
+		response.Trace.Legacy = true
+		response.Missing = []string{"snapshot", "references", "examples", "provider_status", "similarity_edges", "candidate_evidence", "qualification", "stage_metrics"}
+		writeJSON(writer, http.StatusOK, response)
+		return
+	}
+	response.Available = true
+	response.Trace = traceFromSnapshotPayload(batch.Snapshot.Payload)
+	writeJSON(writer, http.StatusOK, response)
+}
+
+func traceFromSnapshotPayload(payload map[string]any) recommendation.Trace {
+	trace := recommendation.Trace{SchemaVersion: recommendation.CurrentSchemaVersion}
+	decode := func(key string, target any) {
+		raw, ok := payload[key]
+		if !ok {
+			return
+		}
+		encoded, err := json.Marshal(raw)
+		if err == nil {
+			_ = json.Unmarshal(encoded, target)
+		}
+	}
+	decode("references", &trace.References)
+	decode("examples", &trace.Examples)
+	decode("providers", &trace.Providers)
+	decode("similarity_edges", &trace.SimilarityEdges)
+	decode("stages", &trace.Stages)
+	if diagnostics, ok := payload["diagnostics"].(map[string]any); ok {
+		if stages, ok := diagnostics["stages"]; ok {
+			decodeValue(stages, &trace.Stages)
+		}
+	}
+	if candidates, ok := payload["candidate_output"].([]any); ok {
+		for _, candidate := range candidates {
+			if item, ok := candidate.(map[string]any); ok {
+				if artist, _ := item["artist"].(string); artist != "" {
+					if album, _ := item["album"].(string); album != "" {
+						trace.FinalCandidateIDs = append(trace.FinalCandidateIDs, artist+" / "+album)
+					}
+				}
+			}
+		}
+	}
+	if reason, ok := payload["degraded_reason"].(string); ok {
+		trace.DegradedReason = reason
+	}
+	if reason, ok := payload["shortfall_reason"].(string); ok {
+		trace.ShortfallReason = reason
+	}
+	return trace.Normalize()
+}
+
+func decodeValue(value any, target any) {
+	encoded, err := json.Marshal(value)
+	if err == nil {
+		_ = json.Unmarshal(encoded, target)
+	}
+}
+
 func (server *Server) handleBatches(writer http.ResponseWriter, request *http.Request) {
 	mode := recommendationMode(request.URL.Query().Get("mode"))
 	batches, err := database.ListRecommendationBatchesForMode(request.Context(), server.db, defaultSessionListLimit, mode)
@@ -964,6 +1158,14 @@ func (server *Server) fetchProfileContext(ctx context.Context) (ProfileContext, 
 		Genres:         genres,
 		RecentFeedback: feedback,
 	}, nil
+}
+
+func recommendationContextTerms(request RecommendationRequest) []string {
+	terms := []string{request.Message, request.Mood}
+	for _, example := range request.Examples {
+		terms = append(terms, example.Artist, example.Album, example.Song, example.SuppliedText)
+	}
+	return terms
 }
 
 func (server *Server) verifyCandidates(
@@ -1051,6 +1253,7 @@ type MCPGroundedOllamaRecommender struct {
 	ollama    *OllamaRecommender
 	discovery DiscoveryProvider
 	similar   mcpserver.SimilarArtistSource
+	db        *sql.DB
 }
 
 // WithSimilarArtists attaches a real similar-artist source (normally Last.fm)
@@ -1063,21 +1266,25 @@ func (recommender *MCPGroundedOllamaRecommender) WithSimilarArtists(source mcpse
 }
 
 type modelDiscoveryPlan struct {
-	VibeSummary         string   `json:"vibe_summary"`
-	RequiredTraits      []string `json:"required_traits"`
-	FlexibleTraits      []string `json:"flexible_traits"`
-	ReferenceAnchors    []string `json:"reference_anchors"`
-	ComparisonTraits    []string `json:"comparison_traits"`
-	FalseFriendTraits   []string `json:"false_friend_traits"`
-	BridgeTraits        []string `json:"bridge_traits"`
-	ComparisonModifiers []string `json:"comparison_modifiers"`
-	TargetVibe          string   `json:"target_vibe"`
-	FallbackTags        []string `json:"fallback_tags"`
+	VibeSummary         string                     `json:"vibe_summary"`
+	RequiredTraits      []string                   `json:"required_traits"`
+	FlexibleTraits      []string                   `json:"flexible_traits"`
+	ReferenceAnchors    []string                   `json:"reference_anchors"`
+	ComparisonTraits    []string                   `json:"comparison_traits"`
+	FalseFriendTraits   []string                   `json:"false_friend_traits"`
+	BridgeTraits        []string                   `json:"bridge_traits"`
+	ComparisonModifiers []string                   `json:"comparison_modifiers"`
+	TargetVibe          string                     `json:"target_vibe"`
+	FallbackTags        []string                   `json:"fallback_tags"`
+	References          []recommendation.Reference `json:"references,omitempty"`
 }
 
 type modelCandidateSelection struct {
-	CandidateIndex int    `json:"candidate_index"`
-	Note           string `json:"note"`
+	CandidateIndex int      `json:"candidate_index"`
+	Note           string   `json:"note"`
+	Fit            string   `json:"fit"`
+	EvidenceIDs    []string `json:"evidence_ids,omitempty"`
+	Reason         string   `json:"reason,omitempty"`
 }
 
 type modelCandidateSelectionResponse struct {
@@ -2250,24 +2457,44 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 		return RecommendationDraft{}, errors.New("MCP discovery provider is not configured.")
 	}
 
+	planStarted := time.Now()
 	plan, err := recommender.planDiscovery(ctx, request, profile)
 	if err != nil {
 		return RecommendationDraft{}, err
 	}
+	planMetric := recommendation.StageMetric{Stage: "planning", ElapsedMS: time.Since(planStarted).Milliseconds(), ExternalCalls: 1}
 	if len(plan.FallbackTags) == 0 && strings.TrimSpace(plan.TargetVibe) == "" {
 		plan.TargetVibe = request.Message
 	}
 
+	similarityStarted := time.Now()
+	seedArtists := similaritySeedsForPlan(plan.References, profile.Artists)
+	similarityEdges := mcpserver.SimilarArtistEdges(ctx, recommender.similar, seedArtists)
+	discoverySeeds := similarArtistsFromEdges(similarityEdges, plan.References, profile.Artists)
+	neighborTerms := make([]string, 0, len(plan.References)*4+len(discoverySeeds))
+	for _, reference := range plan.References {
+		neighborTerms = append(neighborTerms, reference.Artist, reference.Album, reference.Song, reference.SuppliedText)
+	}
+	neighborTerms = append(neighborTerms, discoverySeeds...)
+	if recommender.db != nil {
+		if neighborContext, contextErr := database.FetchRelevantRecommendationContext(ctx, recommender.db, neighborTerms, 24); contextErr == nil {
+			profile.RelevantContext = append(profile.RelevantContext, neighborContext...)
+		}
+	}
+	similarityMetric := recommendation.StageMetric{Stage: "similarity", ElapsedMS: time.Since(similarityStarted).Milliseconds(), ExternalCalls: len(seedArtists)}
+
+	discoveryStarted := time.Now()
 	candidates, err := recommender.discovery.Discover(ctx, DiscoveryRequest{
 		TargetVibe:   plan.TargetVibe,
 		FallbackTags: compactWebStrings(plan.FallbackTags),
-		SeedArtists:  recommender.similarSeedArtists(ctx, profile.Artists),
+		SeedArtists:  discoverySeeds,
 		Limit:        discoveryCandidateFetchLimit(request.Mode, request.Limit),
 		Mode:         request.Mode,
 	})
 	if err != nil {
 		return RecommendationDraft{}, fmt.Errorf("MCP verified discovery failed: %w", err)
 	}
+	discoveryMetric := recommendation.StageMetric{Stage: "discovery", ElapsedMS: time.Since(discoveryStarted).Milliseconds(), ExternalCalls: 1}
 	diagnostics := RecommendationDiagnostics{
 		RequestedCount:     clampBatchLimit(request.Mode, request.Limit),
 		DiscoveryPoolCount: len(candidates),
@@ -2284,11 +2511,31 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 	candidates = rankDiscoveryCandidatesForPrompt(request, plan, candidates)
 	candidates = rankDiscoveryCandidatesWithFeedback(request, plan, candidates, profile.RecentFeedback)
 
+	selectionStarted := time.Now()
 	draft, err := recommender.selectDiscoveryCandidates(ctx, request, profile, plan, candidates)
+	draft.Diagnostics.Stages = append([]recommendation.StageMetric{planMetric, similarityMetric, discoveryMetric}, draft.Diagnostics.Stages...)
+	draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "selection", selectionStarted, 1)
 	diagnostics.ModelSelectedCount = draft.Diagnostics.ModelSelectedCount
 	diagnostics.BackfillAddedCount = draft.Diagnostics.BackfillAddedCount
+	diagnostics.Stages = draft.Diagnostics.Stages
+	draft.References = append([]recommendation.Reference(nil), plan.References...)
+	draft.SimilarityEdges = similarityEdges
+	draft.Providers = []recommendation.ProviderStatus{{Provider: "last.fm", Status: similarityProviderStatus(recommender.similar, seedArtists, similarityEdges), Calls: len(seedArtists)}}
 	draft.Diagnostics = diagnostics
 	return draft, err
+}
+
+func similarityProviderStatus(source mcpserver.SimilarArtistSource, seeds []string, edges []recommendation.SimilarityEdge) string {
+	if len(edges) > 0 {
+		return "available"
+	}
+	if source == nil {
+		return "unconfigured"
+	}
+	if len(seeds) == 0 {
+		return "not_requested"
+	}
+	return "no_results"
 }
 
 func (recommender *MCPGroundedOllamaRecommender) planDiscovery(
@@ -2316,6 +2563,7 @@ func (recommender *MCPGroundedOllamaRecommender) planDiscovery(
 	plan.TargetVibe = strings.TrimSpace(plan.TargetVibe)
 	plan.FallbackTags = compactWebStrings(plan.FallbackTags)
 	plan = calibrateDiscoveryPlanForPrompt(request, plan)
+	plan.References = reconcileRecommendationReferences(plan.References, request.Examples)
 	return plan, nil
 }
 
@@ -2349,6 +2597,76 @@ func (recommender *MCPGroundedOllamaRecommender) similarSeedArtists(
 	return mcpserver.SimilarArtistNames(ctx, recommender.similar, seeds, exclude, 4)
 }
 
+func similaritySeedsForPlan(references []recommendation.Reference, artists []database.ArtistAffinity) []string {
+	seeds := make([]string, 0, 4)
+	seen := make(map[string]bool)
+	for _, reference := range references {
+		if !strings.EqualFold(strings.TrimSpace(reference.Polarity), "positive") {
+			continue
+		}
+		name := strings.TrimSpace(reference.Artist)
+		if name == "" {
+			name = strings.TrimSpace(reference.SuppliedText)
+		}
+		clean, err := utils.NormalizeSearchText(name)
+		if err != nil || clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		seeds = append(seeds, name)
+		if len(seeds) == 4 {
+			return seeds
+		}
+	}
+	if len(seeds) > 0 {
+		return seeds
+	}
+	for _, affinity := range artists {
+		clean, err := utils.NormalizeSearchText(affinity.Artist)
+		if err != nil || clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		seeds = append(seeds, affinity.Artist)
+		if len(seeds) == 4 {
+			break
+		}
+	}
+	return seeds
+}
+
+func similarArtistsFromEdges(edges []recommendation.SimilarityEdge, references []recommendation.Reference, artists []database.ArtistAffinity) []string {
+	if len(edges) == 0 {
+		return nil
+	}
+	exclude := make(map[string]bool)
+	for _, reference := range references {
+		if clean, err := utils.NormalizeSearchText(reference.Artist); err == nil && clean != "" {
+			exclude[clean] = true
+		}
+	}
+	for _, artist := range artists {
+		if clean, err := utils.NormalizeSearchText(artist.Artist); err == nil && clean != "" {
+			exclude[clean] = true
+		}
+	}
+	seen := make(map[string]bool)
+	result := make([]string, 0, 4)
+	for _, edge := range edges {
+		name := strings.TrimSpace(edge.Neighbor)
+		clean, err := utils.NormalizeSearchText(name)
+		if err != nil || clean == "" || seen[clean] || exclude[clean] {
+			continue
+		}
+		seen[clean] = true
+		result = append(result, name)
+		if len(result) == 4 {
+			break
+		}
+	}
+	return result
+}
+
 func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 	ctx context.Context,
 	request RecommendationRequest,
@@ -2363,12 +2681,16 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 		discoverySelectionUserPrompt(request, profile, plan, candidates, limit),
 	)
 	if err != nil {
-		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
+		draft := fallbackDiscoveryDraft(request, candidates, plan, limit)
+		draft.DegradedReason = "selection_model_error"
+		return draft, nil
 	}
 
 	var selection modelCandidateSelectionResponse
 	if err := json.Unmarshal([]byte(extractJSONObject(content)), &selection); err != nil {
-		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
+		draft := fallbackDiscoveryDraft(request, candidates, plan, limit)
+		draft.DegradedReason = "selection_malformed_json"
+		return draft, nil
 	}
 
 	draft := RecommendationDraft{Reply: strings.TrimSpace(selection.Reply)}
@@ -2379,10 +2701,18 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 			continue
 		}
 		seen[idx] = true
+		qualification := qualifyDiscoveryCandidate(request, plan, candidates[idx])
+		assessment := validateCandidateSelectionAssessment(selected, candidates[idx])
+		if !assessment.Valid {
+			continue
+		}
+		if qualification.Status != recommendation.QualificationSupported && qualification.Status != recommendation.QualificationPlausible {
+			continue
+		}
 		candidateInput := discoveryCandidateInput(
 			candidates[idx],
 			len(draft.Candidates)+1,
-			selected.Note,
+			assessment.Note,
 		)
 		if songRecommendationMode(request) {
 			candidateInput.Song = candidates[idx].TrackName
@@ -2398,7 +2728,9 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 		resetRecommendationCandidateRanks(draft.Candidates)
 	}
 	if len(draft.Candidates) == 0 {
-		return fallbackDiscoveryDraft(request, candidates, plan, limit), nil
+		draft := fallbackDiscoveryDraft(request, candidates, plan, limit)
+		draft.DegradedReason = "selection_no_qualified_candidates"
+		return draft, nil
 	}
 	if draft.Reply == "" {
 		draft.Reply = "Here are verified albums from the MCP discovery search."
@@ -2406,10 +2738,86 @@ func (recommender *MCPGroundedOllamaRecommender) selectDiscoveryCandidates(
 	return draft, nil
 }
 
+type candidateSelectionAssessment struct {
+	Valid       bool
+	Fit         string
+	EvidenceIDs []string
+	Note        string
+}
+
+func validateCandidateSelectionAssessment(selection modelCandidateSelection, candidate mcpserver.DiscoveryCandidate) candidateSelectionAssessment {
+	fit := strings.ToLower(strings.TrimSpace(selection.Fit))
+	if fit == "" {
+		fit = recommendation.QualificationPlausible
+	}
+	if fit != recommendation.QualificationSupported && fit != recommendation.QualificationPlausible {
+		return candidateSelectionAssessment{}
+	}
+	evidence := make(map[string]recommendation.Evidence, len(candidate.Evidence))
+	for _, item := range candidate.Evidence {
+		if item.ID != "" {
+			evidence[item.ID] = item
+		}
+	}
+	for _, id := range selection.EvidenceIDs {
+		item, ok := evidence[id]
+		if !ok || item.EntityScope == "" || item.Claim == "" {
+			return candidateSelectionAssessment{}
+		}
+		if item.EntityScope == recommendation.EntityRecording && strings.TrimSpace(candidate.TrackName) == "" {
+			return candidateSelectionAssessment{}
+		}
+	}
+	if fit == recommendation.QualificationSupported && len(selection.EvidenceIDs) == 0 {
+		return candidateSelectionAssessment{}
+	}
+	note := strings.TrimSpace(selection.Note)
+	if note == "" {
+		note = "Candidate assessed as " + fit + "."
+	}
+	return candidateSelectionAssessment{Valid: true, Fit: fit, EvidenceIDs: append([]string(nil), selection.EvidenceIDs...), Note: note}
+}
+
+func qualifyDiscoveryCandidate(request RecommendationRequest, plan modelDiscoveryPlan, candidate mcpserver.DiscoveryCandidate) recommendation.Qualification {
+	performanceRequested := promptRequestsVirtuosicPlaying(strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " ")))
+	if len(candidate.Evidence) == 0 {
+		if performanceRequested || len(plan.References) > 0 || promptRequestsComparison(strings.ToLower(request.Message)) {
+			return recommendation.Qualification{Status: recommendation.QualificationInsufficient, Reason: "missing_candidate_evidence"}
+		}
+		return recommendation.Qualification{Status: recommendation.QualificationPlausible, Reason: "legacy_broad_tag_compatibility"}
+	}
+	for _, evidence := range candidate.Evidence {
+		claim := strings.ToLower(strings.Join([]string{evidence.Claim, evidence.Details}, " "))
+		if evidence.Kind == recommendation.EvidenceLocalFit && strings.Contains(claim, "negative") {
+			return recommendation.Qualification{Status: recommendation.QualificationContradicted, Reason: "contradictory_local_fit", EvidenceIDs: []string{evidence.ID}}
+		}
+	}
+	if performanceRequested && !scopedPerformanceEvidenceSupports(candidate, "virtuosic/lead-playing") {
+		return recommendation.Qualification{Status: recommendation.QualificationInsufficient, Reason: "performance_trait_unverified"}
+	}
+	if songRecommendationMode(request) && strings.TrimSpace(candidate.TrackName) == "" {
+		return recommendation.Qualification{Status: recommendation.QualificationInsufficient, Reason: "track_identity_missing"}
+	}
+	if len(plan.References) > 0 || promptRequestsComparison(strings.ToLower(request.Message)) {
+		return recommendation.Qualification{Status: recommendation.QualificationPlausible, Reason: "verified_metadata_and_reference_path", EvidenceIDs: evidenceIDs(candidate.Evidence)}
+	}
+	return recommendation.Qualification{Status: recommendation.QualificationPlausible, Reason: "broad_tag_compatibility", EvidenceIDs: evidenceIDs(candidate.Evidence)}
+}
+
+func evidenceIDs(evidence []recommendation.Evidence) []string {
+	ids := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		if item.ID != "" {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
+}
+
 func discoveryPlanSystemPrompt() string {
 	return `You interpret personal music recommendation prompts into a musical discovery plan, then map that plan to canonical MusicBrainz genre/tag searches.
 Return only JSON with this exact shape:
-{"vibe_summary":"short musical intent","required_traits":["trait"],"flexible_traits":["trait"],"reference_anchors":["artist or style"],"comparison_traits":["trait"],"false_friend_traits":["trait"],"bridge_traits":["trait"],"comparison_modifiers":["modifier"],"target_vibe":"","fallback_tags":["tag one","tag two"]}
+{"vibe_summary":"short musical intent","required_traits":["trait"],"flexible_traits":["trait"],"reference_anchors":["artist or style"],"comparison_traits":["trait"],"false_friend_traits":["trait"],"bridge_traits":["trait"],"comparison_modifiers":["modifier"],"target_vibe":"","fallback_tags":["tag one","tag two"],"references":[{"supplied_text":"artist or project","artist":"","album":"","song":"","entity_scope":"artist","polarity":"positive","origin":"extracted_text"}]}
 
 Rules:
 - Treat the user's words as evidence of the intended listening feel, not a literal checklist, unless they use explicit hard constraints like "must", "only", "no", or "avoid".
@@ -2443,7 +2851,7 @@ Rules:
 func discoverySelectionSystemPrompt() string {
 	return `You rank verified MCP discovery candidates for a personal music recommendation batch.
 Return only JSON with this exact shape:
-{"reply":"short plain-language summary","selections":[{"candidate_index":1,"note":"one concise reason"}]}
+{"reply":"short plain-language summary","selections":[{"candidate_index":1,"fit":"plausible","evidence_ids":["catalog_identity"],"reason":"short reason","note":"one concise reason"}]}
 
 Rules:
 - candidate_index must be one of the numbered candidates provided by the user message.
@@ -2541,7 +2949,14 @@ func discoveryPlanUserPrompt(request RecommendationRequest, profile ProfileConte
 	if request.Avoid != "" {
 		fmt.Fprintf(&builder, "Avoid: %s\n", request.Avoid)
 	}
+	if len(request.Examples) > 0 {
+		builder.WriteString("\nExplicit user examples (authoritative; preserve polarity and identity):\n")
+		for _, example := range request.Examples {
+			fmt.Fprintf(&builder, "- scope=%s polarity=%s supplied=%q artist=%q album=%q song=%q note=%q\n", example.EntityScope, example.Polarity, example.SuppliedText, example.Artist, example.Album, example.Song, example.Notes)
+		}
+	}
 	builder.WriteString("Planning priority: infer the intended musical feel before choosing tags. The user's current prompt owns the search space; profile data calibrates quality and novelty but must not drag every prompt back to the user's top genres. Do not treat casual wording as a literal checklist unless the user states a hard constraint. If the prompt asks for non-metal jazz, funk, bass-forward, electronic, country, bluegrass, or dubstep, search those spaces directly. If it asks for new music with great bass lines that is heavy or funky or both, infer a search for prominent low-end/rhythm-section energy, groove, and weight; heavy-only, funky-only, and overlapping candidates may all be valid. If it asks for bass lines, low end, or rhythm-section feel, include groove/bass proxy tags such as funk, jazz-funk, dub, post-punk, dance-punk, electro-funk, or jazz fusion. If it contains weird/experimental, include an experimental or avant-garde tag.\n")
+	appendRelevantContextPrompt(&builder, profile.RelevantContext)
 
 	builder.WriteString("\nTop genre signals:\n")
 	for idx, genre := range profile.Genres {
@@ -2589,12 +3004,19 @@ func discoverySelectionUserPrompt(
 	if request.Avoid != "" {
 		fmt.Fprintf(&builder, "Avoid: %s\n", request.Avoid)
 	}
+	appendRelevantContextPrompt(&builder, profile.RelevantContext)
 	fmt.Fprintf(&builder, "Prompt trait logic: %s\n", promptTraitLogic(request))
 	if plan.VibeSummary != "" {
 		fmt.Fprintf(&builder, "Interpreted vibe: %s\n", plan.VibeSummary)
 	}
 	if len(plan.RequiredTraits) > 0 {
 		fmt.Fprintf(&builder, "Required traits: %s\n", strings.Join(plan.RequiredTraits, ", "))
+	}
+	if len(plan.References) > 0 {
+		builder.WriteString("Effective references:\n")
+		for _, reference := range plan.References {
+			fmt.Fprintf(&builder, "- scope=%s polarity=%s origin=%s supplied=%q resolution=%s\n", reference.EntityScope, reference.Polarity, reference.Origin, reference.SuppliedText, reference.Resolution)
+		}
 	}
 	if len(plan.FlexibleTraits) > 0 {
 		fmt.Fprintf(&builder, "Flexible traits: %s\n", strings.Join(plan.FlexibleTraits, ", "))
@@ -2658,11 +3080,139 @@ func discoverySelectionUserPrompt(
 	return builder.String()
 }
 
+func appendRelevantContextPrompt(builder *strings.Builder, records []database.RecommendationContextRecord) {
+	if len(records) == 0 {
+		return
+	}
+	builder.WriteString("\nRequest-relevant local context (signal type is authoritative; listening activity is not fit evidence):\n")
+	for _, record := range records {
+		fmt.Fprintf(builder, "- source=%s signal=%s entity=%s artist=%q album=%q song=%q value=%q", record.Source, record.SignalType, record.Entity, record.Artist, record.Album, record.Song, record.Value)
+		if record.Details != "" {
+			fmt.Fprintf(builder, " details=%q", record.Details)
+		}
+		builder.WriteString("\n")
+	}
+}
+
 func decodeJSON(request *http.Request, target any) error {
 	defer request.Body.Close()
 	decoder := json.NewDecoder(io.LimitReader(request.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(target)
+}
+
+func validateRecommendationExamples(examples []recommendation.Reference) error {
+	if len(examples) > 16 {
+		return errors.New("recommendation examples are limited to 16 entries")
+	}
+	for index, example := range examples {
+		if strings.TrimSpace(example.SuppliedText) == "" && strings.TrimSpace(example.Artist) == "" {
+			return fmt.Errorf("recommendation example %d requires supplied_text or artist", index+1)
+		}
+		scope := strings.ToLower(strings.TrimSpace(example.EntityScope))
+		if scope != "artist" && scope != "album" && scope != "song" {
+			return fmt.Errorf("recommendation example %d has invalid entity_scope", index+1)
+		}
+		polarity := strings.ToLower(strings.TrimSpace(example.Polarity))
+		if polarity != "positive" && polarity != "negative" {
+			return fmt.Errorf("recommendation example %d has invalid polarity", index+1)
+		}
+		if scope == "artist" && strings.TrimSpace(example.Song) != "" {
+			return fmt.Errorf("recommendation example %d artist examples must not include song", index+1)
+		}
+		if scope == "album" && (strings.TrimSpace(example.Artist) == "" || strings.TrimSpace(example.Album) == "") {
+			return fmt.Errorf("recommendation example %d album examples require artist and album", index+1)
+		}
+		if scope == "song" && (strings.TrimSpace(example.Artist) == "" || strings.TrimSpace(example.Album) == "" || strings.TrimSpace(example.Song) == "") {
+			return fmt.Errorf("recommendation example %d song examples require artist, album, and song", index+1)
+		}
+	}
+	return nil
+}
+
+func reconcileRecommendationReferences(extracted, explicit []recommendation.Reference) []recommendation.Reference {
+	result := make([]recommendation.Reference, 0, len(extracted)+len(explicit))
+	for _, reference := range extracted {
+		reference = sanitizeReference(reference)
+		reference.Origin = "extracted_text"
+		reference.Polarity = normalizeReferencePolarity(reference.Polarity)
+		reference.EntityScope = normalizeReferenceScope(reference.EntityScope)
+		if strings.TrimSpace(reference.SuppliedText) != "" {
+			result = append(result, reference)
+		}
+	}
+	for _, example := range explicit {
+		example = sanitizeReference(example)
+		example.Origin = "structured_example"
+		example.Polarity = normalizeReferencePolarity(example.Polarity)
+		example.EntityScope = normalizeReferenceScope(example.EntityScope)
+		key := referenceIdentityKey(example)
+		replaced := false
+		for index := range result {
+			if key != "" && referenceIdentityKey(result[index]) == key {
+				result[index] = example
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			result = append(result, example)
+		}
+	}
+	return result
+}
+
+func sanitizeReference(reference recommendation.Reference) recommendation.Reference {
+	reference.CanonicalName = ""
+	reference.MBID = ""
+	// Resolution and canonical identity are server-owned. Until a bounded
+	// server-side lookup resolves this reference, client/model claims remain
+	// explicitly unresolved.
+	reference.Resolution = "unresolved"
+	return reference
+}
+
+func normalizeReferencePolarity(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "negative") {
+		return "negative"
+	}
+	return "positive"
+}
+
+func normalizeReferenceScope(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "album":
+		return "album"
+	case "song", "recording":
+		return "song"
+	default:
+		return "artist"
+	}
+}
+
+func referenceIdentityKey(reference recommendation.Reference) string {
+	scope := normalizeReferenceScope(reference.EntityScope)
+	if strings.TrimSpace(reference.MBID) != "" {
+		clean, _ := utils.NormalizeSearchText(reference.MBID)
+		return scope + "|mbid|" + clean
+	}
+	parts := []string{reference.Artist, reference.Album, reference.Song}
+	if scope == "artist" {
+		parts = []string{reference.Artist, reference.CanonicalName, reference.SuppliedText}
+	}
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		clean, err := utils.NormalizeSearchText(part)
+		if err != nil {
+			return ""
+		}
+		values = append(values, clean)
+	}
+	key := strings.Join(values, "|")
+	if strings.Trim(key, "|") == "" {
+		return ""
+	}
+	return scope + "|name|" + key
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
@@ -2784,8 +3334,6 @@ func promptRequestsVirtuosicPlaying(promptText string) bool {
 		"lead playing",
 		"lead guitar",
 		"neoclassical",
-		"symphony x",
-		"children of bodom",
 	})
 }
 
@@ -2811,9 +3359,6 @@ func promptDerivedDiscoveryTags(promptText string) []string {
 	add(promptDerivedComparisonPlan(promptText).FallbackTags...)
 	if promptRequestsVirtuosicPlaying(promptText) {
 		add("neoclassical metal", "power metal", "progressive metal", "symphonic metal", "melodic metal")
-	}
-	if containsAny(promptText, []string{"children of bodom"}) {
-		add("melodic death metal")
 	}
 	if promptRequestsHeavyMusic(promptText) && containsAny(promptText, []string{"melodic", "melody"}) {
 		add("melodic metal", "power metal", "melodic death metal")
@@ -2845,68 +3390,14 @@ func promptDerivedDiscoveryTags(promptText string) []string {
 func promptDerivedComparisonPlan(promptText string) modelDiscoveryPlan {
 	promptText = strings.ToLower(promptText)
 	var plan modelDiscoveryPlan
-	addAnchors := func(values ...string) {
-		plan.ReferenceAnchors = append(plan.ReferenceAnchors, values...)
-	}
 	addTraits := func(values ...string) {
 		plan.ComparisonTraits = append(plan.ComparisonTraits, values...)
-	}
-	addFalseFriends := func(values ...string) {
-		plan.FalseFriendTraits = append(plan.FalseFriendTraits, values...)
 	}
 	addBridgeTraits := func(values ...string) {
 		plan.BridgeTraits = append(plan.BridgeTraits, values...)
 	}
 	addModifiers := func(values ...string) {
 		plan.ComparisonModifiers = append(plan.ComparisonModifiers, values...)
-	}
-	addTags := func(values ...string) {
-		plan.FallbackTags = append(plan.FallbackTags, values...)
-	}
-
-	if containsAny(promptText, []string{"rage against the machine", "ratm"}) {
-		addAnchors("rage against the machine")
-		addTraits("funk metal", "rap metal", "rhythmic groove", "staccato riffs")
-		addFalseFriends("generic heavy metal")
-		addBridgeTraits("alternative metal", "funk rock")
-		addTags("funk metal", "rap metal", "alternative metal", "funk rock")
-	}
-	if containsAny(promptText, []string{"knower", "louis cole", "clown core"}) {
-		addAnchors("knower")
-		addTraits("jazz-funk", "jazz fusion", "electronic fusion", "synth", "groove", "rhythm-section energy")
-		addFalseFriends("generic heavy metal")
-		addBridgeTraits("electro-funk", "synth-pop", "funk metal")
-		addTags("jazz-funk", "jazz fusion", "electro-funk", "synth-pop", "funk")
-		if promptRequestsHeavyMusic(promptText) {
-			addModifiers("heavier")
-			addBridgeTraits("added weight", "funk metal", "progressive rock")
-			addTags("funk metal", "progressive rock")
-		}
-	}
-	if containsAny(promptText, []string{"opeth"}) {
-		addAnchors("opeth")
-		addTraits("progressive metal", "melodic", "atmospheric", "dynamic contrast")
-		addBridgeTraits("progressive rock", "melodic metal")
-		addTags("progressive metal", "progressive rock", "melodic metal")
-		if containsAny(promptText, []string{"less death", "less death metal", "without death", "no death"}) {
-			addModifiers("less death metal")
-			addFalseFriends("death metal", "technical death metal")
-		} else {
-			addBridgeTraits("death metal")
-			addTags("death metal")
-		}
-	}
-	if containsAny(promptText, []string{"symphony x", "children of bodom"}) {
-		if containsAny(promptText, []string{"symphony x"}) {
-			addAnchors("symphony x")
-		}
-		if containsAny(promptText, []string{"children of bodom"}) {
-			addAnchors("children of bodom")
-		}
-		addTraits("melodic", "neoclassical", "power metal", "progressive metal", "symphonic metal", "speed metal")
-		addFalseFriends("technical death metal", "brutal death metal", "deathcore", "grindcore", "generic death metal")
-		addBridgeTraits("melodic death metal")
-		addTags("neoclassical metal", "power metal", "progressive metal", "symphonic metal", "melodic metal", "melodic death metal")
 	}
 
 	if containsAny(promptText, []string{"but heavier", "heavier"}) {
@@ -3306,6 +3797,9 @@ func fallbackDiscoveryDraft(
 		Reply: "Here are verified albums from the MCP discovery search.",
 	}
 	for idx, candidate := range candidates {
+		if qualification := qualifyDiscoveryCandidate(request, plan, candidate); qualification.Status != recommendation.QualificationSupported && qualification.Status != recommendation.QualificationPlausible {
+			continue
+		}
 		note := fallbackDiscoveryNote(request, plan, candidate)
 		candidateInput := discoveryCandidateInput(candidate, idx+1, note)
 		if songRecommendationMode(request) {
@@ -3375,6 +3869,10 @@ func backfillRecommendationCandidates(
 		if selectedIndexes[idx] {
 			continue
 		}
+		qualification := qualifyDiscoveryCandidate(request, plan, candidate)
+		if qualification.Status != recommendation.QualificationSupported && qualification.Status != recommendation.QualificationPlausible {
+			continue
+		}
 		candidateInput := discoveryCandidateInput(candidate, len(result)+1, fallbackDiscoveryNote(request, plan, candidate))
 		if songRecommendationMode(request) {
 			candidateInput.Song = candidate.TrackName
@@ -3388,6 +3886,22 @@ func backfillRecommendationCandidates(
 		}
 	}
 	return result, backfillAdded
+}
+
+func selectedDiscoveryIndexes(selected []database.RecommendationCandidateInput, pool []mcpserver.DiscoveryCandidate) map[int]bool {
+	seen := make(map[string]bool, len(selected))
+	for _, candidate := range selected {
+		artist, album := recommendationCandidateKeys(candidate)
+		seen[artist+"\x00"+album] = true
+	}
+	result := make(map[int]bool)
+	for index, candidate := range pool {
+		artist, album := recommendationCandidateKeys(database.RecommendationCandidateInput{Artist: candidate.Artist, Album: candidate.Album})
+		if seen[artist+"\x00"+album] {
+			result[index] = true
+		}
+	}
+	return result
 }
 
 func requestAllowsRepeatedArtists(request RecommendationRequest) bool {
@@ -3692,9 +4206,6 @@ func promptAlignmentScore(
 	}
 
 	promptText := strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))
-	if promptRequestsVirtuosicPlaying(promptText) {
-		score += virtuosicMetalTagScore(candidate.GenreTags)
-	}
 	if promptRequestsVirtuosicPlaying(promptText) && styleMatchesAnyAvoidTag("technical death metal", requestAvoidTags(request)) {
 		if candidateTagsContainAny(candidate.GenreTags, []string{"technical death metal", "technical death", "deathcore", "brutal death metal"}) {
 			score -= 10
@@ -3703,39 +4214,6 @@ func promptAlignmentScore(
 			!candidateTagsContainAny(candidate.GenreTags, []string{"melodic death metal", "neoclassical metal", "power metal", "symphonic metal"}) {
 			score -= 4
 		}
-	}
-	return score
-}
-
-func virtuosicMetalTagScore(tags []string) int {
-	score := 0
-	if candidateTagsContainAny(tags, []string{"neoclassical metal", "neoclassical"}) {
-		score += 10
-	}
-	if candidateTagsContainAny(tags, []string{"power metal"}) {
-		score += 7
-	}
-	if candidateTagsContainAny(tags, []string{"progressive metal"}) {
-		score += 5
-	}
-	if candidateTagsContainAny(tags, []string{"symphonic metal"}) {
-		score += 5
-	}
-	if candidateTagsContainAny(tags, []string{"speed metal"}) {
-		score += 4
-	}
-	if candidateTagsContainAny(tags, []string{"melodic metal"}) {
-		score += 3
-	}
-	if candidateTagsContainAny(tags, []string{"melodic death metal"}) {
-		if candidateTagsContainAny(tags, []string{"neoclassical metal", "power metal", "symphonic metal"}) {
-			score += 4
-		} else {
-			score += 1
-		}
-	}
-	if candidateTagsContainAny(tags, []string{"deathcore", "brutal death metal", "grindcore"}) {
-		score -= 6
 	}
 	return score
 }
@@ -3943,7 +4421,11 @@ func promptTraitCoverageForPlan(
 		if !containsAny(promptText, rule.promptTerms) {
 			continue
 		}
-		if containsAny(tagText, rule.tagTerms) {
+		supportedByTags := containsAny(tagText, rule.tagTerms)
+		if rule.name == "virtuosic/lead-playing" {
+			supportedByTags = scopedPerformanceEvidenceSupports(candidate, rule.name)
+		}
+		if supportedByTags {
 			supported = append(supported, rule.name)
 		} else {
 			unsupported = append(unsupported, rule.name)
@@ -3964,6 +4446,22 @@ func promptTraitCoverageForPlan(
 	supported = compactWebStrings(supported)
 	unsupported = compactWebStrings(unsupported)
 	return supported, unsupported
+}
+
+func scopedPerformanceEvidenceSupports(candidate mcpserver.DiscoveryCandidate, trait string) bool {
+	for _, evidence := range candidate.Evidence {
+		if evidence.EntityScope != recommendation.EntityArtist && evidence.EntityScope != recommendation.EntityAlbum && evidence.EntityScope != recommendation.EntityRecording {
+			continue
+		}
+		if evidence.Kind != recommendation.EvidenceCatalogIdentity && evidence.Kind != recommendation.EvidenceLocalPreference && evidence.Kind != recommendation.EvidenceLocalFit {
+			continue
+		}
+		claim := strings.ToLower(strings.Join([]string{evidence.Claim, evidence.Details}, " "))
+		if trait == "virtuosic/lead-playing" && containsAny(claim, []string{"virtuosic", "virtuoso", "shred", "lead playing", "neoclassical lead"}) {
+			return true
+		}
+	}
+	return false
 }
 
 func promptTraitLogic(request RecommendationRequest) string {

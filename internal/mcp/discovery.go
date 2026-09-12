@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/nicksunday/music-context-platform/internal/database"
+	"github.com/nicksunday/music-context-platform/internal/recommendation"
 	"github.com/nicksunday/music-context-platform/internal/utils"
 )
 
@@ -49,13 +50,14 @@ const (
 // DiscoveryCandidate is metadata returned by the external discovery source
 // after validation and local-library exclusion.
 type DiscoveryCandidate struct {
-	ID          string   `json:"-"`
-	TrackName   string   `json:"track_name"`
-	Artist      string   `json:"artist"`
-	Album       string   `json:"album"`
-	Runtime     string   `json:"runtime"`
-	ReleaseYear int      `json:"release_year"`
-	GenreTags   []string `json:"genre_tags,omitempty"`
+	ID          string                    `json:"-"`
+	TrackName   string                    `json:"track_name"`
+	Artist      string                    `json:"artist"`
+	Album       string                    `json:"album"`
+	Runtime     string                    `json:"runtime"`
+	ReleaseYear int                       `json:"release_year"`
+	GenreTags   []string                  `json:"genre_tags,omitempty"`
+	Evidence    []recommendation.Evidence `json:"evidence,omitempty"`
 
 	trackExclusionNames []string
 	albumExclusionNames []string
@@ -871,13 +873,19 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 			alternateAlbumTitles,
 		)
 		candidate := DiscoveryCandidate{
-			TrackName:      trackName,
-			Artist:         musicBrainzArtistName(recording.ArtistCredit),
-			Album:          album,
-			Runtime:        runtimeFromMilliseconds(recording.Length),
-			ReleaseYear:    releaseYear,
-			GenreTags:      musicBrainzGenreTagNames(recording.Genres, recording.Tags, maxCandidateGenreTags),
+			TrackName:   trackName,
+			Artist:      musicBrainzArtistName(recording.ArtistCredit),
+			Album:       album,
+			Runtime:     runtimeFromMilliseconds(recording.Length),
+			ReleaseYear: releaseYear,
+			GenreTags:   musicBrainzGenreTagNames(recording.Genres, recording.Tags, maxCandidateGenreTags),
+			Evidence: []recommendation.Evidence{
+				{ID: "catalog_identity", Source: "musicbrainz", EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "verified recording identity"},
+			},
 			releaseGroupID: release.Group.ID,
+		}
+		for index, tag := range candidate.GenreTags {
+			candidate.Evidence = append(candidate.Evidence, recommendation.Evidence{ID: fmt.Sprintf("genre_proxy_%d", index+1), Source: "musicbrainz", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceGenreProxy, Claim: "catalog tag", Details: tag})
 		}
 		if trackAlias != "" {
 			candidate.trackExclusionNames = []string{recording.Title, trackAlias}

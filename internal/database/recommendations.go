@@ -81,6 +81,28 @@ type RecommendationPromptFitFeedback struct {
 	UpdatedAt   string `json:"updated_at,omitempty"`
 }
 
+type RecommendationExample struct {
+	ID           string `json:"id"`
+	RequestKey   string `json:"request_key"`
+	EntityScope  string `json:"entity_scope"`
+	SuppliedText string `json:"supplied_text"`
+	Artist       string `json:"artist,omitempty"`
+	Album        string `json:"album,omitempty"`
+	Song         string `json:"song,omitempty"`
+	Polarity     string `json:"polarity"`
+	Notes        string `json:"notes,omitempty"`
+	Revision     int    `json:"revision"`
+	Active       bool   `json:"active"`
+	CreatedAt    string `json:"created_at,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
+}
+
+func RecommendationRequestKey(message, mood, avoid, mode string) string {
+	value := strings.Join([]string{strings.TrimSpace(message), strings.TrimSpace(mood), strings.TrimSpace(avoid), normalizedRecommendationMode(mode)}, "\x00")
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
 type RecommendationExportDraft struct {
 	ID             string `json:"id"`
 	FeedbackID     string `json:"feedback_id"`
@@ -407,6 +429,75 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 		return RecommendationBatch{}, err
 	}
 	return batch, nil
+}
+
+func SaveRecommendationExample(ctx context.Context, db *sql.DB, input RecommendationExample) (RecommendationExample, error) {
+	if db == nil {
+		return RecommendationExample{}, fmt.Errorf("database is not initialized")
+	}
+	input.RequestKey = strings.TrimSpace(input.RequestKey)
+	input.EntityScope = strings.ToLower(strings.TrimSpace(input.EntityScope))
+	input.SuppliedText = strings.TrimSpace(input.SuppliedText)
+	input.Artist = strings.TrimSpace(input.Artist)
+	input.Album = strings.TrimSpace(input.Album)
+	input.Song = strings.TrimSpace(input.Song)
+	input.Polarity = strings.ToLower(strings.TrimSpace(input.Polarity))
+	input.Notes = strings.TrimSpace(input.Notes)
+	if input.RequestKey == "" || input.SuppliedText == "" {
+		return RecommendationExample{}, fmt.Errorf("request_key and supplied_text are required")
+	}
+	if input.EntityScope != "artist" && input.EntityScope != "album" && input.EntityScope != "song" {
+		return RecommendationExample{}, fmt.Errorf("invalid recommendation example entity scope")
+	}
+	if input.Polarity != "positive" && input.Polarity != "negative" {
+		return RecommendationExample{}, fmt.Errorf("invalid recommendation example polarity")
+	}
+	if input.ID == "" {
+		input.ID = uuid.NewString()
+	}
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO recommendation_examples (id, request_key, entity_scope, supplied_text, artist, album, song, polarity, notes, revision, active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)
+		ON CONFLICT(request_key, entity_scope, supplied_text, artist, album, song) DO UPDATE SET
+			polarity=excluded.polarity, notes=excluded.notes, revision=recommendation_examples.revision+1,
+			active=1, updated_at=CURRENT_TIMESTAMP`,
+		input.ID, input.RequestKey, input.EntityScope, input.SuppliedText, input.Artist, input.Album, input.Song, input.Polarity, nullableTrimmedString(input.Notes))
+	if err != nil {
+		return RecommendationExample{}, err
+	}
+	return findRecommendationExample(ctx, db, input.RequestKey, input.EntityScope, input.SuppliedText, input.Artist, input.Album, input.Song)
+}
+
+func ListRecommendationExamples(ctx context.Context, db *sql.DB, requestKey string) ([]RecommendationExample, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, request_key, entity_scope, supplied_text, COALESCE(artist,''), COALESCE(album,''), COALESCE(song,''), polarity, COALESCE(notes,''), revision, active, created_at, updated_at FROM recommendation_examples WHERE request_key=? AND active=1 ORDER BY updated_at DESC, rowid DESC`, strings.TrimSpace(requestKey))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []RecommendationExample
+	for rows.Next() {
+		var item RecommendationExample
+		var active int
+		if err := rows.Scan(&item.ID, &item.RequestKey, &item.EntityScope, &item.SuppliedText, &item.Artist, &item.Album, &item.Song, &item.Polarity, &item.Notes, &item.Revision, &active, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		item.Active = active != 0
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func ClearRecommendationExample(ctx context.Context, db *sql.DB, requestKey, entityScope, suppliedText, artist, album, song string) error {
+	_, err := db.ExecContext(ctx, `UPDATE recommendation_examples SET active=0, revision=revision+1, updated_at=CURRENT_TIMESTAMP WHERE request_key=? AND entity_scope=? AND supplied_text=? AND COALESCE(artist,'')=? AND COALESCE(album,'')=? AND COALESCE(song,'')=?`, strings.TrimSpace(requestKey), strings.TrimSpace(entityScope), strings.TrimSpace(suppliedText), strings.TrimSpace(artist), strings.TrimSpace(album), strings.TrimSpace(song))
+	return err
+}
+
+func findRecommendationExample(ctx context.Context, db *sql.DB, requestKey, scope, suppliedText, artist, album, song string) (RecommendationExample, error) {
+	var item RecommendationExample
+	var active int
+	err := db.QueryRowContext(ctx, `SELECT id, request_key, entity_scope, supplied_text, COALESCE(artist,''), COALESCE(album,''), COALESCE(song,''), polarity, COALESCE(notes,''), revision, active, created_at, updated_at FROM recommendation_examples WHERE request_key=? AND entity_scope=? AND supplied_text=? AND COALESCE(artist,'')=? AND COALESCE(album,'')=? AND COALESCE(song,'')=?`, requestKey, scope, suppliedText, artist, album, song).Scan(&item.ID, &item.RequestKey, &item.EntityScope, &item.SuppliedText, &item.Artist, &item.Album, &item.Song, &item.Polarity, &item.Notes, &item.Revision, &active, &item.CreatedAt, &item.UpdatedAt)
+	item.Active = active != 0
+	return item, err
 }
 
 func insertRecommendationBatchSnapshot(ctx context.Context, tx *sql.Tx, batchID string, input RecommendationBatchSnapshotInput) error {

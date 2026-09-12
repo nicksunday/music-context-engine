@@ -167,6 +167,23 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 		approved_at TEXT,
 		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS recommendation_examples (
+		id TEXT PRIMARY KEY,
+		request_key TEXT NOT NULL,
+		entity_scope TEXT NOT NULL CHECK (entity_scope IN ('artist', 'album', 'song')),
+		supplied_text TEXT NOT NULL,
+		artist TEXT,
+		album TEXT,
+		song TEXT,
+		polarity TEXT NOT NULL CHECK (polarity IN ('positive', 'negative')),
+		notes TEXT,
+		revision INTEGER NOT NULL DEFAULT 1,
+		active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+		created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE (request_key, entity_scope, supplied_text, artist, album, song)
 	);`
 
 	_, err = db.Exec(schema)
@@ -281,6 +298,9 @@ func ensureAlignedSchema(db *sql.DB) error {
 	if err := ensureRecommendationFeedbackExportSchema(db); err != nil {
 		return err
 	}
+	if err := ensureRecommendationExamplesSchema(db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -319,6 +339,34 @@ func ensureRecommendationFeedbackExportSchema(db *sql.DB) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to ensure recommendation fit feedback schema: %w", err)
+	}
+	return nil
+}
+
+// ensureRecommendationExamplesSchema is additive and safe for existing
+// installations. Cleared examples remain as inactive revisions so removal is
+// distinguishable from never having supplied an example.
+func ensureRecommendationExamplesSchema(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS recommendation_examples (
+			id TEXT PRIMARY KEY,
+			request_key TEXT NOT NULL,
+			entity_scope TEXT NOT NULL CHECK (entity_scope IN ('artist', 'album', 'song')),
+			supplied_text TEXT NOT NULL,
+			artist TEXT,
+			album TEXT,
+			song TEXT,
+			polarity TEXT NOT NULL CHECK (polarity IN ('positive', 'negative')),
+			notes TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (request_key, entity_scope, supplied_text, artist, album, song)
+		);
+		CREATE INDEX IF NOT EXISTS idx_recommendation_examples_request ON recommendation_examples(request_key, active, updated_at);`)
+	if err != nil {
+		return fmt.Errorf("failed to ensure recommendation examples schema: %w", err)
 	}
 	return nil
 }
