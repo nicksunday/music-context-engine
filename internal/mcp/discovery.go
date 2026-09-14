@@ -73,6 +73,7 @@ type VerifiedDiscoveryQuery struct {
 	// only needs recording-level song candidates. Album discovery keeps the
 	// default false value so its album-level genre safeguards are unchanged.
 	SkipAlbumGenreReconciliation bool
+	SkipAlbumExclusions          bool
 }
 
 type VerifiedDiscoveryResult struct {
@@ -247,9 +248,13 @@ func getVerifiedDiscoveryCandidatesFromSource(
 	}
 	limit := clampDiscoveryCandidateLimit(query.Limit)
 
-	exclusions, err := db.GetDiscoveryAlbumExclusionsContext(ctx)
-	if err != nil {
-		return VerifiedDiscoveryResult{}, fmt.Errorf("build discovery exclusion list: %w", err)
+	exclusions := database.NewAlbumExclusionSet()
+	if !query.SkipAlbumExclusions {
+		var err error
+		exclusions, err = db.GetDiscoveryAlbumExclusionsContext(ctx)
+		if err != nil {
+			return VerifiedDiscoveryResult{}, fmt.Errorf("build discovery exclusion list: %w", err)
+		}
 	}
 
 	candidates, err := getVerifiedDiscoveryCandidatesSeededWithOptions(ctx, source, searchTags, compactStrings(query.SeedArtists), limit, exclusions, query.SkipAlbumGenreReconciliation)

@@ -28,30 +28,32 @@ import (
 )
 
 const (
-	defaultArtistLimit             = 12
-	defaultGenreLimit              = 20
-	defaultFeedbackLimit           = 25
-	defaultBatchLimit              = 6
-	defaultSessionListLimit        = 25
-	maxAlbumBatchLimit             = 10
-	maxSongBatchLimit              = 20
-	defaultOllamaTimeout           = 3 * time.Minute
-	defaultVerifyTimeout           = 10 * time.Second
-	defaultVerifyDelay             = time.Second
-	defaultLinkerTimeout           = 10 * time.Second
-	defaultRadarTimeout            = 25 * time.Second
-	defaultRadarArtists            = 1500
-	defaultMusicBrainzRadarArtists = 50
-	defaultRadarReleases           = 16
-	defaultRadarCacheTTL           = 12 * time.Hour
-	defaultRadarErrorTTL           = 5 * time.Minute
-	defaultRadarRefreshTimeout     = 3 * time.Minute
-	listenBrainzResponseLimit      = 32 << 20
-	newReleaseWindowDays           = 90
-	listenBrainzBaseURL            = "https://api.listenbrainz.org/1"
-	musicBrainzBaseURL             = "https://musicbrainz.org/ws/2"
-	iTunesSearchBaseURL            = "https://itunes.apple.com/search"
-	webUserAgent                   = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
+	defaultArtistLimit                 = 12
+	defaultGenreLimit                  = 20
+	defaultFeedbackLimit               = 25
+	defaultBatchLimit                  = 6
+	defaultSessionListLimit            = 25
+	maxAlbumBatchLimit                 = 10
+	maxSongBatchLimit                  = 20
+	defaultOllamaTimeout               = 3 * time.Minute
+	defaultVerifyTimeout               = 10 * time.Second
+	defaultVerifyDelay                 = time.Second
+	defaultLinkerTimeout               = 10 * time.Second
+	defaultRadarTimeout                = 25 * time.Second
+	defaultRadarArtists                = 1500
+	defaultMusicBrainzRadarArtists     = 50
+	defaultRadarReleases               = 16
+	defaultRadarCacheTTL               = 12 * time.Hour
+	defaultRadarErrorTTL               = 5 * time.Minute
+	defaultRadarRefreshTimeout         = 3 * time.Minute
+	listenBrainzResponseLimit          = 32 << 20
+	newReleaseWindowDays               = 90
+	listenBrainzBaseURL                = "https://api.listenbrainz.org/1"
+	musicBrainzBaseURL                 = "https://musicbrainz.org/ws/2"
+	iTunesSearchBaseURL                = "https://itunes.apple.com/search"
+	webUserAgent                       = "music-context-platform/1.0.0 (https://github.com/nicksunday/music-context-platform)"
+	maxFeelingLuckyBatchLimit          = 20
+	maxFeelingLuckyCandidateMultiplier = 8
 )
 
 var errReleaseRadarRefreshInProgress = errors.New("release radar refresh is in progress")
@@ -61,6 +63,7 @@ var staticFiles embed.FS
 
 type Options struct {
 	Recommender              Recommender
+	Discovery                DiscoveryProvider
 	Verifier                 CandidateVerifier
 	ReleaseRadar             ReleaseRadarProvider
 	LinkResolver             StreamingLinkResolver
@@ -75,6 +78,7 @@ type Options struct {
 type Server struct {
 	db                       *sql.DB
 	recommender              Recommender
+	discovery                DiscoveryProvider
 	verifier                 CandidateVerifier
 	releaseRadar             ReleaseRadarProvider
 	linkResolver             StreamingLinkResolver
@@ -276,11 +280,12 @@ type ReleaseRadarProvider interface {
 }
 
 type DiscoveryRequest struct {
-	TargetVibe   string
-	FallbackTags []string
-	SeedArtists  []string
-	Limit        int
-	Mode         string
+	TargetVibe     string
+	FallbackTags   []string
+	SeedArtists    []string
+	Limit          int
+	Mode           string
+	SkipExclusions bool
 }
 
 type RecommendationRequest struct {
@@ -391,7 +396,99 @@ func recommendationMode(value string) string {
 	if strings.EqualFold(strings.TrimSpace(value), "song") || strings.EqualFold(strings.TrimSpace(value), "songs") {
 		return "song"
 	}
+	if strings.EqualFold(strings.TrimSpace(value), "feeling_lucky") || strings.EqualFold(strings.TrimSpace(value), "feeling-lucky") || strings.EqualFold(strings.TrimSpace(value), "lucky") {
+		return "feeling_lucky"
+	}
 	return "album"
+}
+
+func feelingLuckyMode(request RecommendationRequest) bool {
+	return recommendationMode(request.Mode) == "feeling_lucky"
+}
+
+func feelingLuckyGenres(genres []database.GenreTopography) (observed, inferred []string) {
+	seen := make(map[string]bool)
+	for _, genre := range genres {
+		value := strings.ToLower(strings.TrimSpace(genre.Subgenre))
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		observed = append(observed, value)
+	}
+	// These broad adjacent areas expand discovery without changing the
+	// probability of any admitted bucket. They are deliberately deterministic
+	// and profile-derived rather than based on ratings or play counts.
+	adjacent := map[string][]string{
+		"rock":       {"alternative rock", "indie rock"},
+		"metal":      {"heavy metal", "progressive metal"},
+		"hip hop":    {"experimental hip hop", "jazz rap"},
+		"electronic": {"idm", "ambient"},
+		"jazz":       {"jazz fusion", "post-bop"},
+		"pop":        {"indie pop", "synth-pop"},
+	}
+	for _, genre := range observed {
+		for _, value := range adjacent[genre] {
+			if !seen[value] {
+				seen[value] = true
+				inferred = append(inferred, value)
+			}
+		}
+	}
+	return observed, inferred
+}
+
+func uniformFeelingLuckyCandidates(candidates []database.RecommendationCandidateInput, genres []string, limit int) []database.RecommendationCandidateInput {
+	return uniformFeelingLuckyCandidatesWithRand(candidates, genres, limit, rand.New(rand.NewSource(time.Now().UnixNano())))
+}
+
+func uniformFeelingLuckyCandidatesWithRand(candidates []database.RecommendationCandidateInput, genres []string, limit int, rng *rand.Rand) []database.RecommendationCandidateInput {
+	if limit <= 0 {
+		return nil
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	byGenre := make(map[string][]database.RecommendationCandidateInput)
+	for _, candidate := range candidates {
+		cleanArtist, cleanAlbum, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
+		if err != nil || cleanArtist == "" || cleanAlbum == "" {
+			continue
+		}
+		for _, tag := range candidate.GenreTags {
+			genre := strings.ToLower(strings.TrimSpace(tag))
+			if genre != "" {
+				byGenre[genre] = append(byGenre[genre], candidate)
+			}
+		}
+	}
+	eligibleGenres := make([]string, 0, len(genres))
+	for _, genre := range genres {
+		if len(byGenre[genre]) > 0 {
+			eligibleGenres = append(eligibleGenres, genre)
+		}
+	}
+	seen := make(map[string]bool)
+	result := make([]database.RecommendationCandidateInput, 0, limit)
+	for len(result) < limit && len(eligibleGenres) > 0 {
+		genreIndex := rng.Intn(len(eligibleGenres))
+		genre := eligibleGenres[genreIndex]
+		pool := byGenre[genre]
+		candidateIndex := rng.Intn(len(pool))
+		candidate := pool[candidateIndex]
+		artist, album, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
+		key := artist + "\x00" + album + "\x00" + strings.ToLower(strings.TrimSpace(candidate.Song))
+		if err == nil && !seen[key] {
+			seen[key] = true
+			result = append(result, candidate)
+		}
+		pool = append(pool[:candidateIndex], pool[candidateIndex+1:]...)
+		byGenre[genre] = pool
+		if len(pool) == 0 {
+			eligibleGenres = append(eligibleGenres[:genreIndex], eligibleGenres[genreIndex+1:]...)
+		}
+	}
+	return result
 }
 
 type ProfileContext struct {
@@ -443,6 +540,7 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	server := &Server{
 		db:                       db,
 		recommender:              options.Recommender,
+		discovery:                options.Discovery,
 		verifier:                 options.Verifier,
 		releaseRadar:             options.ReleaseRadar,
 		linkResolver:             options.LinkResolver,
@@ -451,6 +549,9 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 		appleMusicDeveloperToken: strings.TrimSpace(options.AppleMusicDeveloperToken),
 		model:                    strings.TrimSpace(options.Model),
 		ollamaURL:                normalizeBaseURL(options.OllamaURL),
+	}
+	if server.discovery == nil {
+		server.discovery = NewMCPDiscoveryProvider(db)
 	}
 
 	mux := http.NewServeMux()
@@ -594,11 +695,6 @@ func (server *Server) handleRail(writer http.ResponseWriter, request *http.Reque
 }
 
 func (server *Server) handleRecommendations(writer http.ResponseWriter, request *http.Request) {
-	if server.recommender == nil {
-		writeJSONError(writer, http.StatusServiceUnavailable, "Recommendation model is not configured.")
-		return
-	}
-
 	var input RecommendationRequest
 	if err := decodeJSON(request, &input); err != nil {
 		writeJSONError(writer, http.StatusBadRequest, "Request body must be a JSON object.")
@@ -611,18 +707,28 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
-	if songRecommendationMode(input) {
-		input.Mode = "song"
-	} else {
-		input.Mode = "album"
+	input.Mode = recommendationMode(input.Mode)
+	if feelingLuckyMode(input) && (input.Limit <= 0 || input.Limit > maxFeelingLuckyBatchLimit) {
+		writeJSONError(writer, http.StatusBadRequest, fmt.Sprintf("Feeling Lucky count must be between 1 and %d.", maxFeelingLuckyBatchLimit))
+		return
 	}
 	input.Limit = clampBatchLimit(input.Mode, input.Limit)
-	if input.Message == "" {
+	if server.recommender == nil && !feelingLuckyMode(input) {
+		writeJSONError(writer, http.StatusServiceUnavailable, "Recommendation model is not configured.")
+		return
+	}
+	if !feelingLuckyMode(input) && input.Message == "" {
 		writeJSONError(writer, http.StatusBadRequest, "Please provide a recommendation prompt.")
 		return
 	}
 
-	profile, err := server.fetchProfileContext(request.Context())
+	var profile ProfileContext
+	var err error
+	if feelingLuckyMode(input) {
+		profile, err = server.fetchFeelingLuckyProfile(request.Context())
+	} else {
+		profile, err = server.fetchProfileContext(request.Context())
+	}
 	if err != nil {
 		writeJSONError(writer, http.StatusInternalServerError, "Unable to load music profile context.")
 		return
@@ -633,6 +739,10 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 	}
 	if relevant, contextErr := database.FetchRelevantRecommendationContext(request.Context(), server.db, contextTerms, 24); contextErr == nil {
 		profile.RelevantContext = relevant
+	}
+	if feelingLuckyMode(input) {
+		server.handleFeelingLucky(writer, request, input, profile)
+		return
 	}
 	exclusions, err := (&database.DB{Ctx: server.db}).GetDiscoveryAlbumExclusionsContext(request.Context())
 	if err != nil {
@@ -754,6 +864,72 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		DegradedReason:  draft.DegradedReason,
 		ShortfallReason: draft.ShortfallReason,
 	})
+}
+
+func (server *Server) handleFeelingLucky(writer http.ResponseWriter, request *http.Request, input RecommendationRequest, profile ProfileContext) {
+	if input.Limit <= 0 || input.Limit > maxFeelingLuckyBatchLimit {
+		writeJSONError(writer, http.StatusBadRequest, fmt.Sprintf("Feeling Lucky count must be between 1 and %d.", maxFeelingLuckyBatchLimit))
+		return
+	}
+	observed, inferred := feelingLuckyGenres(profile.Genres)
+	allGenres := append(append([]string{}, observed...), inferred...)
+	if len(allGenres) == 0 {
+		writeJSONError(writer, http.StatusUnprocessableEntity, "Feeling Lucky needs normalized genre data or an enriched listening profile before it can generate a batch.")
+		return
+	}
+
+	candidates, err := database.FetchFeelingLuckyLocalCandidates(request.Context(), server.db, allGenres, input.Limit*maxFeelingLuckyCandidateMultiplier)
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to load local Feeling Lucky candidates.")
+		return
+	}
+	if server.discovery != nil {
+		for _, genre := range allGenres {
+			external, discoveryErr := server.discovery.Discover(request.Context(), DiscoveryRequest{FallbackTags: []string{genre}, Limit: input.Limit * 2, Mode: "feeling_lucky", SkipExclusions: true})
+			if discoveryErr != nil {
+				continue
+			}
+			for _, candidate := range external {
+				candidateInput := discoveryCandidateInput(candidate, len(candidates)+1, "Feeling Lucky selection from "+genre)
+				candidateInput.Song = candidate.TrackName
+				candidates = append(candidates, candidateInput)
+			}
+		}
+	}
+	candidates = uniformFeelingLuckyCandidates(candidates, allGenres, input.Limit)
+	if len(candidates) == 0 {
+		writeJSONError(writer, http.StatusUnprocessableEntity, "Feeling Lucky found no verified playable items for the available profile genres.")
+		return
+	}
+	for index := range candidates {
+		candidates[index].Rank = index + 1
+	}
+	if server.songLinkResolver != nil {
+		candidates = server.resolveSongLinks(request.Context(), candidates)
+	} else {
+		candidates = server.resolveCandidateLinks(request.Context(), candidates)
+	}
+	metadata := database.FeelingLuckyMetadata{
+		RequestedCount: input.Limit,
+		ReturnedCount:  len(candidates),
+		ObservedGenres: observed,
+		InferredGenres: inferred,
+		Limited:        len(candidates) < input.Limit,
+	}
+	notes := fmt.Sprintf("Feeling Lucky sampled %d observed and %d inferred genre areas without taste weighting.", len(observed), len(inferred))
+	batch, err := database.CreateRecommendationBatch(request.Context(), server.db, database.RecommendationBatchInput{
+		Prompt: "Feeling Lucky", Notes: notes, Mode: "feeling_lucky", Candidates: candidates,
+		Snapshot: &database.RecommendationBatchSnapshotInput{SchemaVersion: 1, Complete: true, Payload: map[string]any{
+			"request":       map[string]any{"limit": input.Limit, "mode": "feeling_lucky"},
+			"feeling_lucky": metadata, "candidate_output": candidates,
+		}},
+	})
+	if err != nil {
+		writeJSONError(writer, http.StatusInternalServerError, "Unable to persist Feeling Lucky batch.")
+		return
+	}
+	batch.FeelingLucky = &metadata
+	writeJSON(writer, http.StatusOK, RecommendationResponse{Reply: notes, Batch: batch, ShortfallReason: map[bool]string{true: "eligible_pool_exhausted", false: ""}[metadata.Limited]})
 }
 
 func (server *Server) handleExamples(writer http.ResponseWriter, request *http.Request) {
@@ -1158,6 +1334,14 @@ func (server *Server) fetchProfileContext(ctx context.Context) (ProfileContext, 
 		Genres:         genres,
 		RecentFeedback: feedback,
 	}, nil
+}
+
+func (server *Server) fetchFeelingLuckyProfile(ctx context.Context) (ProfileContext, error) {
+	genres, err := database.FetchAllGenreTopography(ctx, server.db)
+	if err != nil {
+		return ProfileContext{}, err
+	}
+	return ProfileContext{Genres: genres}, nil
 }
 
 func recommendationContextTerms(request RecommendationRequest) []string {
@@ -2438,6 +2622,7 @@ func (provider *MCPDiscoveryProvider) Discover(
 		SeedArtists:                  request.SeedArtists,
 		Limit:                        request.Limit,
 		SkipAlbumGenreReconciliation: strings.EqualFold(strings.TrimSpace(request.Mode), "song"),
+		SkipAlbumExclusions:          request.SkipExclusions,
 	})
 	if err != nil {
 		return nil, err
@@ -3232,6 +3417,8 @@ func clampBatchLimit(mode string, limit int) int {
 	maxLimit := maxAlbumBatchLimit
 	if strings.EqualFold(strings.TrimSpace(mode), "song") || strings.EqualFold(strings.TrimSpace(mode), "songs") {
 		maxLimit = maxSongBatchLimit
+	} else if recommendationMode(mode) == "feeling_lucky" {
+		maxLimit = maxFeelingLuckyBatchLimit
 	}
 	if limit > maxLimit {
 		return maxLimit

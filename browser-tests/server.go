@@ -36,6 +36,12 @@ func main() {
 }
 
 func seed(db *database.DBClient) {
+	if _, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, release_date) VALUES ('browser-lucky-album', 'Lucky Album', 'Lucky Artist', 'lucky album', 'lucky artist', '["jazz"]', 2020);
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, genres) VALUES ('browser-lucky-track', 'browser-lucky-album', 'Lucky Song', 'Lucky Album', 'Lucky Artist', 'lucky song', 'lucky artist', '["jazz"]');
+	`); err != nil {
+		log.Fatal(err)
+	}
 	album, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "album request", Mode: "album", Candidates: []database.RecommendationCandidateInput{{Artist: "Browser Artist", Album: "Browser Album", StarterTrack: "Browser Track"}}})
 	if err != nil {
 		log.Fatal(err)

@@ -609,3 +609,37 @@ func TestRecommendationBatchesAreIsolatedByMode(t *testing.T) {
 		t.Fatalf("legacy album = %#v, err = %v", legacyAlbum, err)
 	}
 }
+
+func TestFeelingLuckyModeAndLocalCandidatesIgnoreTasteFlags(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, user_rating) VALUES ('lucky-album', 'Heard Album', 'Heard Artist', 'heard album', 'heard artist', '["jazz"]', 1.0);
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, genres, is_favorite, is_disliked) VALUES ('lucky-track', 'lucky-album', 'Heard Song', 'Heard Album', 'Heard Artist', 'heard song', 'heard artist', '["jazz"]', 0, 1);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := FetchFeelingLuckyLocalCandidates(context.Background(), db.Ctx, []string{"jazz"}, 10)
+	if err != nil || len(candidates) != 1 || candidates[0].Artist != "Heard Artist" {
+		t.Fatalf("local candidates = %#v, err = %v", candidates, err)
+	}
+	if got := normalizedRecommendationMode("feeling-lucky"); got != "feeling_lucky" {
+		t.Fatalf("normalized mode = %q", got)
+	}
+}
+
+func TestFeelingLuckyMetadataRoundTrip(t *testing.T) {
+	db := openRecommendationTestDB(t)
+	metadata := FeelingLuckyMetadata{RequestedCount: 4, ReturnedCount: 2, ObservedGenres: []string{"jazz"}, InferredGenres: []string{"jazz fusion"}, Limited: true}
+	batch, err := CreateRecommendationBatch(context.Background(), db.Ctx, RecommendationBatchInput{
+		Prompt: "Feeling Lucky", Mode: "feeling_lucky", Candidates: []RecommendationCandidateInput{{Artist: "Artist", Album: "Album", Song: "Song", GenreTags: []string{"jazz"}}},
+		Snapshot: &RecommendationBatchSnapshotInput{SchemaVersion: 1, Complete: true, Payload: map[string]any{"feeling_lucky": metadata}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := FetchRecommendationBatchByID(context.Background(), db.Ctx, batch.ID)
+	if err != nil || loaded.FeelingLucky == nil || loaded.FeelingLucky.InferredGenres[0] != "jazz fusion" || !loaded.FeelingLucky.Limited {
+		t.Fatalf("loaded metadata = %#v, err = %v", loaded.FeelingLucky, err)
+	}
+}

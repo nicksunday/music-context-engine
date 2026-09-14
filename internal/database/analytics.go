@@ -521,3 +521,27 @@ func FetchTopGenreTopography(ctx context.Context, db *sql.DB, limit int) ([]Genr
 
 	return topography, nil
 }
+
+// FetchAllGenreTopography returns every normalized genre without preference
+// ordering. Feeling Lucky uses this unbiased profile scope instead of the
+// taste-oriented topography ordering used by the recommendation context.
+func FetchAllGenreTopography(ctx context.Context, db *sql.DB) ([]GenreTopography, error) {
+	const stmt = `
+		SELECT subgenre, total_tracks, favorite_tracks_count, disliked_tracks_count, avg_album_rating
+		FROM v_genre_topography
+		ORDER BY subgenre COLLATE NOCASE ASC`
+	rows, err := db.QueryContext(ctx, stmt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var topography []GenreTopography
+	for rows.Next() {
+		var genre GenreTopography
+		if err := rows.Scan(&genre.Subgenre, &genre.TotalTracks, &genre.FavoriteTracksCount, &genre.DislikedTracksCount, &genre.AvgAlbumRating); err != nil {
+			return nil, err
+		}
+		topography = append(topography, genre)
+	}
+	return topography, rows.Err()
+}

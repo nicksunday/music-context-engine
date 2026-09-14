@@ -6,6 +6,7 @@ const state = {
     const path = window.location.pathname.replace(/\/+$/, "") || "/";
     if (path === "/recommendations/songs") return "song";
     if (path === "/recommendations/albums") return "album";
+    if (path === "/recommendations/lucky") return "feeling_lucky";
     return "entry";
   })(),
 };
@@ -13,6 +14,7 @@ const state = {
 const defaultPrompts = {
   song: "Give me a handful of individual songs to hear next.",
   album: "Give me a handful of high-impact albums to check out next.",
+  feeling_lucky: "",
 };
 
 const verdictLabels = {
@@ -240,7 +242,8 @@ function renderSessions(sessions) {
     const prompt = document.createElement("strong");
     prompt.textContent = session.prompt || "Untitled prompt";
     const meta = document.createElement("span");
-    meta.textContent = [formatSessionDate(session.created_at), `${session.candidate_count || 0} ${session.mode === "song" ? "songs" : "albums"}`].join(" · ");
+    const itemLabel = session.mode === "song" ? "songs" : (session.mode === "feeling_lucky" ? "items" : "albums");
+    meta.textContent = [formatSessionDate(session.created_at), `${session.candidate_count || 0} ${itemLabel}`].join(" · ");
     const reply = document.createElement("span");
     reply.className = "session-reply";
     reply.textContent = session.reply || "";
@@ -344,10 +347,10 @@ async function submitPrompt(event) {
     mood: String(form.get("mood") || "").trim(),
     avoid: String(form.get("avoid") || "").trim(),
     limit: Number(form.get("limit") || 6),
-    mode: state.mode === "song" ? "song" : "album",
+    mode: state.mode,
     examples: state.examples || [],
   };
-  if (!request.message) return;
+  if (!request.message && request.mode !== "feeling_lucky") return;
 
   appendMessage("user", request.message);
   elements.sendButton.disabled = true;
@@ -401,8 +404,15 @@ function renderBatch(batch) {
   }
   const count = batch.candidates.length;
   const isSongBatch = batch.mode === "song";
+  const isFeelingLucky = batch.mode === "feeling_lucky";
   const state = [batch.degraded_reason && `degraded: ${batch.degraded_reason}`, batch.shortfall_reason && `shortfall: ${batch.shortfall_reason}`].filter(Boolean).join(" · ");
-  elements.batchMeta.textContent = `${count} ${isSongBatch ? "song" : "album"}${count === 1 ? "" : "s"} from the latest verified discovery run${state ? ` · ${state}` : ""}`;
+  if (isFeelingLucky && batch.feeling_lucky) {
+    const lucky = batch.feeling_lucky;
+    const genres = [...(lucky.observed_genres || []).map(value => `observed: ${value}`), ...(lucky.inferred_genres || []).map(value => `inferred: ${value}`)];
+    elements.batchMeta.textContent = `${count}/${lucky.requested_count} Feeling Lucky item${count === 1 ? "" : "s"}${lucky.limited ? " · limited by available candidates" : ""}${genres.length ? ` · ${genres.join(", ")}` : ""}`;
+  } else {
+    elements.batchMeta.textContent = `${count} ${isSongBatch ? "song" : "album"}${count === 1 ? "" : "s"} from the latest verified discovery run${state ? ` · ${state}` : ""}`;
+  }
   for (const candidate of batch.candidates) {
     if (isSongBatch) {
       renderSongCandidate(candidate);
@@ -674,12 +684,13 @@ function configureMode() {
     entry: ["Recommendation Engine", "Choose a recommendation workflow or generate a verified batch."],
     song: ["Song Recommendations", "Discover individual tracks in a compact list with quick feedback."],
     album: ["Album Recommendations", "Explore verified albums with richer context and album-level feedback."],
+    feeling_lucky: ["Feeling Lucky", "Get a random surprise from observed and inferred areas of your listening profile."],
   };
   const [title, description] = labels[state.mode];
   elements.pageTitle.textContent = title;
   elements.pageDescription.textContent = description;
-  elements.limit.max = state.mode === "song" ? "20" : "10";
-  elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : "Album Sessions";
+  elements.limit.max = state.mode === "song" ? "20" : (state.mode === "feeling_lucky" ? "20" : "10");
+  elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : (state.mode === "feeling_lucky" ? "Feeling Lucky Sessions" : "Album Sessions");
   if (defaultPrompts[state.mode] && (!elements.message.value || elements.message.value === initialPrompt)) {
     elements.message.value = defaultPrompts[state.mode];
   }

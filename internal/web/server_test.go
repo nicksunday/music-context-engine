@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -626,14 +627,14 @@ func TestExportReviewAndDownloadUsePortableApprovedPayloads(t *testing.T) {
 func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 	db := openWebTestDB(t)
 	handler := NewServer(db.Ctx, Options{})
-	for _, path := range []string{"/recommendations", "/recommendations/songs", "/recommendations/albums"} {
+	for _, path := range []string{"/recommendations", "/recommendations/songs", "/recommendations/albums", "/recommendations/lucky"} {
 		record := httptest.NewRecorder()
 		handler.ServeHTTP(record, httptest.NewRequest(http.MethodGet, path, nil))
 		if record.Code != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", path, record.Code)
 		}
 		body := record.Body.String()
-		for _, expected := range []string{"Song Recommendations", "Album Recommendations", "/recommendations/songs", "/recommendations/albums"} {
+		for _, expected := range []string{"Song Recommendations", "Album Recommendations", "Feeling Lucky", "/recommendations/songs", "/recommendations/albums", "/recommendations/lucky"} {
 			if !strings.Contains(body, expected) {
 				t.Fatalf("GET %s body does not contain %q", path, expected)
 			}
@@ -643,8 +644,8 @@ func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 
 func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
 	for name, expected := range map[string][]string{
-		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\""},
-		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "restorePrompt(response.batch", "response.degraded_reason"},
+		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\"", "data-mode=\"feeling_lucky\"", "/recommendations/lucky"},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "restorePrompt(response.batch", "response.degraded_reason", "Feeling Lucky"},
 		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
@@ -655,6 +656,157 @@ func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *test
 			if !strings.Contains(string(content), expectedValue) {
 				t.Fatalf("embedded %s does not contain %q", name, expectedValue)
 			}
+		}
+	}
+}
+
+func TestFeelingLuckySelectorDeduplicatesAcrossObservedAndInferredGenres(t *testing.T) {
+	candidates := []database.RecommendationCandidateInput{
+		{Artist: "Artist A", Album: "Album A", Song: "Song A", GenreTags: []string{"rock", "alternative rock"}},
+		{Artist: "Artist B", Album: "Album B", Song: "Song B", GenreTags: []string{"alternative rock"}},
+	}
+	selected := uniformFeelingLuckyCandidatesWithRand(candidates, []string{"rock", "alternative rock"}, 3, rand.New(rand.NewSource(1)))
+	if len(selected) != 2 {
+		t.Fatalf("selected %d candidates, want 2 unique candidates", len(selected))
+	}
+	seen := map[string]bool{}
+	for _, candidate := range selected {
+		key := candidate.Artist + "\x00" + candidate.Album + "\x00" + candidate.Song
+		if seen[key] {
+			t.Fatalf("duplicate selected candidate %q", key)
+		}
+		seen[key] = true
+	}
+}
+
+func TestFeelingLuckySelectorDoesNotWeightGenreByCandidateVolume(t *testing.T) {
+	candidates := []database.RecommendationCandidateInput{
+		{Artist: "Sparse", Album: "Sparse Album", Song: "Sparse Song", GenreTags: []string{"jazz"}},
+	}
+	for index := 0; index < 20; index++ {
+		candidates = append(candidates, database.RecommendationCandidateInput{
+			Artist: "Dense", Album: "Dense Album " + strconv.Itoa(index), Song: "Dense Song", GenreTags: []string{"rock"},
+		})
+	}
+	seenJazz := false
+	for seed := int64(0); seed < 20; seed++ {
+		selected := uniformFeelingLuckyCandidatesWithRand(candidates, []string{"jazz", "rock"}, 1, rand.New(rand.NewSource(seed)))
+		if len(selected) == 1 && selected[0].Artist == "Sparse" {
+			seenJazz = true
+			break
+		}
+	}
+	if !seenJazz {
+		t.Fatal("sparse genre was never selected across deterministic samples")
+	}
+}
+
+func TestFeelingLuckyEndpointWorksWithoutOllamaAndPersistsMetadata(t *testing.T) {
+	db := openWebTestDB(t)
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres, release_date) VALUES ('lucky-album', 'Heard Album', 'Heard Artist', 'heard album', 'heard artist', '["jazz"]', 2020);
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, genres) VALUES ('lucky-track', 'lucky-album', 'Heard Song', 'Heard Album', 'Heard Artist', 'heard song', 'heard artist', '["jazz"]');
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{
+		Discovery: &fakeDiscoveryProvider{candidates: []mcpserver.DiscoveryCandidate{{Artist: "New Artist", Album: "New Album", TrackName: "New Song", GenreTags: []string{"jazz"}}}},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"mode":"feeling_lucky","limit":2}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload RecommendationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Batch.Mode != "feeling_lucky" || payload.Batch.FeelingLucky == nil || payload.Batch.FeelingLucky.RequestedCount != 2 {
+		t.Fatalf("batch = %#v", payload.Batch)
+	}
+	if len(payload.Batch.Candidates) == 0 || payload.Batch.Candidates[0].GenreTags[0] != "jazz" {
+		t.Fatalf("candidates = %#v", payload.Batch.Candidates)
+	}
+	latest, err := database.FetchLatestRecommendationBatchForMode(context.Background(), db.Ctx, "feeling_lucky")
+	if err != nil || latest.ID != payload.Batch.ID || latest.FeelingLucky == nil {
+		t.Fatalf("latest = %#v, err = %v", latest, err)
+	}
+}
+
+func TestFeelingLuckyEndpointRejectsInvalidCountWithoutPersistence(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{})
+	for _, body := range []string{`{"mode":"feeling_lucky","limit":0}`, `{"mode":"feeling_lucky","limit":21}`} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(body)))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d, want 400", body, response.Code)
+		}
+	}
+	var count int
+	if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM recommendation_batches WHERE mode = 'feeling_lucky'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("Feeling Lucky batches persisted after invalid counts: %d", count)
+	}
+}
+
+func TestFeelingLuckyEndpointReturnsExplicitNoGenreState(t *testing.T) {
+	db := openWebTestDB(t)
+	_, err := db.Ctx.Exec(`INSERT INTO tracks (id, title, album, artist, clean_title, clean_artist, genres) VALUES ('no-genre-track', 'Track', 'Album', 'Artist', 'track', 'artist', '[]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"mode":"feeling_lucky","limit":3}`)))
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "normalized genre") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestFeelingLuckyEndpointFallsBackToLocalAndLabelsInferredGenres(t *testing.T) {
+	db := openWebTestDB(t)
+	_, err := db.Ctx.Exec(`INSERT INTO tracks (id, title, album, artist, clean_title, clean_artist, genres) VALUES ('fallback-track', 'Local Song', 'Local Album', 'Local Artist', 'local song', 'local artist', '["rock"]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{Discovery: &fakeDiscoveryProvider{err: errors.New("provider unavailable")}})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"mode":"feeling_lucky","limit":3}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload RecommendationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Batch.FeelingLucky == nil || len(payload.Batch.FeelingLucky.InferredGenres) == 0 || len(payload.Batch.Candidates) != 1 {
+		t.Fatalf("batch=%#v", payload.Batch)
+	}
+	if !payload.Batch.FeelingLucky.Limited {
+		t.Fatalf("metadata=%#v, want limited local fallback", payload.Batch.FeelingLucky)
+	}
+}
+
+func TestFeelingLuckyLatestAndSessionReadsDoNotLeakOtherModes(t *testing.T) {
+	db := openWebTestDB(t)
+	lucky, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "Feeling Lucky", Mode: "feeling_lucky", Candidates: []database.RecommendationCandidateInput{{Artist: "Lucky", Album: "Album", Song: "Song"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{Prompt: "Album", Mode: "album", Candidates: []database.RecommendationCandidateInput{{Artist: "Album", Album: "Album"}}}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(db.Ctx, Options{})
+	for path := range map[string]bool{"/api/batch/latest?mode=feeling_lucky": true, "/api/batches?mode=feeling_lucky": true} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), lucky.ID) {
+			t.Fatalf("path=%s status=%d body=%s", path, response.Code, response.Body.String())
 		}
 	}
 }
@@ -711,6 +863,7 @@ func (fake fakeLinkResolver) Resolve(
 type fakeDiscoveryProvider struct {
 	request    DiscoveryRequest
 	candidates []mcpserver.DiscoveryCandidate
+	err        error
 }
 
 type fakeReleaseRadar struct {
@@ -796,7 +949,7 @@ func (fake *fakeDiscoveryProvider) Discover(
 	request DiscoveryRequest,
 ) ([]mcpserver.DiscoveryCandidate, error) {
 	fake.request = request
-	return fake.candidates, nil
+	return fake.candidates, fake.err
 }
 
 func (fake *fakeReleaseRadar) NewReleases(

@@ -299,6 +299,18 @@ type RecommendationBatch struct {
 	Snapshot          *RecommendationBatchSnapshot `json:"snapshot,omitempty"`
 	SnapshotAvailable bool                         `json:"snapshot_available"`
 	Candidates        []RecommendationCandidate    `json:"candidates"`
+	FeelingLucky      *FeelingLuckyMetadata        `json:"feeling_lucky,omitempty"`
+}
+
+// FeelingLuckyMetadata describes the unbiased profile scope used for a batch.
+// It is stored in the batch snapshot payload so older databases remain compatible.
+type FeelingLuckyMetadata struct {
+	RequestedCount int      `json:"requested_count"`
+	ReturnedCount  int      `json:"returned_count"`
+	ObservedGenres []string `json:"observed_genres,omitempty"`
+	InferredGenres []string `json:"inferred_genres,omitempty"`
+	Limited        bool     `json:"limited"`
+	EmptyReason    string   `json:"empty_reason,omitempty"`
 }
 
 type RecommendationBatchSummary struct {
@@ -815,6 +827,14 @@ func FetchRecommendationBatchByID(ctx context.Context, db *sql.DB, id string) (R
 	if snapshot, snapshotErr := FetchRecommendationBatchSnapshot(ctx, db, id); snapshotErr == nil {
 		batch.Snapshot = &snapshot
 		batch.SnapshotAvailable = true
+		if batch.Mode == "feeling_lucky" {
+			if raw, ok := snapshot.Payload["feeling_lucky"]; ok {
+				var metadata FeelingLuckyMetadata
+				if encoded, encodeErr := json.Marshal(raw); encodeErr == nil && json.Unmarshal(encoded, &metadata) == nil {
+					batch.FeelingLucky = &metadata
+				}
+			}
+		}
 	} else if !errors.Is(snapshotErr, sql.ErrNoRows) {
 		return RecommendationBatch{}, snapshotErr
 	}
@@ -879,6 +899,9 @@ func ListRecommendationBatchesForMode(ctx context.Context, db *sql.DB, limit int
 func normalizedRecommendationMode(mode string) string {
 	if strings.EqualFold(strings.TrimSpace(mode), "song") || strings.EqualFold(strings.TrimSpace(mode), "songs") {
 		return "song"
+	}
+	if strings.EqualFold(strings.TrimSpace(mode), "feeling_lucky") || strings.EqualFold(strings.TrimSpace(mode), "feeling-lucky") || strings.EqualFold(strings.TrimSpace(mode), "lucky") {
+		return "feeling_lucky"
 	}
 	return "album"
 }
@@ -951,6 +974,59 @@ func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID stri
 	}
 
 	return candidates, nil
+}
+
+// FetchFeelingLuckyLocalCandidates returns heard library items matching any
+// supplied genre. Preference and feedback columns are intentionally ignored.
+func FetchFeelingLuckyLocalCandidates(ctx context.Context, db *sql.DB, genres []string, limit int) ([]RecommendationCandidateInput, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if len(genres) == 0 {
+		return []RecommendationCandidateInput{}, nil
+	}
+	placeholders := make([]string, len(genres))
+	args := make([]any, 0, len(genres)+1)
+	for i, genre := range genres {
+		placeholders[i] = "?"
+		args = append(args, strings.ToLower(strings.TrimSpace(genre)))
+	}
+	args = append(args, limit)
+	rows, err := db.QueryContext(ctx, `
+		SELECT tracks.artist, COALESCE(tracks.album, ''), tracks.title, albums.release_date, tracks.genres
+		FROM tracks
+		LEFT JOIN albums ON albums.id = tracks.album_id
+		WHERE EXISTS (
+			SELECT 1 FROM json_each(CASE WHEN json_valid(tracks.genres) THEN tracks.genres ELSE '[]' END)
+			WHERE lower(trim(CAST(json_each.value AS TEXT))) IN (`+strings.Join(placeholders, ",")+`)
+		)
+		AND trim(tracks.artist) != '' AND trim(tracks.title) != ''
+		ORDER BY random() LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []RecommendationCandidateInput
+	for rows.Next() {
+		var artist, album, song, rawGenres string
+		var releaseYear sql.NullInt64
+		if err := rows.Scan(&artist, &album, &song, &releaseYear, &rawGenres); err != nil {
+			return nil, err
+		}
+		var genreTags []string
+		if json.Valid([]byte(rawGenres)) {
+			_ = json.Unmarshal([]byte(rawGenres), &genreTags)
+		}
+		candidate := RecommendationCandidateInput{Artist: artist, Album: album, Song: song, StarterTrack: song, GenreTags: compactGenreTags(genreTags)}
+		if releaseYear.Valid {
+			candidate.ReleaseYear = int(releaseYear.Int64)
+		}
+		result = append(result, candidate)
+	}
+	return result, rows.Err()
 }
 
 func CanonicalRecommendationVerdict(value string) (string, bool) {
