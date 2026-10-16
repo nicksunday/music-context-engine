@@ -301,6 +301,7 @@ type RecommendationDraft struct {
 	Reply           string                                  `json:"reply"`
 	Candidates      []database.RecommendationCandidateInput `json:"candidates"`
 	Diagnostics     RecommendationDiagnostics               `json:"-"`
+	Trace           recommendation.Trace                    `json:"-"`
 	References      []recommendation.Reference              `json:"references,omitempty"`
 	SimilarityEdges []recommendation.SimilarityEdge         `json:"similarity_edges,omitempty"`
 	Providers       []recommendation.ProviderStatus         `json:"providers,omitempty"`
@@ -708,9 +709,8 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		return
 	}
 	input.Mode = recommendationMode(input.Mode)
-	if feelingLuckyMode(input) && (input.Limit <= 0 || input.Limit > maxFeelingLuckyBatchLimit) {
-		writeJSONError(writer, http.StatusBadRequest, fmt.Sprintf("Feeling Lucky count must be between 1 and %d.", maxFeelingLuckyBatchLimit))
-		return
+	if feelingLuckyMode(input) {
+		input.Limit = 10
 	}
 	input.Limit = clampBatchLimit(input.Mode, input.Limit)
 	if server.recommender == nil && !feelingLuckyMode(input) {
@@ -756,66 +756,72 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 		writeJSONError(writer, http.StatusBadGateway, err.Error())
 		return
 	}
-	if len(draft.Candidates) == 0 {
+	emptyAttempt := len(draft.Candidates) == 0 && strings.TrimSpace(draft.ShortfallReason) != ""
+	if len(draft.Candidates) == 0 && !emptyAttempt {
 		writeJSONError(writer, http.StatusBadGateway, recommendationCandidateEmptyMessage(input))
 		return
 	}
 	draft.Diagnostics.RequestedCount = input.Limit
-	before := len(draft.Candidates)
-	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
-	draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
-	before = len(draft.Candidates)
-	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
-	draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
-	if songRecommendationMode(input) {
-		for idx := range draft.Candidates {
-			if strings.TrimSpace(draft.Candidates[idx].Song) == "" {
-				draft.Candidates[idx].Song = strings.TrimSpace(draft.Candidates[idx].StarterTrack)
+	before := 0
+	if !emptyAttempt {
+		before = len(draft.Candidates)
+		draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+		draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
+		before = len(draft.Candidates)
+		draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
+		draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
+		if songRecommendationMode(input) {
+			for idx := range draft.Candidates {
+				if strings.TrimSpace(draft.Candidates[idx].Song) == "" {
+					draft.Candidates[idx].Song = strings.TrimSpace(draft.Candidates[idx].StarterTrack)
+				}
 			}
 		}
-	}
-	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
-		return
-	}
-	verificationStarted := time.Now()
-	before = len(draft.Candidates)
-	draft.Candidates, err = server.verifyCandidates(request.Context(), draft.Candidates)
-	draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "verification", verificationStarted, before)
-	draft.Diagnostics.VerifiedCount = len(draft.Candidates)
-	draft.Diagnostics.VerificationRejected += before - len(draft.Candidates)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadGateway, err.Error())
-		return
-	}
-	before = len(draft.Candidates)
-	draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
-	draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
-	before = len(draft.Candidates)
-	draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
-	draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
-	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived external verification, album-level exclusions, and avoid filters. Try again with a more specific prompt.")
-		return
-	}
-	before = len(draft.Candidates)
-	draft.Candidates = applyRecommendationBatchDiversity(input, draft.Candidates)
-	draft.Diagnostics.DiversityRejectedCount += before - len(draft.Candidates)
-	if len(draft.Candidates) == 0 {
-		writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived final artist-diversity filtering. Try again with a broader prompt.")
-		return
-	}
-	if len(draft.Candidates) > input.Limit {
-		draft.Candidates = draft.Candidates[:input.Limit]
-		resetRecommendationCandidateRanks(draft.Candidates)
-	}
-	draft.Diagnostics.ReturnedCount = len(draft.Candidates)
-	if reason := draft.Diagnostics.shortfallReason(); reason != "" {
-		draft.ShortfallReason = reason
-		if draft.Reply == "" {
-			draft.Reply = "Returned a smaller batch because there were not enough qualified candidates (" + reason + ")."
+		if len(draft.Candidates) == 0 {
+			writeJSONError(writer, http.StatusBadGateway, "The recommendation model only returned albums blocked by ratings, recommendation feedback, or avoid filters. Try again with a more specific prompt.")
+			return
 		}
-		log.Printf("recommendation_shortfall mode=%s requested=%d returned=%d discovery_pool=%d discovery_avoided=%d model_selected=%d backfill_added=%d verified=%d verification_rejected=%d excluded=%d avoided=%d diversity_rejected=%d reason=%s", input.Mode, draft.Diagnostics.RequestedCount, draft.Diagnostics.ReturnedCount, draft.Diagnostics.DiscoveryPoolCount, draft.Diagnostics.DiscoveryAvoidedCount, draft.Diagnostics.ModelSelectedCount, draft.Diagnostics.BackfillAddedCount, draft.Diagnostics.VerifiedCount, draft.Diagnostics.VerificationRejected, draft.Diagnostics.ExcludedCount, draft.Diagnostics.AvoidedCount, draft.Diagnostics.DiversityRejectedCount, reason)
+	}
+	if !emptyAttempt {
+		verificationStarted := time.Now()
+		before = len(draft.Candidates)
+		draft.Candidates, err = server.verifyCandidates(request.Context(), draft.Candidates)
+		draft.Diagnostics.Stages = appendStageMetric(draft.Diagnostics.Stages, "verification", verificationStarted, before)
+		draft.Diagnostics.VerifiedCount = len(draft.Candidates)
+		draft.Diagnostics.VerificationRejected += before - len(draft.Candidates)
+		if err != nil {
+			writeJSONError(writer, http.StatusBadGateway, err.Error())
+			return
+		}
+		before = len(draft.Candidates)
+		draft.Candidates = filterExcludedCandidates(draft.Candidates, exclusions)
+		draft.Diagnostics.ExcludedCount += before - len(draft.Candidates)
+		before = len(draft.Candidates)
+		draft.Candidates = filterAvoidedRecommendationCandidates(draft.Candidates, avoidTags)
+		draft.Diagnostics.AvoidedCount += before - len(draft.Candidates)
+		if len(draft.Candidates) == 0 {
+			writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived external verification, album-level exclusions, and avoid filters. Try again with a more specific prompt.")
+			return
+		}
+		before = len(draft.Candidates)
+		draft.Candidates = applyRecommendationBatchDiversity(input, draft.Candidates)
+		draft.Diagnostics.DiversityRejectedCount += before - len(draft.Candidates)
+		if len(draft.Candidates) == 0 {
+			writeJSONError(writer, http.StatusBadGateway, "No generated album candidates survived final artist-diversity filtering. Try again with a broader prompt.")
+			return
+		}
+		if len(draft.Candidates) > input.Limit {
+			draft.Candidates = draft.Candidates[:input.Limit]
+			resetRecommendationCandidateRanks(draft.Candidates)
+		}
+		draft.Diagnostics.ReturnedCount = len(draft.Candidates)
+		if reason := draft.Diagnostics.shortfallReason(); reason != "" {
+			draft.ShortfallReason = reason
+			if draft.Reply == "" {
+				draft.Reply = "Returned a smaller batch because there were not enough qualified candidates (" + reason + ")."
+			}
+			log.Printf("recommendation_shortfall mode=%s requested=%d returned=%d discovery_pool=%d discovery_avoided=%d model_selected=%d backfill_added=%d verified=%d verification_rejected=%d excluded=%d avoided=%d diversity_rejected=%d reason=%s", input.Mode, draft.Diagnostics.RequestedCount, draft.Diagnostics.ReturnedCount, draft.Diagnostics.DiscoveryPoolCount, draft.Diagnostics.DiscoveryAvoidedCount, draft.Diagnostics.ModelSelectedCount, draft.Diagnostics.BackfillAddedCount, draft.Diagnostics.VerifiedCount, draft.Diagnostics.VerificationRejected, draft.Diagnostics.ExcludedCount, draft.Diagnostics.AvoidedCount, draft.Diagnostics.DiversityRejectedCount, reason)
+		}
 	}
 	destinationStarted := time.Now()
 	if songRecommendationMode(input) {
@@ -849,6 +855,10 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 				"diagnostics":      draft.Diagnostics,
 				"degraded_reason":  draft.DegradedReason,
 				"shortfall_reason": draft.ShortfallReason,
+				"candidate_evidence": draft.Trace.CandidateEvidence,
+				"qualifications":     draft.Trace.Qualifications,
+				"selected_indexes":   draft.Trace.SelectedIndexes,
+				"context_summary":    draft.Trace.ContextSummary,
 			},
 		},
 	})
@@ -867,10 +877,7 @@ func (server *Server) handleRecommendations(writer http.ResponseWriter, request 
 }
 
 func (server *Server) handleFeelingLucky(writer http.ResponseWriter, request *http.Request, input RecommendationRequest, profile ProfileContext) {
-	if input.Limit <= 0 || input.Limit > maxFeelingLuckyBatchLimit {
-		writeJSONError(writer, http.StatusBadRequest, fmt.Sprintf("Feeling Lucky count must be between 1 and %d.", maxFeelingLuckyBatchLimit))
-		return
-	}
+	input.Limit = 10
 	observed, inferred := feelingLuckyGenres(profile.Genres)
 	allGenres := append(append([]string{}, observed...), inferred...)
 	if len(allGenres) == 0 {
@@ -890,8 +897,7 @@ func (server *Server) handleFeelingLucky(writer http.ResponseWriter, request *ht
 				continue
 			}
 			for _, candidate := range external {
-				candidateInput := discoveryCandidateInput(candidate, len(candidates)+1, "Feeling Lucky selection from "+genre)
-				candidateInput.Song = candidate.TrackName
+				candidateInput := discoveryCandidateInput(candidate, len(candidates)+1, "Feeling Lucky album selection from "+genre)
 				candidates = append(candidates, candidateInput)
 			}
 		}
@@ -2685,13 +2691,36 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 		DiscoveryPoolCount: len(candidates),
 	}
 	if len(candidates) == 0 {
-		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates for those tags. Try a slightly broader prompt.")
+		trace := buildDiscoveryTrace(request, plan, candidates, nil, similarityEdges)
+		return RecommendationDraft{
+			Reply:           "The discovery search completed, but no verified candidates matched this request.",
+			References:      append([]recommendation.Reference(nil), plan.References...),
+			SimilarityEdges: similarityEdges,
+			Providers:       []recommendation.ProviderStatus{{Provider: "last.fm", Status: similarityProviderStatus(recommender.similar, seedArtists, similarityEdges), Calls: len(seedArtists)}},
+			ShortfallReason: diagnostics.shortfallReason(),
+			Diagnostics: RecommendationDiagnostics{
+				RequestedCount:     diagnostics.RequestedCount,
+				DiscoveryPoolCount: diagnostics.DiscoveryPoolCount,
+				Stages:             []recommendation.StageMetric{planMetric, similarityMetric, discoveryMetric},
+			},
+			Trace: trace,
+		}, nil
 	}
 	beforeAvoid := len(candidates)
 	candidates = filterAvoidedDiscoveryCandidates(candidates, requestAvoidTags(request))
 	diagnostics.DiscoveryAvoidedCount = beforeAvoid - len(candidates)
 	if len(candidates) == 0 {
-		return RecommendationDraft{}, errors.New("MCP verified discovery returned no candidates after applying avoid filters. Try a slightly broader prompt or fewer avoided styles.")
+		shortfallReason := "excluded_or_avoided"
+		trace := buildDiscoveryTrace(request, plan, candidates, nil, similarityEdges)
+		return RecommendationDraft{
+			Reply:           "The discovery search completed, but all verified candidates matched an excluded style.",
+			References:      append([]recommendation.Reference(nil), plan.References...),
+			SimilarityEdges: similarityEdges,
+			Providers:       []recommendation.ProviderStatus{{Provider: "last.fm", Status: similarityProviderStatus(recommender.similar, seedArtists, similarityEdges), Calls: len(seedArtists)}},
+			ShortfallReason: shortfallReason,
+			Diagnostics:     diagnostics,
+			Trace:           trace,
+		}, nil
 	}
 	candidates = rankDiscoveryCandidatesForPrompt(request, plan, candidates)
 	candidates = rankDiscoveryCandidatesWithFeedback(request, plan, candidates, profile.RecentFeedback)
@@ -2707,7 +2736,61 @@ func (recommender *MCPGroundedOllamaRecommender) Recommend(
 	draft.SimilarityEdges = similarityEdges
 	draft.Providers = []recommendation.ProviderStatus{{Provider: "last.fm", Status: similarityProviderStatus(recommender.similar, seedArtists, similarityEdges), Calls: len(seedArtists)}}
 	draft.Diagnostics = diagnostics
+	draft.Trace = buildDiscoveryTrace(request, plan, candidates, draft.Candidates, similarityEdges)
 	return draft, err
+}
+
+// buildDiscoveryTrace retains bounded, provider-neutral evidence for replay and
+// acceptance inspection. Candidate keys are stable within one discovery pool;
+// they intentionally do not infer identity from display names.
+func buildDiscoveryTrace(
+	request RecommendationRequest,
+	plan modelDiscoveryPlan,
+	candidates []mcpserver.DiscoveryCandidate,
+	selected []database.RecommendationCandidateInput,
+	edges []recommendation.SimilarityEdge,
+) recommendation.Trace {
+	trace := recommendation.Trace{
+		SchemaVersion:   recommendation.CurrentSchemaVersion,
+		References:      append([]recommendation.Reference(nil), plan.References...),
+		Examples:        append([]recommendation.Reference(nil), request.Examples...),
+		SimilarityEdges: append([]recommendation.SimilarityEdge(nil), edges...),
+		CandidateEvidence: make(map[string][]recommendation.Evidence),
+		Qualifications:    make(map[string]recommendation.Qualification),
+		ContextSummary: []string{
+			"vibe_summary: " + strings.TrimSpace(plan.VibeSummary),
+			"target_vibe: " + strings.TrimSpace(plan.TargetVibe),
+			"fallback_tags: " + strings.Join(compactWebStrings(plan.FallbackTags), ", "),
+		},
+	}
+	selectedIndexes := make(map[string]bool)
+	for _, item := range selected {
+		selectedIndexes[recommendationCandidateTraceKey(item.Artist, item.Album, item.Song)] = true
+	}
+	for index, candidate := range candidates {
+		key := fmt.Sprintf("candidate_%d", index+1)
+		trace.CandidateEvidence[key] = boundedEvidence(candidate.Evidence)
+		trace.Qualifications[key] = qualifyDiscoveryCandidate(request, plan, candidate)
+		if selectedIndexes[recommendationCandidateTraceKey(candidate.Artist, candidate.Album, candidate.TrackName)] {
+			trace.SelectedIndexes = append(trace.SelectedIndexes, index+1)
+		}
+	}
+	for _, item := range selected {
+		trace.FinalCandidateIDs = append(trace.FinalCandidateIDs, recommendationCandidateTraceKey(item.Artist, item.Album, item.Song))
+	}
+	return trace.Normalize()
+}
+
+func recommendationCandidateTraceKey(artist, album, song string) string {
+	return strings.Join([]string{strings.TrimSpace(artist), strings.TrimSpace(album), strings.TrimSpace(song)}, " / ")
+}
+
+func boundedEvidence(evidence []recommendation.Evidence) []recommendation.Evidence {
+	const maxTraceEvidence = 12
+	if len(evidence) > maxTraceEvidence {
+		evidence = evidence[:maxTraceEvidence]
+	}
+	return append([]recommendation.Evidence(nil), evidence...)
 }
 
 func similarityProviderStatus(source mcpserver.SimilarArtistSource, seeds []string, edges []recommendation.SimilarityEdge) string {
@@ -2964,7 +3047,8 @@ func validateCandidateSelectionAssessment(selection modelCandidateSelection, can
 }
 
 func qualifyDiscoveryCandidate(request RecommendationRequest, plan modelDiscoveryPlan, candidate mcpserver.DiscoveryCandidate) recommendation.Qualification {
-	performanceRequested := promptRequestsVirtuosicPlaying(strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " ")))
+	promptText := strings.ToLower(strings.Join([]string{request.Message, request.Mood}, " "))
+	performanceRequested := promptRequiresVerifiedPerformance(promptText)
 	if len(candidate.Evidence) == 0 {
 		if performanceRequested || len(plan.References) > 0 || promptRequestsComparison(strings.ToLower(request.Message)) {
 			return recommendation.Qualification{Status: recommendation.QualificationInsufficient, Reason: "missing_candidate_evidence"}
@@ -2987,6 +3071,34 @@ func qualifyDiscoveryCandidate(request RecommendationRequest, plan modelDiscover
 		return recommendation.Qualification{Status: recommendation.QualificationPlausible, Reason: "verified_metadata_and_reference_path", EvidenceIDs: evidenceIDs(candidate.Evidence)}
 	}
 	return recommendation.Qualification{Status: recommendation.QualificationPlausible, Reason: "broad_tag_compatibility", EvidenceIDs: evidenceIDs(candidate.Evidence)}
+}
+
+func promptRequiresVerifiedPerformance(promptText string) bool {
+	promptText = " " + strings.Join(strings.Fields(strings.ToLower(promptText)), " ") + " "
+	if !containsAny(promptText, []string{
+		" must ",
+		" must-have ",
+		" must have ",
+		" only ",
+		" exclusively ",
+		" no ",
+		" without ",
+		" requires ",
+		" require ",
+	}) {
+		return false
+	}
+	return containsAny(promptText, []string{
+		"virtuosic",
+		"vituosic",
+		"virtuoso",
+		"shred",
+		"shredding",
+		"lead playing",
+		"lead guitar",
+		"neoclassical playing",
+		"instrumental technique",
+	})
 }
 
 func evidenceIDs(evidence []recommendation.Evidence) []string {
@@ -4032,7 +4144,7 @@ func applyRecommendationBatchDiversity(
 	request RecommendationRequest,
 	candidates []database.RecommendationCandidateInput,
 ) []database.RecommendationCandidateInput {
-	return dedupeRecommendationCandidates(candidates, requestAllowsRepeatedArtists(request) || songRecommendationMode(request))
+	return dedupeRecommendationCandidates(candidates, requestAllowsRepeatedArtists(request))
 }
 
 func backfillRecommendationCandidates(
@@ -4124,7 +4236,16 @@ func dedupeRecommendationCandidates(
 	}
 
 	seenArtists := make(map[string]bool, len(candidates))
+	artistCounts := make(map[string]int, len(candidates))
 	seenAlbums := make(map[string]bool, len(candidates))
+	seenRecordings := make(map[string]bool, len(candidates))
+	songMode := false
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Song) != "" || strings.TrimSpace(candidate.RecordingID) != "" {
+			songMode = true
+			break
+		}
+	}
 	filtered := make([]database.RecommendationCandidateInput, 0, len(candidates))
 	for _, candidate := range candidates {
 		cleanArtist, cleanAlbum := recommendationCandidateKeys(candidate)
@@ -4134,24 +4255,42 @@ func dedupeRecommendationCandidates(
 		if cleanAlbum == "" {
 			cleanAlbum = strings.ToLower(strings.TrimSpace(candidate.Album))
 		}
-		identity := cleanAlbum
-		if strings.TrimSpace(candidate.Song) != "" {
-			_, identity, _ = database.NormalizeAlbumLookup("placeholder", candidate.Song)
+		if songMode {
+			recordingKey := strings.TrimSpace(candidate.RecordingID)
+			if recordingKey == "" {
+				_, recordingKey, _ = database.NormalizeAlbumLookup("placeholder", candidate.Song)
+				recordingKey = cleanArtist + "\x00" + recordingKey
+			}
+			if recordingKey != "" && seenRecordings[recordingKey] {
+				continue
+			}
+			if recordingKey != "" {
+				seenRecordings[recordingKey] = true
+			}
+		} else {
+			identity := cleanAlbum
+			albumKey := cleanArtist + "\x00" + identity
+			if albumKey != "\x00" && seenAlbums[albumKey] {
+				continue
+			}
 		}
-		albumKey := cleanArtist + "\x00" + identity
-		if albumKey != "\x00" && seenAlbums[albumKey] {
+		if !songMode && !allowRepeatedArtists && cleanArtist != "" && seenArtists[cleanArtist] {
 			continue
 		}
-		if !allowRepeatedArtists && cleanArtist != "" && seenArtists[cleanArtist] {
+		if songMode && !allowRepeatedArtists && cleanArtist != "" && artistCounts[cleanArtist] >= 2 {
 			continue
 		}
 		candidate.Rank = len(filtered) + 1
 		filtered = append(filtered, candidate)
 		if cleanArtist != "" {
 			seenArtists[cleanArtist] = true
+			artistCounts[cleanArtist]++
 		}
-		if albumKey != "\x00" {
-			seenAlbums[albumKey] = true
+		if !songMode {
+			albumKey := cleanArtist + "\x00" + cleanAlbum
+			if albumKey != "\x00" {
+				seenAlbums[albumKey] = true
+			}
 		}
 	}
 	return filtered
@@ -4187,6 +4326,9 @@ func discoveryCandidateInput(
 	note string,
 ) database.RecommendationCandidateInput {
 	input := database.RecommendationCandidateInput{
+		ArtistID:     candidate.ArtistID,
+		AlbumID:      candidate.AlbumID,
+		RecordingID:  candidate.RecordingID,
 		Artist:       candidate.Artist,
 		Album:        candidate.Album,
 		StarterTrack: candidate.TrackName,

@@ -5,8 +5,14 @@ test("Feeling Lucky has a dedicated route and isolated refresh state", async ({ 
   await expect(page).toHaveTitle("Music Vault");
   await expect(page.locator("#pageTitle")).toHaveText("Feeling Lucky");
   await expect(page.locator("#pageDescription")).toContainText("random surprise");
-  await expect(page.locator("#limit")).toHaveAttribute("max", "20");
-  await expect(page.locator("#sendButton")).toHaveText("Generate Batch");
+  await expect(page.locator("#limit")).toHaveAttribute("max", "10");
+  await expect(page.locator("#promptForm")).toBeHidden();
+  await expect(page.locator("#feelingLuckyControls")).toBeVisible();
+  await expect(page.locator("#feelingLuckyButton")).toHaveText("Feeling Lucky");
+  await expect(page.locator("#message")).toBeHidden();
+  await expect(page.locator("#mood")).toBeHidden();
+  await expect(page.locator("#avoid")).toBeHidden();
+  await expect(page.locator("#limit")).toBeHidden();
   await expect(page.locator("#candidateList")).toContainText("No current batch");
   await expect(page.locator(".recommendation-nav a[data-mode='feeling_lucky']")).toHaveClass(/active/);
 

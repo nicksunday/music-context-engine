@@ -50,6 +50,8 @@ const elements = {
   exportPreview: document.querySelector("#exportPreview"),
   approveExport: document.querySelector("#approveExport"),
   downloadExport: document.querySelector("#downloadExport"),
+  feelingLuckyControls: document.querySelector("#feelingLuckyControls"),
+  feelingLuckyButton: document.querySelector("#feelingLuckyButton"),
 };
 
 const savedVerdicts = new Map();
@@ -377,6 +379,31 @@ async function submitPrompt(event) {
   }
 }
 
+async function generateFeelingLucky() {
+  elements.feelingLuckyButton.disabled = true;
+  setStatus("Generating 10 albums");
+  try {
+    const response = await api("/api/recommendations", {
+      method: "POST",
+      body: JSON.stringify({ mode: "feeling_lucky" }),
+    });
+    if (response.batch) {
+      response.batch.degraded_reason = response.degraded_reason || "";
+      response.batch.shortfall_reason = response.shortfall_reason || "";
+    }
+    setCurrentBatch(response.batch);
+    appendMessage("assistant", response.reply || "Feeling Lucky batch generated.");
+    await loadContext();
+    await loadRail();
+    await loadSessions();
+  } catch (error) {
+    appendMessage("error", error.message);
+  } finally {
+    elements.feelingLuckyButton.disabled = false;
+    setStatus("");
+  }
+}
+
 function exampleRequestFields() {
   return {
     message: elements.message.value.trim(),
@@ -689,7 +716,7 @@ function configureMode() {
   const [title, description] = labels[state.mode];
   elements.pageTitle.textContent = title;
   elements.pageDescription.textContent = description;
-  elements.limit.max = state.mode === "song" ? "20" : (state.mode === "feeling_lucky" ? "20" : "10");
+  elements.limit.max = state.mode === "song" ? "20" : "10";
   elements.sessionHeading.textContent = state.mode === "song" ? "Song Sessions" : (state.mode === "feeling_lucky" ? "Feeling Lucky Sessions" : "Album Sessions");
   if (defaultPrompts[state.mode] && (!elements.message.value || elements.message.value === initialPrompt)) {
     elements.message.value = defaultPrompts[state.mode];
@@ -698,7 +725,8 @@ function configureMode() {
   document.querySelectorAll(".recommendation-nav a").forEach(link => {
     link.classList.toggle("active", link.dataset.mode === state.mode);
   });
-  elements.promptForm.hidden = state.mode === "entry";
+  elements.promptForm.hidden = state.mode === "entry" || state.mode === "feeling_lucky";
+  elements.feelingLuckyControls.hidden = state.mode !== "feeling_lucky";
 }
 
 async function refreshAll() {
@@ -706,6 +734,7 @@ async function refreshAll() {
 }
 
 elements.promptForm.addEventListener("submit", submitPrompt);
+elements.feelingLuckyButton.addEventListener("click", generateFeelingLucky);
 elements.quickFeedback.addEventListener("submit", submitQuickFeedback);
 elements.refreshContext.addEventListener("click", () => refreshAll().catch((error) => appendMessage("error", error.message)));
 elements.approveExport.addEventListener("click", () => approveSelectedExports().catch((error) => appendMessage("error", error.message)));

@@ -29,6 +29,48 @@ type fakeRecommender struct {
 	requestCapture *RecommendationRequest
 }
 
+func TestRecommendationEndpointPersistsSuccessfulEmptyAttemptWithTrace(t *testing.T) {
+	db := openWebTestDB(t)
+	handler := NewServer(db.Ctx, Options{
+		Recommender: fakeRecommender{draft: RecommendationDraft{
+			Reply:           "No verified candidates matched.",
+			ShortfallReason: "discovery_pool_exhausted",
+			Diagnostics: RecommendationDiagnostics{
+				RequestedCount:     20,
+				DiscoveryPoolCount: 0,
+			},
+		}},
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(`{"message":"neoclassical metal","mode":"song","limit":20}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload RecommendationResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Batch.ID == "" || len(payload.Batch.Candidates) != 0 {
+		t.Fatalf("empty batch = %#v, want persisted batch with no candidates", payload.Batch)
+	}
+	if payload.ShortfallReason != "discovery_pool_exhausted" {
+		t.Fatalf("shortfall reason = %q", payload.ShortfallReason)
+	}
+
+	traceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(traceResponse, httptest.NewRequest(http.MethodGet, "/api/trace?id="+payload.Batch.ID, nil))
+	if traceResponse.Code != http.StatusOK || !strings.Contains(traceResponse.Body.String(), payload.Batch.ID) {
+		t.Fatalf("trace response = %d %s", traceResponse.Code, traceResponse.Body.String())
+	}
+	var trace RecommendationTraceResponse
+	if err := json.Unmarshal(traceResponse.Body.Bytes(), &trace); err != nil {
+		t.Fatal(err)
+	}
+	if !trace.Available || trace.Trace.ShortfallReason != "discovery_pool_exhausted" {
+		t.Fatalf("trace = %#v", trace)
+	}
+}
+
 func (fake fakeRecommender) Recommend(_ context.Context, request RecommendationRequest, _ ProfileContext) (RecommendationDraft, error) {
 	if fake.requestCapture != nil {
 		*fake.requestCapture = request
@@ -365,12 +407,12 @@ func TestQualifyDiscoveryCandidateSeparatesGeneralTagsFromSpecificPerformance(t 
 	if general.Status != recommendation.QualificationPlausible {
 		t.Fatalf("general tag qualification = %#v", general)
 	}
-	specific := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal"}, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{GenreTags: []string{"progressive metal"}})
+	specific := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal with must-have lead playing"}, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{GenreTags: []string{"progressive metal"}})
 	if specific.Status != recommendation.QualificationInsufficient || specific.Reason != "missing_candidate_evidence" {
 		t.Fatalf("specific tag qualification = %#v", specific)
 	}
 	withEvidence := mcpserver.DiscoveryCandidate{TrackName: "Track", Evidence: []recommendation.Evidence{{ID: "lead", EntityScope: recommendation.EntityRecording, Kind: recommendation.EvidenceCatalogIdentity, Claim: "virtuosic lead playing"}}}
-	qualified := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal", Mode: "song"}, modelDiscoveryPlan{}, withEvidence)
+	qualified := qualifyDiscoveryCandidate(RecommendationRequest{Message: "virtuosic metal with must-have lead playing", Mode: "song"}, modelDiscoveryPlan{}, withEvidence)
 	if qualified.Status != recommendation.QualificationPlausible {
 		t.Fatalf("scoped evidence qualification = %#v", qualified)
 	}
@@ -380,8 +422,41 @@ func TestQualifyDiscoveryCandidateSeparatesGeneralTagsFromSpecificPerformance(t 
 	}
 }
 
+func TestBareNeoclassicalGenreDoesNotRequirePerformanceEvidence(t *testing.T) {
+	candidate := mcpserver.DiscoveryCandidate{
+		Artist:    "Synthetic Neoclassical Artist",
+		Album:     "Genre Record",
+		GenreTags: []string{"neoclassical metal"},
+		Evidence: []recommendation.Evidence{{
+			ID: "genre", Source: "musicbrainz", EntityScope: recommendation.EntityAlbum,
+			Kind: recommendation.EvidenceGenreProxy, Claim: "catalog tag", Details: "neoclassical metal",
+		}},
+	}
+	qualified := qualifyDiscoveryCandidate(RecommendationRequest{Message: "neoclassical metal"}, modelDiscoveryPlan{}, candidate)
+	if qualified.Status != recommendation.QualificationPlausible {
+		t.Fatalf("bare neoclassical qualification = %#v, want plausible", qualified)
+	}
+	if promptRequiresVerifiedPerformance("neoclassical metal") {
+		t.Fatal("bare neoclassical genre was treated as a hard performance requirement")
+	}
+}
+
+func TestExplicitHardPerformanceRequirementNeedsScopedEvidence(t *testing.T) {
+	request := RecommendationRequest{Message: "neoclassical metal with must-have virtuosic lead playing"}
+	withoutEvidence := qualifyDiscoveryCandidate(request, modelDiscoveryPlan{}, mcpserver.DiscoveryCandidate{
+		GenreTags: []string{"neoclassical metal"},
+		Evidence:  []recommendation.Evidence{{ID: "genre", EntityScope: recommendation.EntityAlbum, Kind: recommendation.EvidenceGenreProxy, Claim: "catalog tag", Details: "neoclassical metal"}},
+	})
+	if withoutEvidence.Status != recommendation.QualificationInsufficient || withoutEvidence.Reason != "performance_trait_unverified" {
+		t.Fatalf("hard performance qualification = %#v, want insufficient performance evidence", withoutEvidence)
+	}
+	if !promptRequiresVerifiedPerformance(request.Message) {
+		t.Fatal("explicit hard performance requirement was not detected")
+	}
+}
+
 func TestBackfillSkipsUnqualifiedCandidates(t *testing.T) {
-	request := RecommendationRequest{Message: "virtuosic metal", Limit: 2}
+	request := RecommendationRequest{Message: "virtuosic metal with must-have lead playing", Limit: 2}
 	plan := modelDiscoveryPlan{}
 	selected := []database.RecommendationCandidateInput{}
 	pool := []mcpserver.DiscoveryCandidate{
@@ -645,7 +720,7 @@ func TestRecommendationPagesExposeSharedNavigation(t *testing.T) {
 func TestRecommendationFrontendContainsModeSpecificPresentationContracts(t *testing.T) {
 	for name, expected := range map[string][]string{
 		"static/index.html": {"id=\"modeChooser\"", "data-mode=\"song\"", "data-mode=\"album\"", "data-mode=\"feeling_lucky\"", "/recommendations/lucky"},
-		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next", "high-impact albums to check out next", "initialPrompt", "/api/examples", "restorePrompt(response.batch", "response.degraded_reason", "Feeling Lucky"},
+		"static/app.js":     {"function renderSongCandidate", "Not Today", "/api/batch/latest?mode=", "/api/batches?mode=", "individual songs to hear next.", "high-impact albums to check out next.", "initialPrompt", "/api/examples", "restorePrompt(response.batch", "response.degraded_reason", "generateFeelingLucky", "Generating 10 albums"},
 		"static/app.css":    {".song-row", ".recommendation-nav", ".mode-choice", ".prompt-fit", "grid-template-rows: auto auto auto minmax(0, 1fr)"},
 	} {
 		content, err := fs.ReadFile(staticFiles, name)
@@ -723,10 +798,10 @@ func TestFeelingLuckyEndpointWorksWithoutOllamaAndPersistsMetadata(t *testing.T)
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Batch.Mode != "feeling_lucky" || payload.Batch.FeelingLucky == nil || payload.Batch.FeelingLucky.RequestedCount != 2 {
+	if payload.Batch.Mode != "feeling_lucky" || payload.Batch.FeelingLucky == nil || payload.Batch.FeelingLucky.RequestedCount != 10 {
 		t.Fatalf("batch = %#v", payload.Batch)
 	}
-	if len(payload.Batch.Candidates) == 0 || payload.Batch.Candidates[0].GenreTags[0] != "jazz" {
+	if len(payload.Batch.Candidates) == 0 || payload.Batch.Candidates[0].GenreTags[0] != "jazz" || payload.Batch.Candidates[0].Song != "" {
 		t.Fatalf("candidates = %#v", payload.Batch.Candidates)
 	}
 	latest, err := database.FetchLatestRecommendationBatchForMode(context.Background(), db.Ctx, "feeling_lucky")
@@ -735,22 +810,25 @@ func TestFeelingLuckyEndpointWorksWithoutOllamaAndPersistsMetadata(t *testing.T)
 	}
 }
 
-func TestFeelingLuckyEndpointRejectsInvalidCountWithoutPersistence(t *testing.T) {
+func TestFeelingLuckyEndpointAlwaysUsesFixedTenCount(t *testing.T) {
 	db := openWebTestDB(t)
+	if _, err := db.Ctx.Exec(`INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres) VALUES ('fixed-count-album', 'Album', 'Artist', 'album', 'artist', '["jazz"]')`); err != nil {
+		t.Fatal(err)
+	}
 	handler := NewServer(db.Ctx, Options{})
 	for _, body := range []string{`{"mode":"feeling_lucky","limit":0}`, `{"mode":"feeling_lucky","limit":21}`} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recommendations", bytes.NewBufferString(body)))
-		if response.Code != http.StatusBadRequest {
-			t.Fatalf("body=%s status=%d, want 400", body, response.Code)
+		if response.Code != http.StatusOK {
+			t.Fatalf("body=%s status=%d, want fixed-count request to proceed; response=%s", body, response.Code, response.Body.String())
 		}
 	}
 	var count int
 	if err := db.Ctx.QueryRow("SELECT COUNT(*) FROM recommendation_batches WHERE mode = 'feeling_lucky'").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("Feeling Lucky batches persisted after invalid counts: %d", count)
+	if count != 2 {
+		t.Fatalf("Feeling Lucky batches persisted = %d, want 2 fixed-count batches", count)
 	}
 }
 
@@ -770,7 +848,10 @@ func TestFeelingLuckyEndpointReturnsExplicitNoGenreState(t *testing.T) {
 
 func TestFeelingLuckyEndpointFallsBackToLocalAndLabelsInferredGenres(t *testing.T) {
 	db := openWebTestDB(t)
-	_, err := db.Ctx.Exec(`INSERT INTO tracks (id, title, album, artist, clean_title, clean_artist, genres) VALUES ('fallback-track', 'Local Song', 'Local Album', 'Local Artist', 'local song', 'local artist', '["rock"]')`)
+	_, err := db.Ctx.Exec(`
+		INSERT INTO albums (id, title, artist, clean_title, clean_artist, genres) VALUES ('fallback-album', 'Local Album', 'Local Artist', 'local album', 'local artist', '["rock"]');
+		INSERT INTO tracks (id, album_id, title, album, artist, clean_title, clean_artist, genres) VALUES ('fallback-track', 'fallback-album', 'Local Song', 'Local Album', 'Local Artist', 'local song', 'local artist', '["rock"]');
+	`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,6 +1562,28 @@ func TestSongRecommendationDiversityAllowsDistinctTracksByArtist(t *testing.T) {
 	got := applyRecommendationBatchDiversity(request, candidates)
 	if len(got) != 3 {
 		t.Fatalf("song-diverse candidates = %#v, want all 3 distinct tracks", got)
+	}
+}
+
+func TestSongRecommendationDiversityCapsArtistsByDefaultAndAllowsDeepDive(t *testing.T) {
+	candidates := []database.RecommendationCandidateInput{
+		{Artist: "Same Artist", Album: "Album", Song: "First Song", RecordingID: "recording-1"},
+		{Artist: "Same Artist", Album: "Album", Song: "Second Song", RecordingID: "recording-2"},
+		{Artist: "Same Artist", Album: "Album", Song: "Third Song", RecordingID: "recording-3"},
+		{Artist: "Other Artist", Album: "Other Album", Song: "Other Song", RecordingID: "recording-4"},
+	}
+
+	got := applyRecommendationBatchDiversity(RecommendationRequest{Mode: "song", Message: "technical metal"}, candidates)
+	if len(got) != 3 {
+		t.Fatalf("default song diversity = %#v, want two same-artist songs plus one other artist", got)
+	}
+	if got[0].Artist != "Same Artist" || got[1].Artist != "Same Artist" || got[2].Artist != "Other Artist" {
+		t.Fatalf("default song diversity = %#v, want default artist cap of two", got)
+	}
+
+	deepDive := applyRecommendationBatchDiversity(RecommendationRequest{Mode: "song", Message: "deep dive into Same Artist"}, candidates)
+	if len(deepDive) != 4 {
+		t.Fatalf("deep-dive song diversity = %#v, want all distinct recordings", deepDive)
 	}
 }
 

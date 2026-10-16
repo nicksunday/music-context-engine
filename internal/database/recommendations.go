@@ -14,6 +14,9 @@ import (
 )
 
 type RecommendationCandidateInput struct {
+	ArtistID          string   `json:"artist_id,omitempty"`
+	AlbumID           string   `json:"album_id,omitempty"`
+	RecordingID       string   `json:"recording_id,omitempty"`
 	Artist            string   `json:"artist"`
 	Album             string   `json:"album"`
 	Song              string   `json:"song,omitempty"`
@@ -30,6 +33,9 @@ type RecommendationCandidateInput struct {
 type RecommendationCandidate struct {
 	ID                string                           `json:"id"`
 	BatchID           string                           `json:"batch_id"`
+	ArtistID          string                           `json:"artist_id,omitempty"`
+	AlbumID           string                           `json:"album_id,omitempty"`
+	RecordingID       string                           `json:"recording_id,omitempty"`
 	Artist            string                           `json:"artist"`
 	Album             string                           `json:"album"`
 	Song              string                           `json:"song,omitempty"`
@@ -409,10 +415,13 @@ func CreateRecommendationBatch(ctx context.Context, db *sql.DB, input Recommenda
 
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO recommendation_candidates (
-				id, batch_id, artist, album, song, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url, streaming_provider, streaming_app_url
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, batch_id, artist_id, album_id, recording_id, artist, album, song, clean_artist, clean_title, starter_track, release_year, genre_tags, rank, streaming_url, streaming_provider, streaming_app_url
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.ID,
 			candidate.BatchID,
+			nullableTrimmedString(candidate.ArtistID),
+			nullableTrimmedString(candidate.AlbumID),
+			nullableTrimmedString(candidate.RecordingID),
 			candidate.Artist,
 			candidate.Album,
 			candidate.Song,
@@ -908,7 +917,7 @@ func normalizedRecommendationMode(mode string) string {
 
 func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID string) ([]RecommendationCandidate, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT c.id, c.batch_id, c.artist, c.album, c.song, c.clean_artist, c.clean_title, c.starter_track, c.release_year, c.genre_tags, c.rank, c.streaming_url, c.streaming_provider, c.streaming_app_url,
+		SELECT c.id, c.batch_id, c.artist_id, c.album_id, c.recording_id, c.artist, c.album, c.song, c.clean_artist, c.clean_title, c.starter_track, c.release_year, c.genre_tags, c.rank, c.streaming_url, c.streaming_provider, c.streaming_app_url,
 			f.id, f.verdict, f.reason, f.notes, f.revision, f.created_at, f.updated_at
 		FROM recommendation_candidates
 		AS c LEFT JOIN recommendation_prompt_fit_feedback AS f ON f.candidate_id = c.id
@@ -922,13 +931,16 @@ func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID stri
 	var candidates []RecommendationCandidate
 	for rows.Next() {
 		var candidate RecommendationCandidate
-		var song, starterTrack, genreTags, streamingURL, streamingProvider, streamingAppURL sql.NullString
+		var artistID, albumID, recordingID, song, starterTrack, genreTags, streamingURL, streamingProvider, streamingAppURL sql.NullString
 		var fitID, fitVerdict, fitReason, fitNotes, fitCreated, fitUpdated sql.NullString
 		var fitRevision sql.NullInt64
 		var releaseYear sql.NullInt64
 		if err := rows.Scan(
 			&candidate.ID,
 			&candidate.BatchID,
+			&artistID,
+			&albumID,
+			&recordingID,
 			&candidate.Artist,
 			&candidate.Album,
 			&song,
@@ -954,6 +966,9 @@ func fetchRecommendationCandidates(ctx context.Context, db *sql.DB, batchID stri
 		candidate.StarterTrack = nullStringText(starterTrack)
 		candidate.StreamingURL = nullStringText(streamingURL)
 		candidate.Song = nullStringText(song)
+		candidate.ArtistID = nullStringText(artistID)
+		candidate.AlbumID = nullStringText(albumID)
+		candidate.RecordingID = nullStringText(recordingID)
 		candidate.StreamingProvider = nullStringText(streamingProvider)
 		candidate.StreamingAppURL = nullStringText(streamingAppURL)
 		if fitID.Valid {
@@ -996,14 +1011,13 @@ func FetchFeelingLuckyLocalCandidates(ctx context.Context, db *sql.DB, genres []
 	}
 	args = append(args, limit)
 	rows, err := db.QueryContext(ctx, `
-		SELECT tracks.artist, COALESCE(tracks.album, ''), tracks.title, albums.release_date, tracks.genres
-		FROM tracks
-		LEFT JOIN albums ON albums.id = tracks.album_id
+		SELECT albums.artist, albums.title, '', albums.release_date, albums.genres
+		FROM albums
 		WHERE EXISTS (
-			SELECT 1 FROM json_each(CASE WHEN json_valid(tracks.genres) THEN tracks.genres ELSE '[]' END)
+			SELECT 1 FROM json_each(CASE WHEN json_valid(albums.genres) THEN albums.genres ELSE '[]' END)
 			WHERE lower(trim(CAST(json_each.value AS TEXT))) IN (`+strings.Join(placeholders, ",")+`)
 		)
-		AND trim(tracks.artist) != '' AND trim(tracks.title) != ''
+		AND trim(albums.artist) != '' AND trim(albums.title) != ''
 		ORDER BY random() LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -1080,6 +1094,9 @@ func normalizeRecommendationCandidate(batchID string, fallbackRank int, input Re
 	return RecommendationCandidate{
 		ID:                uuid.NewString(),
 		BatchID:           batchID,
+		ArtistID:          strings.TrimSpace(input.ArtistID),
+		AlbumID:           strings.TrimSpace(input.AlbumID),
+		RecordingID:       strings.TrimSpace(input.RecordingID),
 		Artist:            strings.TrimSpace(input.Artist),
 		Album:             strings.TrimSpace(input.Album),
 		Song:              strings.TrimSpace(input.Song),

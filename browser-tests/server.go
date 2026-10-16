@@ -56,4 +56,17 @@ func seed(db *database.DBClient) {
 	if _, err := database.SaveRecommendationPromptFitFeedback(context.Background(), db.Ctx, database.RecommendationPromptFitFeedbackInput{BatchID: song.ID, CandidateID: song.Candidates[0].ID, Verdict: "missed", Reason: "wrong_energy"}); err != nil {
 		log.Fatal(err)
 	}
+	if _, err := database.CreateRecommendationBatch(context.Background(), db.Ctx, database.RecommendationBatchInput{
+		Prompt: "empty browser trace", Mode: "song",
+		Snapshot: &database.RecommendationBatchSnapshotInput{
+			SchemaVersion: 1, Complete: true,
+			Payload: map[string]any{
+				"request":          map[string]any{"message": "empty browser trace", "mode": "song", "limit": 20},
+				"candidate_output": []database.RecommendationCandidateInput{},
+				"shortfall_reason": "discovery_pool_exhausted",
+			},
+		},
+	}); err != nil {
+		log.Fatal(err)
+	}
 }

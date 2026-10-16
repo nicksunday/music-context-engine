@@ -51,6 +51,9 @@ const (
 // after validation and local-library exclusion.
 type DiscoveryCandidate struct {
 	ID          string                    `json:"-"`
+	ArtistID    string                    `json:"artist_id,omitempty"`
+	AlbumID     string                    `json:"album_id,omitempty"`
+	RecordingID string                    `json:"recording_id,omitempty"`
 	TrackName   string                    `json:"track_name"`
 	Artist      string                    `json:"artist"`
 	Album       string                    `json:"album"`
@@ -122,6 +125,7 @@ type musicBrainzRecordingSearchResponse struct {
 }
 
 type musicBrainzRecording struct {
+	ID               string                    `json:"id"`
 	Title            string                    `json:"title"`
 	Length           int64                     `json:"length"`
 	FirstReleaseDate string                    `json:"first-release-date"`
@@ -149,6 +153,7 @@ type musicBrainzAlias struct {
 
 type musicBrainzArtistCredit struct {
 	Name       string `json:"name"`
+	ID         string `json:"id"`
 	JoinPhrase string `json:"joinphrase"`
 	Artist     struct {
 		Name string `json:"name"`
@@ -156,6 +161,7 @@ type musicBrainzArtistCredit struct {
 }
 
 type musicBrainzRelease struct {
+	ID      string                    `json:"id"`
 	Title   string                    `json:"title"`
 	Status  string                    `json:"status"`
 	Date    string                    `json:"date"`
@@ -313,7 +319,14 @@ func getVerifiedDiscoveryCandidatesSeededWithOptions(
 	if err != nil {
 		return nil, err
 	}
-	cleanSeeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
+	seedLimit := maxDiscoverySeedArtists
+	if skipAlbumGenreReconciliation {
+		seedLimit = songDiscoveryArtistSearchBudget(limit)
+	}
+	cleanSeeds := compactDiscoverySeeds(seedArtists, seedLimit)
+	if skipAlbumGenreReconciliation && len(cleanTags) > 2 {
+		cleanTags = cleanTags[:2]
+	}
 
 	var liveCandidates []DiscoveryCandidate
 	if skipAlbumGenreReconciliation {
@@ -335,10 +348,15 @@ func getVerifiedDiscoveryCandidatesSeededWithOptions(
 		return nil, fmt.Errorf("at least one discovery tag or seed artist must be provided")
 	}
 
+	songMode := skipAlbumGenreReconciliation
 	candidates := make([]DiscoveryCandidate, 0, limit)
 	seen := make(map[string]bool)
 	seenAlbums := make(map[string]bool)
 	artistCount := make(map[string]int)
+	artistCap := 2
+	if songMode {
+		artistCap = 4
+	}
 	for _, candidate := range liveCandidates {
 		if err := validateDiscoveryCandidate(candidate); err != nil {
 			continue
@@ -365,22 +383,27 @@ func getVerifiedDiscoveryCandidatesSeededWithOptions(
 		}
 
 		candidateKey := cleanArtist + "\x00" + cleanAlbum + "\x00" + cleanTrack
+		if songMode && strings.TrimSpace(candidate.RecordingID) != "" {
+			candidateKey = "recording:" + strings.TrimSpace(candidate.RecordingID)
+		}
 		if seen[candidateKey] {
 			continue
 		}
 
 		albumKeys := discoveryAlbumKeys(cleanArtist, cleanAlbum, cleanAlbumNames)
-		if containsSeenValue(seenAlbums, albumKeys) {
+		if !songMode && containsSeenValue(seenAlbums, albumKeys) {
 			continue
 		}
 
-		if artistCount[cleanArtist] >= 2 {
+		if artistCount[cleanArtist] >= artistCap {
 			continue
 		}
 
 		candidates = append(candidates, candidate)
 		seen[candidateKey] = true
-		markSeenValues(seenAlbums, albumKeys)
+		if !songMode {
+			markSeenValues(seenAlbums, albumKeys)
+		}
 		artistCount[cleanArtist]++
 		if len(candidates) == limit {
 			break
@@ -461,6 +484,34 @@ func discoverySearchLimit(limit int) int {
 	return searchLimit
 }
 
+func songDiscoveryPoolLimit(limit int) int {
+	if limit <= 0 {
+		return 48
+	}
+	pool := 5 * limit
+	if pool < 48 {
+		pool = 48
+	}
+	if pool > 96 {
+		pool = 96
+	}
+	return pool
+}
+
+func songDiscoveryArtistSearchBudget(limit int) int {
+	if limit <= 0 {
+		return 4
+	}
+	budget := (limit + 2) / 3
+	if budget < 4 {
+		budget = 4
+	}
+	if budget > 8 {
+		budget = 8
+	}
+	return budget
+}
+
 func discoveryAlbumKeys(cleanArtist string, cleanAlbum string, alternateCleanAlbums []string) []string {
 	values := append([]string{cleanAlbum}, alternateCleanAlbums...)
 	keys := make([]string, 0, len(values))
@@ -535,7 +586,7 @@ func (client *musicBrainzDiscoveryClient) SearchSongs(
 	if err != nil {
 		return nil, err
 	}
-	recordings, err := client.searchSeededRecordings(ctx, cleanTags, seedArtists, limit)
+	recordings, err := client.searchSeededRecordingsMode(ctx, cleanTags, seedArtists, limit, true)
 	if err != nil {
 		return nil, err
 	}
@@ -558,7 +609,7 @@ func (client *musicBrainzDiscoveryClient) SearchWithSeeds(
 	}
 
 	cleanTags, _ := normalizeDiscoveryTags(searchTags)
-	recordings, err := client.searchSeededRecordings(ctx, cleanTags, seedArtists, limit)
+	recordings, err := client.searchSeededRecordingsMode(ctx, cleanTags, seedArtists, limit, false)
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +629,21 @@ func (client *musicBrainzDiscoveryClient) searchSeededRecordings(
 	seedArtists []string,
 	limit int,
 ) ([]musicBrainzRecording, error) {
-	seeds := compactDiscoverySeeds(seedArtists, maxDiscoverySeedArtists)
+	return client.searchSeededRecordingsMode(ctx, cleanTags, seedArtists, limit, false)
+}
+
+func (client *musicBrainzDiscoveryClient) searchSeededRecordingsMode(
+	ctx context.Context,
+	cleanTags []string,
+	seedArtists []string,
+	limit int,
+	songMode bool,
+) ([]musicBrainzRecording, error) {
+	maxSeeds := maxDiscoverySeedArtists
+	if songMode {
+		maxSeeds = 8
+	}
+	seeds := compactDiscoverySeeds(seedArtists, maxSeeds)
 	if len(seeds) == 0 {
 		return client.searchTagRecordings(ctx, cleanTags, limit)
 	}
@@ -603,16 +668,27 @@ func (client *musicBrainzDiscoveryClient) searchSeededRecordings(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return mergeDiscoveryRecordings(tagRecords, artistRecords), nil
+	poolLimit := maxDiscoveryReconcileCandidates
+	if songMode {
+		poolLimit = songDiscoveryPoolLimit(limit)
+	}
+	return mergeDiscoveryRecordingsWithLimit(tagRecords, artistRecords, poolLimit), nil
 }
 
 // mergeDiscoveryRecordings reserves half the pool for prompt tags, then gives
 // each artist a turn. Sparse sources donate unused capacity to other sources.
 func mergeDiscoveryRecordings(tags []musicBrainzRecording, artists [][]musicBrainzRecording) []musicBrainzRecording {
+	return mergeDiscoveryRecordingsWithLimit(tags, artists, maxDiscoveryReconcileCandidates)
+}
+
+func mergeDiscoveryRecordingsWithLimit(tags []musicBrainzRecording, artists [][]musicBrainzRecording, poolLimit int) []musicBrainzRecording {
+	if poolLimit <= 0 {
+		return nil
+	}
 	seen := make(map[string]bool)
 	var recordings []musicBrainzRecording
 	take := func(list *[]musicBrainzRecording) bool {
-		for len(*list) > 0 && len(recordings) < maxDiscoveryReconcileCandidates {
+		for len(*list) > 0 && len(recordings) < poolLimit {
 			rec := (*list)[0]
 			*list = (*list)[1:]
 			key := musicBrainzRecordingKey(rec)
@@ -625,11 +701,12 @@ func mergeDiscoveryRecordings(tags []musicBrainzRecording, artists [][]musicBrai
 		}
 		return false
 	}
-	for len(recordings) < (maxDiscoveryReconcileCandidates+1)/2 && take(&tags) {
+	tagReservation := (poolLimit + 1) / 2
+	for len(recordings) < tagReservation && take(&tags) {
 	}
 	// Copy slice headers so consuming lists does not mutate the caller's lists.
 	artists = append([][]musicBrainzRecording(nil), artists...)
-	for len(recordings) < maxDiscoveryReconcileCandidates {
+	for len(recordings) < poolLimit {
 		before := len(recordings)
 		for i := range artists {
 			take(&artists[i])
@@ -770,6 +847,9 @@ func musicBrainzArtistQuery(artist string) string {
 // musicBrainzRecordingKey deduplicates recordings across multiple seed/tag
 // queries by normalized title and artist credit.
 func musicBrainzRecordingKey(rec musicBrainzRecording) string {
+	if id := strings.TrimSpace(rec.ID); id != "" {
+		return "recording:" + id
+	}
 	title := strings.ToLower(strings.TrimSpace(rec.Title))
 	artist := strings.ToLower(strings.TrimSpace(musicBrainzArtistName(rec.ArtistCredit)))
 	if title == "" || artist == "" {
@@ -878,6 +958,10 @@ func parseMusicBrainzCandidates(recordings []musicBrainzRecording) []DiscoveryCa
 			alternateAlbumTitles,
 		)
 		candidate := DiscoveryCandidate{
+			ID:          recording.ID,
+			ArtistID:    musicBrainzArtistID(recording.ArtistCredit),
+			AlbumID:     release.Group.ID,
+			RecordingID: recording.ID,
 			TrackName:   trackName,
 			Artist:      musicBrainzArtistName(recording.ArtistCredit),
 			Album:       album,
@@ -1254,6 +1338,15 @@ func musicBrainzArtistName(credits []musicBrainzArtistCredit) string {
 		artist.WriteString(credit.JoinPhrase)
 	}
 	return strings.TrimSpace(artist.String())
+}
+
+func musicBrainzArtistID(credits []musicBrainzArtistCredit) string {
+	for _, credit := range credits {
+		if id := strings.TrimSpace(credit.ID); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 func releaseYearFromDate(date string) (int, error) {

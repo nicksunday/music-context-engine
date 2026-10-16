@@ -291,6 +291,29 @@ func TestDiscoverySearchLimitPadsAndCapsExternalFetches(t *testing.T) {
 	}
 }
 
+func TestSongDiscoveryBudgetsAreLimitDerived(t *testing.T) {
+	for _, tt := range []struct {
+		limit       int
+		artistCalls int
+		records     int
+	}{
+		{limit: 1, artistCalls: 4, records: 48},
+		{limit: 12, artistCalls: 4, records: 60},
+		{limit: 15, artistCalls: 5, records: 75},
+		{limit: 20, artistCalls: 7, records: 96},
+		{limit: 50, artistCalls: 8, records: 96},
+	} {
+		t.Run(fmt.Sprintf("limit_%d", tt.limit), func(t *testing.T) {
+			if got := songDiscoveryArtistSearchBudget(tt.limit); got != tt.artistCalls {
+				t.Fatalf("songDiscoveryArtistSearchBudget(%d) = %d, want %d", tt.limit, got, tt.artistCalls)
+			}
+			if got := songDiscoveryPoolLimit(tt.limit); got != tt.records {
+				t.Fatalf("songDiscoveryPoolLimit(%d) = %d, want %d", tt.limit, got, tt.records)
+			}
+		})
+	}
+}
+
 func TestDiversifyDiscoveryCandidatesPreservesFitAndVariesTies(t *testing.T) {
 	candidates := []DiscoveryCandidate{
 		{Artist: "Weak", Album: "Weak Album", TrackName: "Weak Track", GenreTags: []string{"heavy metal"}},

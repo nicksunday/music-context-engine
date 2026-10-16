@@ -109,6 +109,9 @@ func initResolvedDB(dbPath string) (*DBClient, error) {
 	CREATE TABLE IF NOT EXISTS recommendation_candidates (
 		id TEXT PRIMARY KEY,
 		batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+		artist_id TEXT,
+		album_id TEXT,
+		recording_id TEXT,
 		artist TEXT NOT NULL,
 		album TEXT NOT NULL,
 		song TEXT,
@@ -482,6 +485,9 @@ func ensureRecommendationSchema(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS recommendation_candidates (
 			id TEXT PRIMARY KEY,
 			batch_id TEXT REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+			artist_id TEXT,
+			album_id TEXT,
+			recording_id TEXT,
 			artist TEXT NOT NULL,
 			album TEXT NOT NULL,
 			song TEXT,
@@ -547,7 +553,7 @@ func ensureRecommendationStreamingURLColumn(db *sql.DB) error {
 }
 
 func ensureRecommendationSongColumns(db *sql.DB) error {
-	for _, name := range []string{"song", "streaming_provider", "streaming_app_url"} {
+	for _, name := range []string{"song", "streaming_provider", "streaming_app_url", "artist_id", "album_id", "recording_id"} {
 		exists, err := columnExists(db, "recommendation_candidates", name)
 		if err != nil {
 			return err

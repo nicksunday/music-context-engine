@@ -14,7 +14,7 @@ The `get_taste_adjacencies` tool SHALL provide the user's profile metrics to gro
 ### Requirement: get_verified_discovery_candidates tool
 The `get_verified_discovery_candidates` tool SHALL retrieve a programmatically filtered set of candidate tracks/albums from an external source or cache, guaranteeing that returned album candidates are not exact albums the user has already rated or blocked through recommendation feedback. Known artists and track-level listening history SHALL remain eligible unless the exact normalized artist+album pair is excluded. Inputs: `target_vibe` (string, optional) a raw vibe or canonical MusicBrainz genre tag, with comma-separated canonical tag lists accepted; `fallback_tags` (array of strings, optional) canonical MusicBrainz genre tags derived from an abstract vibe, taking precedence over `target_vibe`; `limit` (int, optional) max candidates, defaulting to 5. Callers MUST provide either `target_vibe` or `fallback_tags`. (The full input contract is defined in the mcp-api capability.)
 
-Execution MUST: (1) query the database layer to build a memory-resident exclusion set keyed by normalized artist+album pairs, including albums with `albums.user_rating IS NOT NULL`, albums with durable recommendation-feedback verdicts (`disliked`, `ok`, `good`, `great`, `already_know`), and albums with `not_for_me_today` feedback from the current local calendar day; (2) search live MusicBrainz recording metadata for the normalized raw tag or an OR query over normalized fallback tags, using a bounded request context and MusicBrainz-compliant client identification and rate limiting; (3) strip out candidates whose normalized artist+album pair, including known alternate album titles, hits the exclusion set, while leaving standalone artist tokens, standalone album-title tokens, track titles, and starter-track strings non-excluding; (4) return a clean JSON envelope containing the critical recommendation instructions, the effective candidate limit, and a `candidates` slice of 100% verified real-world tracks (exact Title, Artist, Album, Runtime, Release Year) to eliminate LLM autocomplete hallucinations.
+Execution MUST: (1) query the database layer to build a memory-resident exclusion set keyed by normalized artist+album pairs, including albums with `albums.user_rating IS NOT NULL`, albums with durable recommendation-feedback verdicts (`disliked`, `ok`, `good`, `great`, `already_know`), and albums with `not_for_me_today` feedback from the current local calendar day; (2) search live MusicBrainz recording metadata for the normalized raw tag or an OR query over normalized fallback tags, using a bounded request context and MusicBrainz-compliant client identification and rate limiting; (3) strip out candidates whose normalized artist+album pair, including known alternate album titles, hits the exclusion set, while leaving standalone artist tokens, standalone album-title tokens, track titles, and starter-track strings non-excluding; (4) return a clean JSON envelope containing the critical recommendation instructions, the effective candidate limit, and a `candidates` slice of 100% verified real-world tracks (exact Title, Artist, Album, Runtime, Release Year) to eliminate LLM autocomplete hallucinations. In addition, the recommendation system MUST support a Feeling Lucky retrieval path that uses normalized genres from the user's listening history as the baseline candidate scope and MAY add genre or genre-adjacent buckets inferred from that listening profile. Observed and inferred buckets MUST be selected uniformly rather than by genre frequency, candidate volume, or inference confidence, and the path MUST NOT apply taste, rating, favorite, feedback, recency, affinity, or quality weighting. For Feeling Lucky, known artists, previously listened-to tracks, and previously heard albums SHALL remain eligible unless excluded for invalid/unavailable metadata or an explicit non-history eligibility rule; prior listening alone MUST NOT exclude an item. Newly discovered verified items matching a selected observed or inferred genre area MUST also remain eligible.
 
 #### Scenario: Album-level exclusion set built from ratings and feedback
 - **WHEN** the tool runs
@@ -23,6 +23,30 @@ Execution MUST: (1) query the database layer to build a memory-resident exclusio
 #### Scenario: Known artist and track history remain eligible
 - **WHEN** a candidate artist exists in local listening history or its matched starter track appears in the library, but the exact normalized artist+album pair is not excluded
 - **THEN** the candidate remains eligible
+
+#### Scenario: Feeling Lucky uses historical genre scope
+- **WHEN** Feeling Lucky requests candidates
+- **THEN** the candidate retrieval scope is derived from normalized genres found in the user's listening history
+
+#### Scenario: Feeling Lucky samples genres uniformly
+- **WHEN** historical genres have unequal listening counts or unequal candidate counts
+- **THEN** genre selection does not favor the genre with more records or candidates
+
+#### Scenario: Feeling Lucky admits profile-inferred genres
+- **WHEN** the listening profile supports a genre or genre-adjacent area not explicitly tagged in history
+- **THEN** the area may be admitted as an identified inferred Feeling Lucky genre bucket
+
+#### Scenario: Inferred genre confidence does not bias selection
+- **WHEN** admitted inferred genre buckets have unequal inference confidence
+- **THEN** each admitted bucket remains equally eligible at the genre-selection step
+
+#### Scenario: Prior listening does not exclude candidates
+- **WHEN** a verified candidate's artist, track, or exact album appears in listening history
+- **THEN** it remains eligible for Feeling Lucky unless another explicit exclusion applies
+
+#### Scenario: New discovery candidates are returned
+- **WHEN** a verified external candidate matches a historical genre but is absent from local history
+- **THEN** it may be included in the Feeling Lucky candidate pool
 
 #### Scenario: MusicBrainz query uses normalized tags
 - **WHEN** an abstract vibe phrase is supplied

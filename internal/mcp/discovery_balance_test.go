@@ -112,6 +112,26 @@ func TestSeededDiscoveryRequestsAndFailures(t *testing.T) {
 	}
 }
 
+func TestSongDiscoveryUsesAtMostTwoTagTermsAndDynamicArtistBudget(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Query().Get("query"))
+		json.NewEncoder(w).Encode(musicBrainzRecordingSearchResponse{})
+	}))
+	defer server.Close()
+	client := newMusicBrainzDiscoveryClient(musicBrainzDiscoveryConfig{HTTPClient: server.Client(), BaseURL: server.URL, Timeout: time.Second})
+	_, err := getVerifiedDiscoveryCandidatesSeededWithOptions(context.Background(), client, []string{"a", "b", "c"}, []string{"A", "B", "C", "D", "E", "F", "G"}, 20, database.NewAlbumExclusionSet(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 8 {
+		t.Fatalf("provider calls = %d, want one tag search plus seven artist searches", len(calls))
+	}
+	if strings.Contains(calls[0], `tag:"c"`) {
+		t.Fatalf("song tag search exceeded two-tag ceiling: %q", calls[0])
+	}
+}
+
 func TestSeededDiscoveryCancellationStopsSources(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -170,7 +190,11 @@ func TestBalancedDiscoveryModesPreserveEligibility(t *testing.T) {
 				albums[key] = true
 				counts[c.Artist]++
 			}
-			if counts["unfamiliar"] != 2 || counts["seed"] != 2 || len(got) != 4 {
+			wantPerArtist := 2
+			if song {
+				wantPerArtist = 4
+			}
+			if counts["unfamiliar"] != wantPerArtist || counts["seed"] != wantPerArtist || len(got) != wantPerArtist*2 {
 				t.Fatalf("filtered counts=%v", counts)
 			}
 			if song && lookups != 0 || !song && lookups == 0 {

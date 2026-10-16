@@ -27,3 +27,6 @@ music-vault web listening on http://127.0.0.1:8787
 music-vault web listening on http://127.0.0.1:8787
 recommendation_shortfall mode=song requested=20 returned=11 discovery_pool=11 discovery_avoided=0 model_selected=11 backfill_added=0 verified=11 verification_rejected=0 excluded=0 avoided=0 diversity_rejected=0 reason=discovery_pool_exhausted
 recommendation_shortfall mode=song requested=20 returned=8 discovery_pool=8 discovery_avoided=0 model_selected=5 backfill_added=3 verified=8 verification_rejected=0 excluded=0 avoided=0 diversity_rejected=0 reason=discovery_pool_exhausted
+music-vault web listening on http://127.0.0.1:8787
+music-vault web listening on http://127.0.0.1:8787
+music-vault web listening on http://127.0.0.1:8787

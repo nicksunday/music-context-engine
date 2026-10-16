@@ -35,6 +35,9 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 		Mood:   "dense",
 		Candidates: []RecommendationCandidateInput{
 			{
+				ArtistID:     "artist-mbid",
+				AlbumID:      "release-group-mbid",
+				RecordingID:  "recording-mbid",
 				Artist:       "Dos Monos",
 				Album:        "Dos City!!!",
 				StarterTrack: "In 20XX",
@@ -66,6 +69,9 @@ func TestCreateRecommendationBatchPersistsCandidates(t *testing.T) {
 	const wantStreamingURL = "https://music.apple.com/us/album/dos-city/1450632733"
 	if candidate.StreamingURL != wantStreamingURL {
 		t.Fatalf("candidate.StreamingURL = %q, want %q", candidate.StreamingURL, wantStreamingURL)
+	}
+	if candidate.ArtistID != "artist-mbid" || candidate.AlbumID != "release-group-mbid" || candidate.RecordingID != "recording-mbid" {
+		t.Fatalf("candidate provider IDs = %#v/%#v/%#v, want persisted IDs", candidate.ArtistID, candidate.AlbumID, candidate.RecordingID)
 	}
 
 	var count int
