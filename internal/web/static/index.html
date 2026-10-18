@@ -17,11 +17,6 @@
       </div>
 
       <details class="panel" open>
-        <summary>New Releases</summary>
-        <div id="releaseList" class="stack compact"></div>
-      </details>
-
-      <details class="panel" open>
         <summary>Recent Feedback</summary>
         <div id="feedbackList" class="stack compact"></div>
       </details>
@@ -46,12 +41,19 @@
         <a href="/recommendations/songs" data-mode="song">Song Recommendations</a>
         <a href="/recommendations/albums" data-mode="album">Album Recommendations</a>
         <a href="/recommendations/lucky" data-mode="feeling_lucky">Feeling Lucky</a>
+        <a href="/recommendations/releases" data-mode="releases">New Releases</a>
       </nav>
 
       <section id="modeChooser" class="mode-chooser" hidden>
         <a class="mode-choice" href="/recommendations/songs"><strong>Discover Songs</strong><span>Compact track recommendations with quick feedback.</span></a>
         <a class="mode-choice" href="/recommendations/albums"><strong>Explore Albums</strong><span>Rich album cards with album-level context and feedback.</span></a>
         <a class="mode-choice" href="/recommendations/lucky"><strong>Feeling Lucky</strong><span>A random surprise from observed and inferred areas of your listening profile.</span></a>
+        <a class="mode-choice" href="/recommendations/releases"><strong>New Releases</strong><span>New albums from liked and related artists. Open them in Apple Music.</span></a>
+      </section>
+
+      <section id="releasesPage" class="releases-page" aria-label="New releases" hidden>
+        <p id="releaseStatus" role="status">Loading releases</p>
+        <div id="releaseList" class="release-grid"></div>
       </section>
 
       <form id="promptForm" class="composer">

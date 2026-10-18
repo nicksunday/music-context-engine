@@ -42,8 +42,8 @@ const (
 	defaultRadarTimeout                = 25 * time.Second
 	defaultRadarArtists                = 1500
 	defaultMusicBrainzRadarArtists     = 50
-	defaultRadarReleases               = 16
-	defaultRadarCacheTTL               = 12 * time.Hour
+	defaultRadarReleases               = 100
+	defaultRadarCacheTTL               = 30 * time.Minute
 	defaultRadarErrorTTL               = 5 * time.Minute
 	defaultRadarRefreshTimeout         = 3 * time.Minute
 	listenBrainzResponseLimit          = 32 << 20
@@ -535,6 +535,7 @@ type NewRelease struct {
 	ReleaseType string   `json:"release_type,omitempty"`
 	GenreTags   []string `json:"genre_tags,omitempty"`
 	Blurb       string   `json:"blurb,omitempty"`
+	MatchReason string   `json:"match_reason,omitempty"`
 }
 
 func NewServer(db *sql.DB, options Options) http.Handler {
@@ -575,9 +576,30 @@ func NewServer(db *sql.DB, options Options) http.Handler {
 	mux.HandleFunc("POST /api/export/approve", server.handleExportApprove)
 	mux.HandleFunc("POST /api/export/download", server.handleExportDownload)
 	mux.HandleFunc("POST /api/playlists/apple-music", server.handleAppleMusicPlaylist)
+	mux.HandleFunc("GET /api/releases/open", server.handleOpenRelease)
 	mux.HandleFunc("GET /api/apple-music/config", server.handleAppleMusicConfig)
 	mux.Handle("/", staticHandler())
 	return mux
+}
+
+// Resolve on click so catalog lookups do not delay the release feed.
+func (server *Server) handleOpenRelease(writer http.ResponseWriter, request *http.Request) {
+	artist := strings.TrimSpace(request.URL.Query().Get("artist"))
+	album := strings.TrimSpace(request.URL.Query().Get("album"))
+	if artist == "" || album == "" || len(artist) > 500 || len(album) > 500 {
+		writeJSONError(writer, http.StatusBadRequest, "Artist and release title are required.")
+		return
+	}
+	destination := "https://music.apple.com/us/search?" + url.Values{"term": {artist + " " + album}}.Encode()
+	if server.linkResolver != nil {
+		ctx, cancel := context.WithTimeout(request.Context(), 25*time.Second)
+		defer cancel()
+		resolved, err := server.linkResolver.Resolve(ctx, database.RecommendationCandidateInput{Artist: artist, Album: album})
+		if parsed, parseErr := url.Parse(resolved); err == nil && parseErr == nil && parsed.Scheme == "https" && parsed.Host == "music.apple.com" && parsed.User == nil {
+			destination = resolved
+		}
+	}
+	http.Redirect(writer, request, destination, http.StatusFound)
 }
 
 func (server *Server) handleAppleMusicConfig(writer http.ResponseWriter, _ *http.Request) {
@@ -683,7 +705,7 @@ func (server *Server) handleRail(writer http.ResponseWriter, request *http.Reque
 		response.NewReleases = releases
 		if err != nil {
 			if errors.Is(err, errReleaseRadarRefreshInProgress) {
-				response.ReleaseError = "Scanning new releases from liked artists. Refresh again shortly."
+				response.ReleaseError = "Scanning new releases from liked and related artists. Refresh again shortly."
 			} else if len(releases) > 0 {
 				response.ReleaseError = "Some new release lookups failed; showing partial results."
 			} else {
@@ -1492,6 +1514,7 @@ type MusicBrainzAlbumVerifier struct {
 }
 
 type MusicBrainzReleaseRadar struct {
+	tasteDB         *sql.DB
 	baseURL         string
 	listenBrainzURL string
 	iTunesBaseURL   string
@@ -1571,6 +1594,7 @@ type listenBrainzFreshReleaseResponse struct {
 
 type listenBrainzFreshRelease struct {
 	ArtistCreditName        string   `json:"artist_credit_name"`
+	ArtistMBIDs             []string `json:"artist_mbids"`
 	ReleaseName             string   `json:"release_name"`
 	ReleaseDate             string   `json:"release_date"`
 	ReleaseGroupMBID        string   `json:"release_group_mbid"`
@@ -1579,6 +1603,7 @@ type listenBrainzFreshRelease struct {
 }
 
 type listenBrainzReleaseCandidate struct {
+	matchStrength   int
 	release         NewRelease
 	releaseGroupID  string
 	artistForLookup string
@@ -1590,6 +1615,7 @@ type iTunesSearchResponse struct {
 }
 
 type iTunesSearchResult struct {
+	ArtistID          int64  `json:"artistId"`
 	TrackID           int64  `json:"trackId"`
 	ArtistName        string `json:"artistName"`
 	TrackName         string `json:"trackName"`
@@ -1600,9 +1626,12 @@ type iTunesSearchResult struct {
 }
 
 type AppleMusicLinker struct {
-	baseURL      string
-	client       *http.Client
-	requestDelay time.Duration
+	catalogBaseURL string
+	albumCacheMu   sync.Mutex
+	albumCache     map[string]cachedAppleAlbum
+	baseURL        string
+	client         *http.Client
+	requestDelay   time.Duration
 
 	requestMu sync.Mutex
 	lastCall  time.Time
@@ -1628,65 +1657,7 @@ func AppleMusicAppURL(webURL string) string {
 }
 
 func (linker *AppleMusicLinker) Resolve(ctx context.Context, candidate database.RecommendationCandidateInput) (string, error) {
-	if linker == nil || linker.client == nil {
-		return "", nil
-	}
-
-	targetCleanArtist, targetCleanAlbum, err := database.NormalizeAlbumLookup(candidate.Artist, candidate.Album)
-	if err != nil {
-		return "", err
-	}
-	if targetCleanArtist == "" || targetCleanAlbum == "" {
-		return "", nil
-	}
-
-	endpoint, err := url.Parse(linker.baseURL)
-	if err != nil {
-		return "", err
-	}
-	query := endpoint.Query()
-	query.Set("term", strings.Join([]string{candidate.Artist, candidate.Album}, " "))
-	query.Set("media", "music")
-	query.Set("entity", "album")
-	query.Set("limit", "10")
-	endpoint.RawQuery = query.Encode()
-
-	if err := linker.waitForRateLimit(ctx); err != nil {
-		return "", err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	request.Header.Set("User-Agent", webUserAgent)
-
-	response, err := linker.client.Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return "", fmt.Errorf("iTunes returned %s: %s", response.Status, strings.TrimSpace(string(body)))
-	}
-
-	var payload iTunesSearchResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&payload); err != nil {
-		return "", err
-	}
-	for _, result := range payload.Results {
-		resultCleanArtist, resultCleanAlbum, err := database.NormalizeAlbumLookup(result.ArtistName, result.CollectionName)
-		if err != nil {
-			return "", err
-		}
-		if resultCleanArtist != targetCleanArtist || !equivalentAlbumTitle(targetCleanAlbum, resultCleanAlbum) {
-			continue
-		}
-		return strings.TrimSpace(result.CollectionViewURL), nil
-	}
-	return "", nil
+	return linker.resolveAlbum(ctx, candidate)
 }
 
 func (linker *AppleMusicLinker) ResolveSong(ctx context.Context, candidate database.RecommendationCandidateInput) (SongLink, error) {
@@ -2033,10 +2004,19 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 	}
 
 	artistSet := affinityArtistSet(artists)
+	preferred, tasteErr := radar.releaseTasteGenres(ctx)
+	blocked, blockedErr := radar.releaseBlockedArtists(ctx)
+	if tasteErr == nil {
+		tasteErr = blockedErr
+	}
+	artistTags, tagErr := radar.freshArtistTags(ctx, payload.Payload.Releases, since, until, preferred, artistSet)
+	if tasteErr == nil {
+		tasteErr = tagErr
+	}
 	candidates := make([]listenBrainzReleaseCandidate, 0, limit)
 	seen := make(map[string]bool)
 	for _, release := range payload.Payload.Releases {
-		if !strings.EqualFold(strings.TrimSpace(release.ReleaseGroupPrimaryType), "album") {
+		if !isRadarReleaseType(release.ReleaseGroupPrimaryType) {
 			continue
 		}
 		releaseDate := strings.TrimSpace(release.ReleaseDate)
@@ -2045,8 +2025,23 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 			continue
 		}
 		cleanArtist, cleanAlbum, err := database.NormalizeAlbumLookup(release.ArtistCreditName, release.ReleaseName)
-		if err != nil || cleanArtist == "" || cleanAlbum == "" || !artistMatchesAffinitySet(release.ArtistCreditName, cleanArtist, artistSet) {
+		if err != nil || cleanArtist == "" || cleanAlbum == "" || artistMatchesAffinitySet(release.ArtistCreditName, cleanArtist, blocked) {
 			continue
+		}
+		genreTags := cleanReleaseTags(release.ReleaseTags, 12)
+		known := artistMatchesAffinitySet(release.ArtistCreditName, cleanArtist, artistSet)
+		for _, id := range release.ArtistMBIDs {
+			genreTags = append(genreTags, artistTags[id]...)
+		}
+		genreTags = compactWebStrings(genreTags)
+		strength := 100
+		reason := "From an artist in your liked music."
+		if !known {
+			strength = releaseTasteStrength(genreTags, preferred)
+			reason = releaseTasteReason(genreTags, preferred)
+			if reason == "" {
+				continue
+			}
 		}
 		key := cleanArtist + "\x00" + cleanAlbum
 		if seen[key] {
@@ -2054,10 +2049,10 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 		}
 		seen[key] = true
 
-		genreTags := cleanReleaseTags(release.ReleaseTags, 4)
 		artistName := strings.TrimSpace(release.ArtistCreditName)
 		albumName := strings.TrimSpace(release.ReleaseName)
 		candidates = append(candidates, listenBrainzReleaseCandidate{
+			matchStrength: strength,
 			release: NewRelease{
 				Artist:      artistName,
 				Album:       albumName,
@@ -2065,6 +2060,7 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 				ReleaseType: release.ReleaseGroupPrimaryType,
 				GenreTags:   genreTags,
 				Blurb:       releaseBlurb(genreTags),
+				MatchReason: reason,
 			},
 			releaseGroupID:  release.ReleaseGroupMBID,
 			artistForLookup: artistName,
@@ -2072,7 +2068,11 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return releaseDateSortKey(candidates[i].release.ReleaseDate) > releaseDateSortKey(candidates[j].release.ReleaseDate)
+		left, right := releaseDateSortKey(candidates[i].release.ReleaseDate), releaseDateSortKey(candidates[j].release.ReleaseDate)
+		if left != right {
+			return left > right
+		}
+		return candidates[i].matchStrength > candidates[j].matchStrength
 	})
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
@@ -2089,7 +2089,7 @@ func (radar *MusicBrainzReleaseRadar) listenBrainzNewReleases(
 		release.Blurb = releaseBlurb(release.GenreTags)
 		releases = append(releases, release)
 	}
-	return releases, nil
+	return releases, tasteErr
 }
 
 func (radar *MusicBrainzReleaseRadar) searchReleaseGroupsInWindow(
@@ -2147,7 +2147,7 @@ func (radar *MusicBrainzReleaseRadar) searchReleaseGroupsInWindow(
 
 	releases := make([]NewRelease, 0, len(payload.ReleaseGroups))
 	for _, releaseGroup := range payload.ReleaseGroups {
-		if !strings.EqualFold(strings.TrimSpace(releaseGroup.PrimaryType), "album") {
+		if !isRadarReleaseType(releaseGroup.PrimaryType) {
 			continue
 		}
 		releaseDate := strings.TrimSpace(releaseGroup.FirstReleaseDate)
@@ -5057,4 +5057,13 @@ func normalizeBaseURL(value string) string {
 		return value
 	}
 	return "http://" + value
+}
+
+func isRadarReleaseType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "album":
+		return true
+	default:
+		return false
+	}
 }

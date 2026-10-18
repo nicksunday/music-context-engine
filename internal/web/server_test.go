@@ -2794,7 +2794,7 @@ func TestMusicBrainzReleaseRadarParsesNewAlbums(t *testing.T) {
 				{
 					"id": "new-single",
 					"title": "New Single",
-					"first-release-date": "2026-08-14",
+					"first-release-date": "2026-07-02",
 					"primary-type": "Single",
 					"artist-credit": [{"name": "Liked Artist"}]
 				},
@@ -3178,4 +3178,44 @@ func openWebTestDB(t *testing.T) *database.DBClient {
 		db.Ctx.Close()
 	})
 	return db
+}
+
+func TestOpenReleaseFallsBackToAppleMusicSearch(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodGet, "/api/releases/open?artist=Gloryhammer&album=New+Single", nil)
+	response := httptest.NewRecorder()
+	server.handleOpenRelease(response, request)
+	if response.Code != http.StatusFound || response.Header().Get("Location") != "https://music.apple.com/us/search?term=Gloryhammer+New+Single" {
+		t.Fatalf("response = %d, %s", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestOpenReleaseResolvedDestination(t *testing.T) {
+	for _, destination := range []string{"https://music.apple.com/us/album/example/123", "https://example.com/album", ""} {
+		t.Run(destination, func(t *testing.T) {
+			server := &Server{linkResolver: fakeLinkResolver{urls: map[string]string{"gloryhammer/new single": destination}}}
+			response := httptest.NewRecorder()
+			server.handleOpenRelease(response, httptest.NewRequest(http.MethodGet, "/api/releases/open?artist=Gloryhammer&album=New+Single", nil))
+			want := "https://music.apple.com/us/search?term=Gloryhammer+New+Single"
+			if strings.HasPrefix(destination, "https://music.apple.com/") {
+				want = destination
+			}
+			if response.Code != http.StatusFound || response.Header().Get("Location") != want {
+				t.Fatalf("redirect = %d %q, want %q", response.Code, response.Header().Get("Location"), want)
+			}
+		})
+	}
+}
+
+func TestRadarReleaseTypes(t *testing.T) {
+	for _, value := range []string{"Album", " album ", "ALBUM"} {
+		if !isRadarReleaseType(value) {
+			t.Errorf("excluded album type %q", value)
+		}
+	}
+	for _, value := range []string{"Single", "EP", " ep ", "Broadcast", ""} {
+		if isRadarReleaseType(value) {
+			t.Errorf("included non-album type %q", value)
+		}
+	}
 }

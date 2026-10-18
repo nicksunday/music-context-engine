@@ -6,6 +6,7 @@ const state = {
     const path = window.location.pathname.replace(/\/+$/, "") || "/";
     if (path === "/recommendations/songs") return "song";
     if (path === "/recommendations/albums") return "album";
+    if (path === "/recommendations/releases") return "releases";
     if (path === "/recommendations/lucky") return "feeling_lucky";
     return "entry";
   })(),
@@ -159,19 +160,23 @@ function openAppleMusic(url, appURL) {
 }
 
 async function loadRail() {
-  renderRows(elements.releaseList, [], () => ({}), "Loading releases");
-  const rail = await api("/api/rail");
-  renderRail(rail);
+  if (state.mode !== "releases") return;
+  document.querySelector("#releaseStatus").textContent = "Loading releases";
+  try {
+    renderRail(await api("/api/rail"));
+  } catch (error) {
+    document.querySelector("#releaseStatus").textContent = error.message;
+  }
 }
 
 async function loadLatestBatch() {
-  if (state.mode === "entry") return setCurrentBatch(null);
+  if (["entry", "releases"].includes(state.mode)) return setCurrentBatch(null);
   const response = await api(`/api/batch/latest?mode=${encodeURIComponent(state.mode)}`);
   setCurrentBatch(response.batch);
 }
 
 async function loadSessions() {
-  if (state.mode === "entry") {
+  if (["entry", "releases"].includes(state.mode)) {
     state.sessions = [];
     return renderSessions([]);
   }
@@ -292,11 +297,27 @@ function renderContext(context) {
 }
 
 function renderRail(rail) {
-  renderRows(elements.releaseList, rail.new_releases, (release) => ({
-    name: `${release.album} · ${release.artist}`,
-    meta: [formatReleaseDate(release.release_date), release.release_type].filter(Boolean).join(" · "),
-    detail: release.blurb || "",
-  }), rail.release_error || "No new releases found");
+  const releases = rail.new_releases || [];
+  document.querySelector("#releaseStatus").textContent = rail.release_error || (releases.length
+    ? `${releases.length} recent releases from liked and related artists · Past 90 days · Newest first`
+    : "No new releases from liked and related artists in the past 90 days.");
+  elements.releaseList.replaceChildren();
+  for (const release of releases) {
+    const card = document.createElement("a");
+    card.className = "mode-choice release-card";
+    card.href = `/api/releases/open?${new URLSearchParams({ artist: release.artist, album: release.album })}`;
+    card.target = "_blank";
+    card.rel = "noopener noreferrer";
+    for (const [tag, text] of [["strong", release.album], ["span", release.artist],
+      ["span", [formatReleaseDate(release.release_date), release.release_type].filter(Boolean).join(" · ")],
+      ["span", release.match_reason], ["span", release.blurb], ["span", "Open in Apple Music ↗"]]) {
+      if (!text) continue;
+      const node = document.createElement(tag);
+      node.textContent = text;
+      card.append(node);
+    }
+    elements.releaseList.append(card);
+  }
 }
 
 function renderRows(container, values, mapValue, emptyText = "No rows") {
@@ -708,6 +729,7 @@ function formatSessionDate(value) {
 
 function configureMode() {
   const labels = {
+    releases: ["New Releases", "New albums from liked and related artists. Open a release in Apple Music."],
     entry: ["Recommendation Engine", "Choose a recommendation workflow or generate a verified batch."],
     song: ["Song Recommendations", "Discover individual tracks in a compact list with quick feedback."],
     album: ["Album Recommendations", "Explore verified albums with richer context and album-level feedback."],
@@ -725,12 +747,16 @@ function configureMode() {
   document.querySelectorAll(".recommendation-nav a").forEach(link => {
     link.classList.toggle("active", link.dataset.mode === state.mode);
   });
-  elements.promptForm.hidden = state.mode === "entry" || state.mode === "feeling_lucky";
+  elements.promptForm.hidden = ["entry", "releases", "feeling_lucky"].includes(state.mode);
+  document.querySelector("#releasesPage").hidden = state.mode !== "releases";
+  document.querySelector(".workbench").hidden = state.mode === "releases";
+  elements.sessionHeading.closest("details").hidden = state.mode === "releases";
+  document.body.classList.toggle("releases-mode", state.mode === "releases");
   elements.feelingLuckyControls.hidden = state.mode !== "feeling_lucky";
 }
 
 async function refreshAll() {
-  await Promise.all([loadContext(), loadRail(), loadLatestBatch(), loadSessions(), loadExportReview()]);
+  await Promise.all([loadContext(), loadRail(), loadLatestBatch(), loadSessions(), (state.mode === "releases" ? Promise.resolve() : loadExportReview())]);
 }
 
 elements.promptForm.addEventListener("submit", submitPrompt);

@@ -530,7 +530,7 @@ func runWeb(args []string) {
 	handler := webserver.NewServer(db.Ctx, webserver.Options{
 		Recommender: webserver.NewMCPGroundedOllamaRecommender(db.Ctx, ollamaURL, model, ollamaTimeout).
 			WithSimilarArtists(mcpserver.NewDefaultSimilarArtistSource()),
-		ReleaseRadar: webserver.NewMusicBrainzReleaseRadar(),
+		ReleaseRadar: webserver.NewMusicBrainzReleaseRadar().WithTasteProfile(db.Ctx),
 		LinkResolver: webserver.NewAppleMusicLinker(),
 		SongLinkResolver: webserver.FallbackSongLinkResolver{
 			AppleMusic: webserver.NewAppleMusicLinker(),
